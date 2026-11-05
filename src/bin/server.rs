@@ -8566,38 +8566,48 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
             Ok(json!({ "call_id": call_id, "source_id": source_id }))
         }
 
-        // End the call — or decline it, when it is still ringing.
+        // End the call — or decline it, when the user pressed Decline.
         //
-        // Both are one method because they are one intention ("I am not on this
-        // call") and because the UI shows one button. Which payload goes out depends
-        // on the phase: a caller who is declined is told so, and a call that was up
-        // ends for both sides.
+        // Both are one method because both say "I am not on this call". What goes out is
+        // decided by `hangup_door`, from the phase AND from what the press meant: a caller
+        // who is declined is shown it, and only the Decline press may do that. Every other
+        // way a page ends a ringing call — a transport that failed while an answer was
+        // travelling, a page that gave up — lets the call go here and tells nobody, so the
+        // caller goes on ringing the user's other devices.
         "call_hangup" => {
-            let call_id = param_str(params, "call_id")?;
-            let (local, url, declining) = {
+            let request = hangup_request(params)?;
+            let call_id = request.call_id;
+            let (local, door, url) = {
                 let plane = ctx.calling.lock().unwrap();
                 let call = plane
                     .call
                     .as_ref()
                     .filter(|c| c.id == call_id)
                     .context("call_hangup: no such call")?;
-                let declining =
-                    call.direction == CallDirection::Incoming && call.phase == CallPhase::Ringing;
-                let url = if declining {
-                    call.links.reject().or_else(|| call.links.hangup())
-                } else {
-                    call.links.hangup()
+                let door = hangup_door(call.direction, call.phase, request.intent);
+                let url = match door {
+                    HangupDoor::Reject => call.links.reject().or_else(|| call.links.hangup()),
+                    HangupDoor::Hangup => call.links.hangup(),
+                    HangupDoor::Nothing => None,
                 };
-                (call.local.clone(), url.map(str::to_string), declining)
+                (call.local.clone(), door, url.map(str::to_string))
             };
             // Tell the other side first, then drop it locally: the local drop is what
             // stops the microphone, and it must happen even if the POST fails.
-            let told = match url {
-                Some(url) => {
-                    let payload = if declining {
-                        calling::rejection_payload(&local)
-                    } else {
-                        calling::hangup_payload(&local)
+            let told = match (door, url) {
+                (HangupDoor::Nothing, _) => {
+                    // An accept still on the wire is not lost by this: its own answer finds
+                    // the call gone and hangs up what it made (`hang_up_orphan`).
+                    eprintln!(
+                        "[calling] let a ringing call go without declining it — the caller \
+                         was not told, and it still rings on the user's other devices"
+                    );
+                    false
+                }
+                (_, Some(url)) => {
+                    let payload = match door {
+                        HangupDoor::Reject => calling::rejection_payload(&local),
+                        _ => calling::hangup_payload(&local),
                     };
                     match ctx.post_call_signal(&url, &payload).await {
                         Ok(_) => true,
@@ -8607,17 +8617,12 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
                         }
                     }
                 }
-                None => {
+                (_, None) => {
                     eprintln!("[calling] no link to hang up on — dropping the call locally");
                     false
                 }
             };
-            ctx.end_call_locally(if declining {
-                "CallEndReasonDeclined"
-            } else {
-                "CallEndReasonHangup"
-            })
-            .await;
+            ctx.end_call_locally(door.end_reason()).await;
             Ok(json!({ "call_id": call_id, "told_service": told }))
         }
 
@@ -14633,6 +14638,97 @@ const CALL_PREPARE_NOT_CONNECTED: &str = "call_prepare: calling is not connected
                                           machine registers for calls on its own once it can; \
                                           try again in a moment";
 
+/// What the press that ends a call MEANT, as the page states it in `call_hangup`'s `intent`.
+///
+/// Two presses reach one method, and only one of them is the user's word to the caller. A
+/// failed Answer used to reach it too: the page's catch hung the call up, and on a call still
+/// ringing that posted the invite's reject — so a microphone the browser refused, a page that
+/// timed out or a socket that dropped showed the caller "declined", in the user's name, for a
+/// call they had just tried to take. The intent is what keeps that decision with the press
+/// that really made it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HangupIntent {
+    /// The ringing card's Decline. The caller is told.
+    Decline,
+    /// Everything else that ends a call: the stage's End, a media transport that failed, a page
+    /// that gave up on a start. It never declines anybody.
+    End,
+}
+
+/// Which door a `call_hangup` leaves by. Decided by [`hangup_door`] and nowhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HangupDoor {
+    /// The invite's reject link with `calling::rejection_payload`: the caller is shown
+    /// "declined".
+    Reject,
+    /// The call's hangup link with `calling::hangup_payload`: a call that was up ends for both
+    /// sides, and a dial or a join is taken back.
+    Hangup,
+    /// Nothing goes out. A ringing call is let go HERE and keeps ringing on the user's other
+    /// devices, which is the honest outcome of anything that is not a decline.
+    Nothing,
+}
+
+impl HangupDoor {
+    /// The ending this machine records — the one `end_call_locally` publishes to every page.
+    fn end_reason(self) -> &'static str {
+        match self {
+            HangupDoor::Reject => "CallEndReasonDeclined",
+            HangupDoor::Hangup => "CallEndReasonHangup",
+            HangupDoor::Nothing => calling::END_REASON_LEFT_RINGING,
+        }
+    }
+}
+
+/// The refusal of an `intent` this backend does not know. Refused rather than read as one of
+/// the two: read as `decline` it would decline on a word nobody wrote, and read as `end` a
+/// newer page's third intent would be quietly mistaken for something it is not.
+const CALL_HANGUP_BAD_INTENT: &str = "call_hangup: intent must be decline or end";
+
+/// One `call_hangup`, read and checked in ONE place.
+///
+/// The roadmap adds two more fields here — a `reason` for an ending the page caused (a media
+/// transport that was lost) and a `call_id` that names a WAITING call — and they belong in this
+/// one function so a hangup has one validation table rather than three.
+#[derive(Debug, PartialEq, Eq)]
+struct HangupRequest {
+    call_id: String,
+    /// `None` is a page too old to say, whose one button on a ringing call was Decline.
+    intent: Option<HangupIntent>,
+}
+
+fn hangup_request(params: &Value) -> Result<HangupRequest> {
+    let intent = match params.get("intent") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(word)) if word == "decline" => Some(HangupIntent::Decline),
+        Some(Value::String(word)) if word == "end" => Some(HangupIntent::End),
+        Some(_) => anyhow::bail!(CALL_HANGUP_BAD_INTENT),
+    };
+    Ok(HangupRequest { call_id: param_str(params, "call_id")?, intent })
+}
+
+/// Which door ends this call, for what the press meant.
+///
+/// Only an incoming call that is still RINGING has a choice to make, because only there can
+/// the caller be declined. `End` lets it go and tells nobody. That covers an End while an
+/// accept is still travelling — the phase stays `Ringing` until the attach answers — and the
+/// accept's own answer then hangs up whatever it made (`hang_up_orphan`), exactly as it does
+/// for every start cancelled mid-POST. No intent at all is an older page, and keeps what that
+/// page always did. Everything else hangs up.
+fn hangup_door(
+    direction: CallDirection,
+    phase: CallPhase,
+    intent: Option<HangupIntent>,
+) -> HangupDoor {
+    match (direction, phase, intent) {
+        (CallDirection::Incoming, CallPhase::Ringing, Some(HangupIntent::End)) => {
+            HangupDoor::Nothing
+        }
+        (CallDirection::Incoming, CallPhase::Ringing, _) => HangupDoor::Reject,
+        _ => HangupDoor::Hangup,
+    }
+}
+
 /// Why the calling connection could not be started.
 ///
 /// Typed so the start loop can tell the failure a page has a sentence for — the account's
@@ -18288,6 +18384,98 @@ mod tests {
             .map(|member| member.trim_matches('"'))
             .collect();
         assert_eq!(declared, words, "the page's type names exactly the backend's words, in order");
+    }
+
+    /// Only the Decline press declines. The table is written out rather than derived, so the
+    /// rule is stated once here and once in `hangup_door`, and the two have to agree.
+    #[test]
+    fn only_the_decline_press_declines_a_ringing_call() {
+        use CallDirection::{Incoming, Outgoing};
+        use CallPhase::{Connected, Connecting, Dialing, Ended, Ringing};
+        use HangupIntent::{Decline, End};
+        // The three rows that are not "hang up".
+        assert_eq!(hangup_door(Incoming, Ringing, Some(Decline)), HangupDoor::Reject);
+        assert_eq!(hangup_door(Incoming, Ringing, Some(End)), HangupDoor::Nothing);
+        // An older page names no intent, and its one button on a ringing call is Decline.
+        assert_eq!(hangup_door(Incoming, Ringing, None), HangupDoor::Reject);
+        // Everything else hangs up — whatever the press said, because only a ringing incoming
+        // call has a caller to decline.
+        for direction in [Incoming, Outgoing] {
+            for phase in [Ringing, Dialing, Connecting, Connected, Ended] {
+                for intent in [None, Some(Decline), Some(End)] {
+                    if direction == Incoming && phase == Ringing {
+                        continue;
+                    }
+                    assert_eq!(
+                        hangup_door(direction, phase, intent),
+                        HangupDoor::Hangup,
+                        "{direction:?} {phase:?} {intent:?}"
+                    );
+                }
+            }
+        }
+        // And each door records its own ending: a ring let go is never called a decline.
+        assert_eq!(HangupDoor::Reject.end_reason(), "CallEndReasonDeclined");
+        assert_eq!(HangupDoor::Hangup.end_reason(), "CallEndReasonHangup");
+        assert_eq!(HangupDoor::Nothing.end_reason(), calling::END_REASON_LEFT_RINGING);
+    }
+
+    /// The intent is one of two words, or absent. Anything else is refused in one sentence,
+    /// before the call is looked up — never read as a decline nobody wrote.
+    #[test]
+    fn a_hangup_intent_is_one_of_two_words() {
+        let read = |params: Value| hangup_request(&params).map(|r| r.intent);
+        assert_eq!(read(json!({ "call_id": "c" })).unwrap(), None);
+        assert_eq!(read(json!({ "call_id": "c", "intent": null })).unwrap(), None);
+        assert_eq!(
+            read(json!({ "call_id": "c", "intent": "decline" })).unwrap(),
+            Some(HangupIntent::Decline)
+        );
+        assert_eq!(read(json!({ "call_id": "c", "intent": "end" })).unwrap(), Some(HangupIntent::End));
+        for bad in [json!("Decline"), json!("reject"), json!(""), json!(1), json!(true), json!(["end"])] {
+            let error = read(json!({ "call_id": "c", "intent": bad.clone() })).unwrap_err();
+            assert_eq!(error.to_string(), CALL_HANGUP_BAD_INTENT, "{bad}");
+        }
+        assert_eq!(CALL_HANGUP_BAD_INTENT, "call_hangup: intent must be decline or end");
+        // The mock refuses in the same words: a mock that accepted a word the backend refuses
+        // would let a page sending it pass every spec.
+        let mock = include_str!("../../web/mock/server.ts");
+        assert!(
+            mock.contains(&format!("\"{CALL_HANGUP_BAD_INTENT}\"")),
+            "web/mock/server.ts refuses an unknown intent in the backend's own sentence"
+        );
+        assert!(hangup_request(&json!({ "intent": "end" })).is_err(), "a call id is still required");
+        assert_eq!(
+            hangup_request(&json!({ "call_id": "c-1", "intent": "end" })).unwrap().call_id,
+            "c-1"
+        );
+    }
+
+    /// The reject is posted from ONE place, the Decline door of `call_hangup` — the timer that
+    /// frees an unanswered ring and every start that failed never reach it. A second caller of
+    /// it is a second way to show somebody "declined" for a call nobody declined.
+    #[test]
+    fn the_reject_is_posted_only_through_the_decline_door() {
+        let source = include_str!("server.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap_or(source);
+        assert_eq!(
+            code.matches("calling::rejection_payload(").count(),
+            1,
+            "exactly one call of rejection_payload outside the tests"
+        );
+        let handler = code
+            .split("\n        \"call_hangup\" => {\n")
+            .nth(1)
+            .expect("the call_hangup arm")
+            .split("\n        \"call_mute\" => {\n")
+            .next()
+            .expect("the call_hangup arm ends before call_mute");
+        assert!(handler.contains("HangupDoor::Reject => calling::rejection_payload(&local)"));
+        assert!(handler.contains("let request = hangup_request(params)?;"));
+        assert!(handler.contains("hangup_door(call.direction, call.phase, request.intent)"));
+        assert!(handler.contains("HangupDoor::Nothing => None,"), "the Nothing door has no url");
+        assert!(handler.contains("ctx.end_call_locally(door.end_reason()).await;"));
+        assert!(!handler.contains("let declining"), "the old phase-only decision is gone");
     }
 
     /// The refusal a page meets when no call can start, pinned in full: the page reads its

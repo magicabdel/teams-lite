@@ -56,12 +56,54 @@ export const CALL_NOTICE = "call";
  *  fate replace the reason the call ended, which is the half they cannot infer. */
 export const RECORDING_NOTICE = "call-recording";
 
-/** Show one notice, replacing whatever is on screen under the same id. */
+/**
+ * How long a dismissed notice takes to leave: sonner keeps it mounted for its exit animation
+ * (`TIME_BEFORE_UNMOUNT`, 200 ms in 2.0.7) and then deletes the entry BY ID — so a notice shown
+ * again under the same id inside that window is deleted with the old one, a beat after it was
+ * drawn. That is exactly what a second failed attempt does: the attempt takes the old reason
+ * back as it starts, fails within milliseconds, and says why. This is that window plus a margin.
+ */
+const NOTICE_EXIT_MS = 250;
+
+/** When each subject's notice was last taken back, and the notice waiting for that exit to
+ *  finish. One pending notice per subject: a later one replaces it, as it would on screen. */
+const lastDismissed = new Map<string, number>();
+const pending = new Map<string, { notice: Notice; timer: ReturnType<typeof setTimeout> }>();
+
+/** Show one notice, replacing whatever is on screen under the same id.
+ *
+ *  A notice that lands while the previous one under its id is still LEAVING waits for it to
+ *  go, rather than being deleted with it (see {@link NOTICE_EXIT_MS}). */
 export function showNotice(notice: Notice): void {
   // Client-only. The module store behind `toast` outlives a single SSR render on the
   // server, so a notice queued there would belong to whichever request rendered next.
   if (typeof window === "undefined") return;
   if (!notice.text) return;
+  const leaving = NOTICE_EXIT_MS - (Date.now() - (lastDismissed.get(notice.id) ?? -Infinity));
+  const waiting = pending.get(notice.id);
+  if (leaving > 0) {
+    if (waiting) {
+      waiting.notice = notice;
+      return;
+    }
+    const entry = {
+      notice,
+      timer: setTimeout(() => {
+        pending.delete(notice.id);
+        present(entry.notice);
+      }, leaving),
+    };
+    pending.set(notice.id, entry);
+    return;
+  }
+  if (waiting) {
+    clearTimeout(waiting.timer);
+    pending.delete(notice.id);
+  }
+  present(notice);
+}
+
+function present(notice: Notice): void {
   const options = {
     id: notice.id,
     testId: notice.testId,
@@ -80,4 +122,11 @@ export function showNotice(notice: Notice): void {
 export function dismissNotice(id: string): void {
   if (typeof window === "undefined") return;
   toast.dismiss(id);
+  lastDismissed.set(id, Date.now());
+  // A notice still waiting to be drawn belonged to the attempt this dismissal takes back.
+  const waiting = pending.get(id);
+  if (waiting) {
+    clearTimeout(waiting.timer);
+    pending.delete(id);
+  }
 }

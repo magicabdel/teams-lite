@@ -4,23 +4,30 @@ import { callFailureMessage } from "../src/lib/call-failure";
 import {
   calendarEvent,
   callFromMenu,
+  callRecord,
   closeConversationMenu,
   conversationMenuTrigger,
   disableCalling,
+  dropBackendSockets,
   answerCallMediaUnreadably,
   callSharingOrder,
   dropCallCapture,
   emitCallInvite,
   endCallWithReason,
+  failNextCallStatus,
   gotoApp,
   holdCallStart,
   joinMeetingFromMenu,
+  loseBackend,
   mockRpc,
   openCalendarTab,
   openCalendarView,
   openConversationMenu,
   openConversationNamed,
+  refuseNextCallAccept,
   refuseNextCallMedia,
+  refuseNextCallPrepare,
+  refuseNextMicrophone,
   rejectCallCapture,
   resetCall,
   setCallRegistration,
@@ -534,10 +541,269 @@ test.describe("Audio calling", () => {
     await expect(page.locator('[data-testid="call-notice"]')).toHaveCount(0);
   });
 
+  /** A FAILED ANSWER NEVER DECLINES. It used to hang the call up, and on a call still ringing
+   *  that posted the invite's reject — so a microphone the browser refused showed the caller
+   *  "declined", in the user's name, for a call they had just tried to take. The hangups are
+   *  COUNTED on the mock rather than read off the screen: a page that declined and then drew
+   *  the right card would pass every assertion about the card. */
+  test("a failed Answer leaves the call ringing and never declines it", async ({ page }) => {
+    await gotoApp(page);
+    await openConversationNamed(page, "Ava Thompson");
+    const conversationId = await page
+      .locator('[data-testid="composer-shell"]')
+      .getAttribute("data-conversation-id");
+    await emitCallInvite(page, conversationId!);
+
+    const bar = page.locator('[data-testid="call-bar"]');
+    const answer = page.locator('[data-testid="call-answer"]');
+    const notice = page.locator('[data-testid="call-notice"]');
+    await expect(bar).toHaveAttribute("data-phase", "ringing");
+
+    // The browser refuses the microphone: the commonest real failure.
+    await refuseNextMicrophone(page);
+    await answer.click();
+    await expect(notice).toContainText(
+      "teams-lite could not open the microphone. Allow it for this site, then try again. " +
+        "The call is still ringing.",
+    );
+    await expect(bar).toHaveAttribute("data-phase", "ringing");
+    await expect(bar).toHaveAttribute("data-media", "none");
+    await expect(answer).toBeEnabled();
+    expect((await callRecord(page)).hangups).toEqual([]);
+
+    // A refusal before anything reached anybody leaves it ringing in the same way — and the
+    // second notice STAYS. The attempt takes the first one back as it starts and fails within
+    // milliseconds, which used to land inside the first one's exit and delete the second with
+    // it (lib/notice.ts).
+    await refuseNextCallPrepare(page);
+    await answer.click();
+    await expect(notice).toContainText("that call carried no offer. The call is still ringing.");
+    await page.waitForTimeout(600);
+    await expect(page.locator('[data-testid="call-notice"]:not([data-removed="true"])')).toContainText(
+      "that call carried no offer. The call is still ringing.",
+    );
+    await expect(bar).toHaveAttribute("data-phase", "ringing");
+    expect((await callRecord(page)).hangups).toEqual([]);
+
+    // And it really is still ringing HERE: the next press answers it.
+    await answer.click();
+    const stage = page.locator('[data-testid="call-stage"]');
+    await expect(stage).toHaveAttribute("data-phase", "connected");
+    await expect(stage).toHaveAttribute("data-media", "held");
+
+    // Ending a call that is up is an END, which never declines anybody.
+    await page.locator('[data-testid="call-hangup"]').first().click();
+    await expect(stage).toHaveCount(0);
+    expect((await callRecord(page)).hangups).toEqual([{ intent: "end", declined: false }]);
+  });
+
+  /** The ringing card's Decline is the ONE press that declines, and it does so once. */
+  test("Decline declines the caller exactly once", async ({ page }) => {
+    await gotoApp(page);
+    await openConversationNamed(page, "Ava Thompson");
+    const conversationId = await page
+      .locator('[data-testid="composer-shell"]')
+      .getAttribute("data-conversation-id");
+    await emitCallInvite(page, conversationId!);
+    const bar = page.locator('[data-testid="call-bar"]');
+    await expect(bar).toHaveAttribute("data-phase", "ringing");
+
+    await page.locator('[data-testid="call-hangup"]').click();
+    await expect(bar).toHaveCount(0);
+    expect((await callRecord(page)).hangups).toEqual([{ intent: "decline", declined: true }]);
+  });
+
+  /** An answer still TRAVELLING holds the microphone while the backend's phase is still
+   *  ringing (it moves when the attach answers). The card says so and takes no second press —
+   *  which would open a second microphone and accept twice — and an End landing in that window
+   *  (a transport that failed, a page that gave up) lets the call go without declining it. */
+  test("an answer still travelling is single, and an End in it never declines", async ({ page }) => {
+    await gotoApp(page);
+    await openConversationNamed(page, "Ava Thompson");
+    const conversationId = await page
+      .locator('[data-testid="composer-shell"]')
+      .getAttribute("data-conversation-id");
+    await emitCallInvite(page, conversationId!);
+    const bar = page.locator('[data-testid="call-bar"]');
+    const answer = page.locator('[data-testid="call-answer"]');
+    await expect(bar).toHaveAttribute("data-phase", "ringing");
+
+    await holdCallStart(page, "accept", 4_000);
+    await answer.click();
+    await expect(bar).toHaveAttribute("data-media", "held");
+    await expect(bar).toHaveAttribute("data-phase", "ringing");
+    await expect(answer).toBeDisabled();
+    await expect(answer).toHaveText("Answering…");
+
+    // A frame that still says RINGING lands while the answer travels — the backend's phase
+    // moves only when the attach answers. It must not take the microphone away from the very
+    // answer it belongs to: the page asks whose call the media is, never what phase it is in.
+    await setCallRegistration(page, "registered");
+    await page.waitForTimeout(300);
+    await expect(bar).toHaveAttribute("data-media", "held");
+
+    // What the page sends for any ending but Decline.
+    const callId = await bar.getAttribute("data-call-id");
+    const ended = await mockRpc("call_hangup", { call_id: callId, intent: "end" });
+    expect(ended.result).toMatchObject({ told_service: false });
+    await expect(bar).toHaveCount(0);
+    await expect(page.locator('[data-testid="call-stage"]')).toHaveCount(0);
+    await expect(page.locator('[data-testid="call-notice"]')).toHaveCount(0);
+    expect((await callRecord(page)).hangups).toEqual([{ intent: "end", declined: false }]);
+  });
+
+  /** A word the backend does not know is refused in its own sentence, never read as either. */
+  test("refuses a hangup intent it does not know", async ({ page }) => {
+    await gotoApp(page);
+    await openConversationNamed(page, "Ava Thompson");
+    const conversationId = await page
+      .locator('[data-testid="composer-shell"]')
+      .getAttribute("data-conversation-id");
+    const callId = await emitCallInvite(page, conversationId!);
+    const refused = await mockRpc("call_hangup", { call_id: callId, intent: "reject" });
+    expect(refused.error).toBe("call_hangup: intent must be decline or end");
+    await expect(page.locator('[data-testid="call-bar"]')).toHaveAttribute("data-phase", "ringing");
+    expect((await callRecord(page)).hangups).toEqual([]);
+  });
+
+  /** A backend that RESTARTED under a live call drops it with no frame at all. The page re-reads
+   *  the call when its socket comes back, finds it gone, releases the microphone and says why —
+   *  where before it kept the stage, and the microphone, for a call that existed nowhere. */
+  test("takes the call down when the backend restarted under it, and says so", async ({ page }) => {
+    await gotoApp(page);
+    await openConversationNamed(page, "Ava Thompson");
+    await callFromMenu(page);
+    const stage = page.locator('[data-testid="call-stage"]');
+    await expect(stage).toHaveAttribute("data-phase", "connected");
+    await expect(stage).toHaveAttribute("data-media", "held");
+
+    await loseBackend(page);
+    await expect(stage).toHaveCount(0);
+    await expect(page.locator('[data-testid="call-notice"]')).toContainText(
+      "teams-lite restarted, so you left the call.",
+    );
+  });
+
+  /** A status read that FAILS says nothing about the call, so it takes nothing away: not the
+   *  microphone, and not the stage that holds the call's Hang up. The refusal is counted, or the
+   *  test would pass on a page that never asked. */
+  test("keeps a live call when a status read fails", async ({ page }) => {
+    await gotoApp(page);
+    await openConversationNamed(page, "Ava Thompson");
+    await callFromMenu(page);
+    const stage = page.locator('[data-testid="call-stage"]');
+    await expect(stage).toHaveAttribute("data-phase", "connected");
+
+    await failNextCallStatus(page);
+    await dropBackendSockets(page);
+    await expect.poll(async () => (await callRecord(page)).status_refusals).toBe(1);
+    await page.waitForTimeout(400);
+    await expect(stage).toHaveAttribute("data-phase", "connected");
+    await expect(stage).toHaveAttribute("data-media", "held");
+    await expect(page.locator('[data-testid="call-notice"]')).toHaveCount(0);
+
+    // And a read that succeeds finds the same call, and keeps it too. Waited for by its own
+    // count rather than slept for, so a slow reconnect cannot pass for a kept call.
+    const reads = (await callRecord(page)).status_reads;
+    await dropBackendSockets(page);
+    await expect.poll(async () => (await callRecord(page)).status_reads).toBeGreaterThan(reads);
+    await expect(stage).toHaveAttribute("data-media", "held");
+    await page.locator('[data-testid="call-hangup"]').first().click();
+    await expect(stage).toHaveCount(0);
+    // A press that landed on a closed socket would leave this empty.
+    await expect.poll(async () => (await callRecord(page)).hangups).toEqual([
+      { intent: "end", declined: false },
+    ]);
+  });
+
+  /** A LOST answer is not a refusal: the invite went out, and may already be ringing somebody.
+   *  The page keeps its microphone and lets the backend's frames connect the call, where it used
+   *  to report the backend unreachable and hang up a call that was about to connect. */
+  test("keeps the microphone when the invite's answer is lost", async ({ page }) => {
+    await gotoApp(page);
+    await openConversationNamed(page, "Ava Thompson");
+    await holdCallStart(page, "place", 2_500);
+    await callFromMenu(page);
+    const stage = page.locator('[data-testid="call-stage"]');
+    await expect(stage).toHaveAttribute("data-media", "held");
+
+    await dropBackendSockets(page);
+    await expect(stage).toHaveAttribute("data-phase", "connected", { timeout: 15_000 });
+    await expect(stage).toHaveAttribute("data-media", "held");
+    await expect(page.locator('[data-testid="call-notice"]')).toHaveCount(0);
+    expect((await callRecord(page)).hangups).toEqual([]);
+  });
+
   /** A machine that stops taking calls takes the call with it: it stops being a device
    *  the user's calls ring on, and a call in flight cannot outlive that. It is what the
    *  app does as it shuts down, and the ending is one the user did not ask for — so it is
    *  stated, once. */
+  /** The same rule on an ANSWER: the accept went out and its reply was lost, which says
+   *  nothing about whether the caller is now talking to this machine. Declining or releasing
+   *  here would cut off a call that connected. */
+  test("keeps the microphone when an answer's reply is lost", async ({ page }) => {
+    await gotoApp(page);
+    await openConversationNamed(page, "Ava Thompson");
+    const conversationId = await page
+      .locator('[data-testid="composer-shell"]')
+      .getAttribute("data-conversation-id");
+    await emitCallInvite(page, conversationId!);
+    const bar = page.locator('[data-testid="call-bar"]');
+    await expect(bar).toHaveAttribute("data-phase", "ringing");
+
+    await holdCallStart(page, "accept", 2_500);
+    await page.locator('[data-testid="call-answer"]').click();
+    await expect(bar).toHaveAttribute("data-media", "held");
+
+    await dropBackendSockets(page);
+    const stage = page.locator('[data-testid="call-stage"]');
+    await expect(stage).toHaveAttribute("data-phase", "connected", { timeout: 15_000 });
+    await expect(stage).toHaveAttribute("data-media", "held");
+    await expect(page.locator('[data-testid="call-notice"]')).toHaveCount(0);
+    expect((await callRecord(page)).hangups).toEqual([]);
+  });
+
+  /** And on a JOIN: everybody in the meeting may already see the user arrive. */
+  test("keeps the microphone when a join's reply is lost", async ({ page }) => {
+    await gotoApp(page);
+    await openConversationNamed(page, "Design Sync");
+    await holdCallStart(page, "join", 2_500);
+    await joinMeetingFromMenu(page);
+    const stage = page.locator('[data-testid="call-stage"]');
+    await expect(stage).toHaveAttribute("data-media", "held");
+
+    await dropBackendSockets(page);
+    await expect(stage).toHaveAttribute("data-phase", "connected", { timeout: 15_000 });
+    await expect(stage).toHaveAttribute("data-media", "held");
+    await expect(page.locator('[data-testid="call-notice"]')).toHaveCount(0);
+    expect((await callRecord(page)).hangups).toEqual([]);
+  });
+
+  /** A REFUSAL after the accept left is an answer, and the page acts on it: the microphone goes,
+   *  the backend has already let the call go on its side, and nobody is declined — the page
+   *  sends no hangup of its own. */
+  test("releases the microphone when the answer is refused after it left", async ({ page }) => {
+    await gotoApp(page);
+    await openConversationNamed(page, "Ava Thompson");
+    const conversationId = await page
+      .locator('[data-testid="composer-shell"]')
+      .getAttribute("data-conversation-id");
+    await emitCallInvite(page, conversationId!);
+    const bar = page.locator('[data-testid="call-bar"]');
+    await expect(bar).toHaveAttribute("data-phase", "ringing");
+
+    await refuseNextCallAccept(page);
+    await page.locator('[data-testid="call-answer"]').click();
+    await expect(page.locator('[data-testid="call-notice"]')).toContainText(
+      "the service refused the answer (403 Forbidden)",
+    );
+    // The call is over on this machine, so no "still ringing" is promised.
+    await expect(page.locator('[data-testid="call-notice"]')).not.toContainText("still ringing");
+    await expect(bar).toHaveCount(0);
+    await expect(page.locator('[data-testid="call-stage"]')).toHaveCount(0);
+    expect((await callRecord(page)).hangups).toEqual([]);
+  });
+
   test("ends the call when this machine stops taking calls", async ({ page }) => {
     await gotoApp(page);
     await openConversationNamed(page, "Ava Thompson");

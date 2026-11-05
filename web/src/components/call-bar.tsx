@@ -104,12 +104,16 @@ function RingingCard(props: { call: ActiveCall }) {
   // group mark: `peer_mri` is empty on both, and a face seeded from nothing would stand in
   // for five people.
   const conversation = callNamesAConversation(call);
+  // An answer this page already sent is still travelling: the phase stays `ringing` until
+  // the backend's attach answers, and a second press would accept twice.
+  const answering = useAppState((s) => s.callMediaFor) === call.id;
 
   return (
     <motion.div
       data-testid="call-bar"
       data-call-id={call.id}
       data-phase={call.phase}
+      data-media={answering ? "held" : "none"}
       role="alert"
       initial={{ opacity: 0, y: reduce ? 0 : -8 }}
       animate={{ opacity: 1, y: 0 }}
@@ -141,17 +145,24 @@ function RingingCard(props: { call: ActiveCall }) {
 
       <div className="flex shrink-0 items-center gap-1.5">
         {call.can_accept && (
-          <Button size="sm" data-testid="call-answer" onClick={() => void controller.answerCall()}>
-            Answer
+          <Button
+            size="sm"
+            data-testid="call-answer"
+            disabled={answering}
+            onClick={() => void controller.answerCall()}
+          >
+            {answering ? "Answering…" : "Answer"}
           </Button>
         )}
         {/* A ringing call has no mute: nothing is being sent yet, and a button that muted a
-            microphone which is not open would be a lie about what the machine is doing. */}
+            microphone which is not open would be a lie about what the machine is doing.
+            Decline is the ONE press that declines: the caller is shown it, so it is its own
+            action rather than a hang-up that happens to land on a ringing call. */}
         <button
           type="button"
           data-testid="call-hangup"
           aria-label="Decline"
-          onClick={() => void controller.hangUpCall()}
+          onClick={() => void controller.declineCall()}
           className="grid size-9 place-items-center rounded-full bg-destructive/15 text-destructive transition-colors hover:bg-destructive/25"
         >
           <HugeiconsIcon icon={CallEnd01Icon} className="size-4" strokeWidth={1.8} />

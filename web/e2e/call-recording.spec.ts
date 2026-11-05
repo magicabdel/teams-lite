@@ -2,6 +2,7 @@ import { expect, type Page } from "@playwright/test";
 import {
   callFromMenu,
   disableCalling,
+  loseBackend,
   emitCallInvite,
   fetchCapturedSends,
   gotoApp,
@@ -182,6 +183,46 @@ test.describe("Recording a call", () => {
       /Recording kept/,
       { timeout: 15_000 },
     );
+  });
+
+  /** A backend that RESTARTED under the call drops it with no frame; the page finds that out
+   *  when its socket comes back, and releases the media — and the recording with it. The file
+   *  is named and filed after the call it RECORDED: read off the status in hand at that moment,
+   *  which holds no call, it was titled "Call" and kept out of its conversation. */
+  test("keeps a recording in its conversation when the backend restarts under the call", async ({
+    page,
+  }) => {
+    await callIsUp(page);
+    const record = page.locator('[data-testid="call-record"]');
+    await record.click();
+    await expect(record).toHaveAttribute("data-recording", "true");
+    await page.waitForTimeout(1500);
+
+    await loseBackend(page);
+    await expect(page.locator('[data-testid="call-notice"]').first()).toContainText(
+      "teams-lite restarted, so you left the call.",
+      { timeout: 15_000 },
+    );
+    await expect(page.locator('[data-testid="call-recording-notice"]')).toContainText(
+      /Recording kept — .*, in this conversation\./,
+      { timeout: 15_000 },
+    );
+    await expect(page.locator('[data-testid="call-recording"]')).toBeVisible({ timeout: 15_000 });
+  });
+
+  /** Only the page that carries the call's media can record it: the voices and pictures are
+   *  that page's own connection. A page reloaded mid-call still draws the call — the backend is
+   *  still in it — and holds none of it, so it offers no Record. */
+  test("offers no Record on a page that holds none of the call's media", async ({ page }) => {
+    await callIsUp(page);
+    await expect(page.locator('[data-testid="call-record"]')).toBeVisible();
+
+    await page.reload();
+    const stage = page.locator('[data-testid="call-stage"]');
+    await expect(stage).toHaveAttribute("data-phase", "connected", { timeout: 15_000 });
+    await expect(stage).toHaveAttribute("data-media", "none");
+    await expect(page.locator('[data-testid="call-record"]')).toHaveCount(0);
+    await hangUp(page);
   });
 
   test("survives the hangup that ended the call it was recording", async ({ page }) => {

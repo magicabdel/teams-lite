@@ -10,7 +10,7 @@
 import type { AgentAuthPatch, AgentMode, AgentProviderPatch, AgentStatus } from "./agent";
 import type { AgentPersonaPatch } from "./agent-persona";
 import { BACKEND_WS_ROUTE } from "./backend-route";
-import type { CallPreparation, CallStatus, MeetingAddress } from "./call";
+import type { CallHangupIntent, CallPreparation, CallStatus, MeetingAddress } from "./call";
 import type { ChessEngineState } from "./chess-engine";
 import type { ChessSoundsState } from "./chess-sound";
 import type { SendImage } from "./composer-image";
@@ -1163,10 +1163,19 @@ export class Backend {
     });
   }
   /** End the call, or decline it while it is still ringing. Outward either way: the
-   *  other side is told. */
-  callHangup(callId: string): Promise<{ call_id: string; told_service: boolean }> {
+   *  other side may be told.
+   *
+   *  `intent` is what the press MEANT, and only `"decline"` — the ringing card's Decline —
+   *  ever declines a caller. `"end"` on a call still ringing lets it go here and tells nobody,
+   *  so a failed or abandoned answer can never show the caller "declined" (`hangup_door` in
+   *  src/bin/server.rs). */
+  callHangup(
+    callId: string,
+    intent: CallHangupIntent,
+  ): Promise<{ call_id: string; told_service: boolean }> {
     return this.writeRequest<{ call_id: string; told_service: boolean }>("call_hangup", {
       call_id: callId,
+      intent,
     });
   }
   /** Publish whether the user can be heard. The page has already stopped sending audio;

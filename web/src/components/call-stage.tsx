@@ -106,6 +106,7 @@ const MINI_RADIUS = 20;
 
 function Stage(props: { call: ActiveCall }) {
   const { call } = props;
+  const mediaFor = useAppState((s) => s.callMediaFor);
   const { mode, panel, position, setMode, togglePanel, setPosition } = useCallStage();
   const reduce = useReducedMotion();
   const viewport = useViewport();
@@ -170,6 +171,9 @@ function Stage(props: { call: ActiveCall }) {
       data-mode={mode}
       data-phase={call.phase}
       data-call-id={call.id}
+      // Whether THIS page holds a microphone for the call — the one fact about a live call a
+      // spec cannot read off a button, and the half a reconnect reconciles.
+      data-media={mediaFor === call.id ? "held" : "none"}
       // What the BACKEND says this endpoint sends, beside the phase and for the same reason:
       // it is the one fact about a live call that a driver has to read out of the app's own
       // state rather than out of a button, because a pressed button says what was ASKED for
@@ -789,6 +793,10 @@ function StageControl(props: {
  *
  * - **Only on a call whose audio is up** (`callCanBeRecorded`), because before that there is
  *   nothing to record and a button that produced an empty file would be worse than none.
+ * - **Only on the page that carries the call's media** (`callMediaFor`). The voices and the
+ *   pictures a recording is made of are this page's own connection, so a second window showing
+ *   the same call would record a silent canvas of names — and it holds no microphone for the
+ *   frames that end a call to release with it.
  * - **Only where the file could be kept** (`recordingsCanBeKept`), which is this browser's
  *   own storage answering. A recording that had nowhere to go is a recording nobody asked
  *   for.
@@ -802,9 +810,13 @@ function RecordControl(props: { call: ActiveCall; mini?: boolean }) {
   const controller = useController();
   const canKeep = useAppState((s) => s.recordingsCanBeKept);
   const recording = useAppState((s) => s.callRecording);
+  const mediaFor = useAppState((s) => s.callMediaFor);
   const live = recording && recording.callId === call.id ? recording : null;
 
   if (!callCanBeRecorded(call)) return null;
+  // Only the page that carries the call's media. A second window showing the same call holds
+  // no voice and no picture of it, so what it recorded would be a silent canvas of names.
+  if (!live && mediaFor !== call.id) return null;
   // In the folded window the control exists only while it has something to stop.
   if (mini && !live) return null;
   if (!live && !canKeep) return null;

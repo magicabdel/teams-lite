@@ -140,10 +140,13 @@ import {
 import {
   UNKNOWN_CALL_STATUS,
   callEndLabel,
-  holdsMicrophone,
+  callIsStillRinging,
+  callStillHoldsMedia,
   isLive,
+  lostCallMessage,
   modalityFor,
   type ActiveCall,
+  type CallHangupIntent,
   type CallMediaSignal,
   type CallStatus,
   type MeetingAddress,
@@ -160,7 +163,9 @@ import {
   type SendKind,
 } from "./call-media";
 import {
+  answerFailureMessage,
   callFailureMessage,
+  requestOutcomeUnknown,
   captureDroppedMessage,
   captureRefusedMessage,
   renegotiationRefusedMessage,
@@ -732,6 +737,16 @@ export type AppState = {
    *  pages agree and a reconnecting one is told rather than guessing. */
   callLocalVideo: LocalVideo[];
   /**
+   * The call THIS page holds a microphone for, or null.
+   *
+   * The media itself is not reactive (a peer connection must never be replaced by a render),
+   * so this is its observable half. It is what tells the ringing card an answer is already
+   * travelling — so a second press cannot open a second microphone and accept twice — and it
+   * is stated on the card and the stage (`data-media`), because whether this page is holding
+   * a microphone is the one fact about a call a spec cannot otherwise see.
+   */
+  callMediaFor: string | null;
+  /**
    * Whose picture is on each section, keyed by mid.
    *
    * A section says what it carries (a screen, a camera) and never WHOSE it is: the person is
@@ -1279,6 +1294,7 @@ function initialState(): AppState {
     callStatus: UNKNOWN_CALL_STATUS,
     callVideo: [],
     callLocalVideo: [],
+    callMediaFor: null,
     callVideoNames: {},
     callRecording: null,
     recordings: [],
@@ -2404,6 +2420,12 @@ export class TeamsController {
       // that already restarted. A download in flight is re-stated in the same greeting,
       // because the backend replays the phase on every connection.
       this.set({ update: null, updateProgress: null });
+      // And where the CALL stands. The backend sends no call in its greeting, and the one
+      // frame that ended a call may have gone out while this socket was down — a backend that
+      // restarted drops its call without a frame at all. Without this a page kept its stage,
+      // and its microphone, for a call that exists nowhere; the read reconciles both
+      // (`refreshCallStatus`), and says why the call went.
+      void this.refreshCallStatus();
       if (this.connectionDropped) {
         this.connectionDropped = false;
         void this.handleLiveRecovery();
@@ -2599,31 +2621,43 @@ export class TeamsController {
     return attempt === this.callAttempt;
   }
 
-  /** Take the media a start opened — or release it, because the user hung up while it
-   *  was opening.
+  /** Which backend process the held media was opened against (its `backend_started_ms`), so
+   *  a page that reconnects to find the call gone can say whether a restart took it. */
+  private callMediaBackendStartedMs: number | null = null;
+
+  /** Take the media a start opened for call `callId` — or release it, because the user hung
+   *  up while it was opening.
    *
    *  `this.callMedia` is the only handle on a microphone, and it is assigned here: a
    *  capture adopted after the hang-up would be one nothing could find to stop, and the
-   *  browser's recording indicator would stay on for a call that does not exist. */
-  private adoptCallMedia(media: CallMedia, attempt: number): boolean {
+   *  browser's recording indicator would stay on for a call that does not exist. For the
+   *  same reason a capture somehow still held is released before a new one is taken — one
+   *  call, one microphone. */
+  private adoptCallMedia(media: CallMedia, attempt: number, callId: string): boolean {
     if (!this.callAttemptStands(attempt)) {
       media.stop();
       return false;
     }
+    if (this.callMedia && this.callMedia !== media) this.stopCallMedia();
     this.callMedia = media;
+    this.callMediaBackendStartedMs = this.get().callStatus.backend_started_ms ?? null;
+    this.set({ callMediaFor: callId });
     return true;
   }
 
   /** Fold one `call_state` frame in, and stop the microphone when the call is over.
    *
-   *  This is the ONE place media is torn down, whichever side ended the call: our own
+   *  This is the ONE place a frame tears media down, whichever side ended the call: our own
    *  hangup, the far side's, a dropped connection, calling being turned off. A path that
    *  released the microphone somewhere else would eventually miss a case and leave the
-   *  browser's recording indicator on. */
+   *  browser's recording indicator on. It asks whether the media still belongs to a call
+   *  that is going on (`callStillHoldsMedia`), never what phase that call is in: an answer
+   *  that is still travelling holds the microphone while the backend still says `ringing`,
+   *  and a frame landing in that moment must not take it away. */
   private onCallState(status: CallStatus): void {
     this.set({ callStatus: status });
     const call = status.call;
-    if (!holdsMicrophone(call)) this.stopCallMedia();
+    if (!callStillHoldsMedia(call, this.get().callMediaFor)) this.stopCallMedia();
     // Otherwise: a roster frame is how somebody arriving becomes a name, so a running
     // recording collects them here — the people named in the file are everybody who was in
     // the call while it ran, not everybody who was in it when it started.
@@ -2812,6 +2846,8 @@ export class TeamsController {
     void this.stopCallRecording();
     this.callMedia?.stop();
     this.callMedia = null;
+    this.callMediaBackendStartedMs = null;
+    if (this.get().callMediaFor !== null) this.set({ callMediaFor: null });
     // The tiles go with the connection that fed them. A `<video>` left holding a stopped
     // stream shows its last frame for good, which reads as a call that is still up.
     if (this.get().callVideo.length > 0 || this.get().callLocalVideo.length > 0) {
@@ -2834,7 +2870,10 @@ export class TeamsController {
     // mock is where this surface is reviewed, and a bridge the mock path skipped is a rule no
     // spec could ever hold the app to.
     const media = this.get().backendIsMock
-      ? simulatedCallMedia({ answering: options.remoteOffer !== undefined })
+      ? simulatedCallMedia({
+          answering: options.remoteOffer !== undefined,
+          remoteOffer: options.remoteOffer,
+        })
       : await startCallMedia({
           iceServers: options.iceServers,
           remoteOffer: options.remoteOffer,
@@ -3022,14 +3061,39 @@ export class TeamsController {
 
   /** Ask the backend what this machine can do about calls. Called on connect, and after a
    *  start or a hang-up, so the page draws what the backend now says rather than what it
-   *  last assumed. There is no setting to re-read it after: calling has no switch. */
+   *  last assumed. There is no setting to re-read it after: calling has no switch.
+   *
+   *  A SUCCESSFUL read also reconciles the microphone, and that is the half a reconnect
+   *  needs: a page that lost its socket can miss the one frame that ended its call — the
+   *  backend restarted, or the far side hung up while the page could not hear — and would
+   *  otherwise hold a microphone for a call that exists nowhere. The rule is the frame's own
+   *  (`callStillHoldsMedia`): the call is over, gone, or a different call. It judges only
+   *  media that was ALREADY held when the read was asked, so an answer computed before a
+   *  call began can never take that call's microphone away. A read that FAILS decides
+   *  nothing: it says nothing about the call, and a page holding a call's microphone keeps
+   *  the status that call is drawn from — its Hang up included. */
   async refreshCallStatus(): Promise<void> {
+    const heldWhenAsked = this.callMedia;
+    let status: CallStatus;
     try {
-      this.set({ callStatus: await this.backend.callStatus() });
+      status = await this.backend.callStatus();
     } catch {
+      if (this.callMedia) return;
       // An older backend has no `call_status`; the unknown state is the safe reading.
       this.set({ callStatus: UNKNOWN_CALL_STATUS });
+      return;
     }
+    const heldFor = this.get().callMediaFor;
+    const startedWith = this.callMediaBackendStartedMs;
+    const lost =
+      heldWhenAsked !== null &&
+      this.callMedia === heldWhenAsked &&
+      !callStillHoldsMedia(status.call, heldFor);
+    // Released BEFORE the new status is written, while the status still names the call the
+    // media belonged to — which is the call a running recording is titled and filed under.
+    if (lost) this.stopCallMedia();
+    this.set({ callStatus: status });
+    if (lost) this.reportCall(lostCallMessage(startedWith, status.backend_started_ms), "report");
   }
 
   /** Place a call in a one-to-one chat: reserve it, open the microphone, send the
@@ -3039,6 +3103,9 @@ export class TeamsController {
     dismissNotice(CALL_NOTICE);
     const attempt = ++this.callAttempt;
     let callId: string | null = null;
+    // Set the moment the creating request is about to leave: before it, nothing reached
+    // anybody; after it, only a REFUSAL may be acted on.
+    let posted = false;
     try {
       const prepared = await this.backend.callPrepare({ conversation: conversationId });
       callId = prepared.call_id;
@@ -3051,12 +3118,20 @@ export class TeamsController {
       });
       // The user hung up while the microphone was opening: the reservation went back with
       // their click, so the offer must not go out and nothing is said.
-      if (!this.adoptCallMedia(media, attempt)) return;
+      if (!this.adoptCallMedia(media, attempt, prepared.call_id)) return;
+      posted = true;
       await this.backend.callPlace(prepared.call_id, media.localSdp);
     } catch (error) {
       // A start the user stopped is not a failure to report: they were there, and the
       // hang-up already released the microphone and the reservation.
       if (!this.callAttemptStands(attempt)) return;
+      // A LOST answer is not a refusal: the invite may already be ringing somebody, and a
+      // hang-up here would take back a call that is about to connect. The microphone stays,
+      // and the backend's own frames connect the call or end it (see `requestOutcomeUnknown`).
+      if (posted && requestOutcomeUnknown(error)) {
+        console.error("[call] the call's answer was lost; the backend decides how it ends", error);
+        return;
+      }
       this.reportCall(callFailureMessage(error), "error");
       this.stopCallMedia();
       // The backend reserved the call before the failure, so release it: a machine that
@@ -3080,14 +3155,22 @@ export class TeamsController {
     dismissNotice(CALL_NOTICE);
     const attempt = ++this.callAttempt;
     let callId: string | null = null;
+    let posted = false;
     try {
       const prepared = await this.backend.callPrepare({ meeting, subject });
       callId = prepared.call_id;
       const media = await this.openCallMedia({ iceServers: prepared.ice_servers });
-      if (!this.adoptCallMedia(media, attempt)) return;
+      if (!this.adoptCallMedia(media, attempt, prepared.call_id)) return;
+      posted = true;
       await this.backend.callJoin(prepared.call_id, meeting, media.localSdp);
     } catch (error) {
       if (!this.callAttemptStands(attempt)) return;
+      // The same rule as placing a call: everybody in the meeting may already see the user
+      // arrive, so a lost answer keeps the microphone and the backend's frames decide.
+      if (posted && requestOutcomeUnknown(error)) {
+        console.error("[call] the join's answer was lost; the backend decides how it ends", error);
+        return;
+      }
       this.reportCall(callFailureMessage(error), "error");
       this.stopCallMedia();
       if (callId) await this.hangUpCall();
@@ -3095,12 +3178,30 @@ export class TeamsController {
     }
   }
 
-  /** Answer the call that is ringing: take its offer, open the microphone, answer. */
+  /**
+   * Answer the call that is ringing: take its offer, open the microphone, answer.
+   *
+   * A FAILED ANSWER NEVER DECLINES. It used to hang the call up, and on a call still ringing
+   * that posted the invite's reject — so a microphone the browser refused showed the caller
+   * "declined", in the user's name, for a call they had just tried to take. Now:
+   *
+   * - before the accept leaves (or when it never left the page), nothing reached anybody, so
+   *   the microphone is released and nothing else happens — the call is still ringing, here
+   *   and on the user's other devices, and the sentence says so when the backend agrees;
+   * - after it leaves, a REFUSAL releases the microphone the same way, and the backend has
+   *   already ended or kept the call on its own side;
+   * - an answer that was LOST says nothing about whether the accept worked, so the
+   *   microphone stays and the backend's own frames connect the call or end it.
+   */
   async answerCall(): Promise<void> {
     const call = this.get().callStatus.call;
     if (!call || !call.can_accept) return;
+    // One answer at a time: while this page holds a microphone for the call, an answer is
+    // already travelling, and a second press would open a second microphone and accept twice.
+    if (this.get().callMediaFor === call.id) return;
     dismissNotice(CALL_NOTICE);
     const attempt = ++this.callAttempt;
+    let posted = false;
     try {
       const prepared = await this.backend.callPrepare({ callId: call.id });
       if (!prepared.offer_sdp) throw new Error("that call carried nothing to answer");
@@ -3108,19 +3209,40 @@ export class TeamsController {
         iceServers: prepared.ice_servers,
         remoteOffer: prepared.offer_sdp,
       });
-      if (!this.adoptCallMedia(media, attempt)) return;
+      if (!this.adoptCallMedia(media, attempt, call.id)) return;
+      posted = true;
       await this.backend.callAccept(call.id, media.localSdp);
     } catch (error) {
       if (!this.callAttemptStands(attempt)) return;
-      this.reportCall(callFailureMessage(error), "error");
+      if (posted && requestOutcomeUnknown(error)) {
+        console.error("[call] the answer was lost; the backend decides how the call goes", error);
+        return;
+      }
       this.stopCallMedia();
-      await this.hangUpCall();
+      await this.refreshCallStatus();
+      // The user may have declined or answered elsewhere while the status was read.
+      if (!this.callAttemptStands(attempt)) return;
+      const stillRinging = callIsStillRinging(this.get().callStatus.call, call.id);
+      this.reportCall(answerFailureMessage(error, stillRinging), "error");
     }
   }
 
-  /** End the call, or decline it while it is still ringing. The microphone is released
-   *  here as well as on the backend's own frame, because the user asked for it now. */
+  /** End the call. On a call still ringing this lets it go here WITHOUT declining it — it
+   *  goes on ringing the user's other devices — because only the Decline press declines.
+   *  The microphone is released here as well as on the backend's own frame, because the
+   *  user asked for it now. */
   async hangUpCall(): Promise<void> {
+    await this.leaveCall("end");
+  }
+
+  /** Decline the ringing call: the ringing card's Decline, and nothing else. The caller is
+   *  shown it, which is why it is its own action rather than a hang-up that happens to land
+   *  on a ringing call. */
+  async declineCall(): Promise<void> {
+    await this.leaveCall("decline");
+  }
+
+  private async leaveCall(intent: CallHangupIntent): Promise<void> {
     const call = this.get().callStatus.call;
     // Whatever start is in flight is over: this click is the user saying so, and it is the
     // one thing an await inside that start cannot see (see {@link callAttempt}).
@@ -3128,7 +3250,7 @@ export class TeamsController {
     this.stopCallMedia();
     if (!call) return;
     try {
-      await this.backend.callHangup(call.id);
+      await this.backend.callHangup(call.id, intent);
     } catch (error) {
       console.error("[call] the hangup failed", error);
     }
@@ -3154,6 +3276,16 @@ export class TeamsController {
    *  running recording and the recorder has no reason to know about people. */
   private recordingPeople = new Set<string>();
 
+  /** The call the running recording is OF, as it was last seen while it was the call on screen.
+   *
+   *  The file is named and filed when it is stopped, and by then the status may already say
+   *  something else: a reconnect that found the call gone holds no call at all, and a restarted
+   *  backend may already be ringing a different one. Read off the status at that moment, the
+   *  only copy of the recording was titled "Call" and kept out of its conversation — or titled
+   *  and filed under the other caller. So the status is used only while it still names this
+   *  call, and this is what stands in for it otherwise. */
+  private recordingCall: ActiveCall | null = null;
+
   /** Object URLs handed out for playback, one per recording, revoked when it is deleted.
    *
    *  Cached because a URL is what a `<video>` holds and the history is virtualized: a card
@@ -3173,6 +3305,10 @@ export class TeamsController {
   async startCallRecording(): Promise<void> {
     const call = this.get().callStatus.call;
     if (!callCanBeRecorded(call) || !call) return;
+    // Only the page that carries the call's media: the voices and the pictures a recording is
+    // made of are this page's own connection, so a second window showing the same call would
+    // record a silent canvas of names (see the Record control in components/call-stage.tsx).
+    if (this.get().callMediaFor !== call.id) return;
     if (this.get().callRecording || this.recorder) return;
     // What the LAST recording had to say is taken back, and nothing else: a notice about the
     // call — a camera it refused, a section it dropped — is about something still true.
@@ -3180,6 +3316,7 @@ export class TeamsController {
     try {
       const recorder = startCallRecorder(this.recordingInput(call));
       this.recorder = recorder;
+      this.recordingCall = call;
       this.recordingPeople = new Set(this.callPeople(call));
       this.set({
         callRecording: {
@@ -3214,7 +3351,9 @@ export class TeamsController {
     // press and the call ending in the same second — cannot write the file twice.
     this.recorder = null;
     this.set({ callRecording: { ...live, saving: true } });
-    const call = this.get().callStatus.call;
+    const current = this.get().callStatus.call;
+    const call = current && current.id === live.callId ? current : this.recordingCall;
+    this.recordingCall = null;
     const title = call ? callStageTitle(call) : "Call";
     try {
       const blob = await recorder.stop();
@@ -3291,6 +3430,7 @@ export class TeamsController {
     const recorder = this.recorder;
     const call = this.get().callStatus.call;
     if (!recorder || !call) return;
+    if (call.id === this.get().callRecording?.callId) this.recordingCall = call;
     recorder.update(this.recordingInput(call));
     for (const person of this.callPeople(call)) this.recordingPeople.add(person);
   }

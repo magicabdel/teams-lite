@@ -222,11 +222,57 @@ export function isLive(call: ActiveCall | null): boolean {
   return !!call && call.phase !== "ended";
 }
 
-/** Whether the microphone should be open for this call: from the moment the user
- *  answered (or dialled) until the call is over. */
-export function holdsMicrophone(call: ActiveCall | null): boolean {
-  return !!call && call.phase !== "ended" && call.phase !== "ringing";
+/**
+ * Whether the microphone a page holds for call `heldFor` still belongs to a call that is going
+ * on, by what the backend says now — a `call_state` frame, or a `call_status` read.
+ *
+ * It is keyed on the CALL, not on the phase. An answer that is still travelling holds the
+ * microphone while the backend's phase is still `ringing` (the phase moves when the attach
+ * answers), so reading the phase would release it under the very answer it belongs to. What
+ * really says the media is orphaned is the call being over, gone, or a different call — which
+ * is what a page that reconnects to a RESTARTED backend finds.
+ */
+export function callStillHoldsMedia(call: ActiveCall | null, heldFor: string | null): boolean {
+  return heldFor !== null && !!call && isLive(call) && call.id === heldFor;
 }
+
+/** Whether call `callId` can still be answered here, by what the backend says now — which is
+ *  what a failed Answer may promise the user, and nothing more. */
+export function callIsStillRinging(call: ActiveCall | null, callId: string): boolean {
+  return !!call && call.id === callId && call.phase === "ringing" && call.can_accept;
+}
+
+/**
+ * What a page says when it reconnects holding a microphone for a call the backend no longer has.
+ *
+ * The page missed the frame that ended it, so this is the one place that can still say it. When
+ * the backend's start moment moved, the call went with a restart — which is what the user can
+ * act on, because a restart is something somebody did. When it did not move, the call ended
+ * while the page could not hear about it. A backend too old to state the moment reads as the
+ * second, which is true either way.
+ */
+export function lostCallMessage(
+  heldWithBackendStartedMs: number | null | undefined,
+  nowBackendStartedMs: number | null | undefined,
+): string {
+  const restarted =
+    typeof heldWithBackendStartedMs === "number" &&
+    typeof nowBackendStartedMs === "number" &&
+    heldWithBackendStartedMs !== nowBackendStartedMs;
+  return restarted
+    ? "teams-lite restarted, so you left the call."
+    : "The call ended while this page was disconnected.";
+}
+
+/**
+ * What a press that ends a call MEANT (`call_hangup`'s `intent`).
+ *
+ * Only `"decline"` — the ringing card's Decline — ever declines a caller. Every other ending is
+ * `"end"`, and on a call still ringing that lets the call go here and tells nobody, so it goes
+ * on ringing the user's other devices. The backend decides the door (`hangup_door` in
+ * src/bin/server.rs) and refuses any other word.
+ */
+export type CallHangupIntent = "decline" | "end";
 
 /** Whether a conversation is one this app can call: a chat with people in it to ring.
  *
@@ -385,6 +431,14 @@ export function callDurationLabel(call: ActiveCall | null, nowMs: number): strin
  */
 export const CALL_END_UNREACHABLE = "CallEndReasonNobodyReachable";
 
+/**
+ * The backend's name for a ringing call this machine let go WITHOUT declining it —
+ * `calling::END_REASON_LEFT_RINGING`, spelled once here and pinned from the Rust side
+ * (`the_page_knows_the_name_of_a_ring_let_go`). The user ended it themselves, so it says
+ * nothing; unnamed, it would fall to "The call ended." about a call they ended.
+ */
+export const CALL_END_LEFT_RINGING = "CallEndReasonLeftRinging";
+
 /** Why the call is over, in one short line — or "" when there is nothing worth saying.
  *
  *  The service's own phrases are machine words ("CallEndReasonHangup"), and the ordinary
@@ -396,6 +450,7 @@ export function callEndLabel(call: ActiveCall | null): string {
   switch (reason) {
     case "CallEndReasonHangup":
     case "CallEndReasonDeclined":
+    case CALL_END_LEFT_RINGING:
       return "";
     // The service could not ring anybody: nothing of theirs is signed in (`calling::
     // END_REASON_UNREACHABLE`, and `calling::invite_failed` for how it is known). It reads

@@ -77,6 +77,50 @@ export function callFailureMessage(error: unknown): string {
   return withoutMethodName(raw) || "That did not happen, and nothing said why.";
 }
 
+/**
+ * Whether a request failed BEFORE it left this page — the socket was not open, so the backend
+ * never saw it (`not connected`, in lib/ws-client.ts). Nothing happened anywhere, which is what
+ * lets a failed Answer leave the call exactly as it was.
+ */
+export function requestNeverSent(error: unknown): boolean {
+  return rawMessage(error) === "not connected";
+}
+
+/**
+ * Whether a request's OUTCOME is unknown: it left this page and the answer never came back —
+ * the page's own ceiling ran out (`timeout: <method>`) or the socket closed under it
+ * (`connection closed`). Neither says whether the backend did the thing.
+ *
+ * This is the half that decides what a start does after its creating request went out: the
+ * page acts on a REFUSAL, never on a lost answer. Hanging up on a lost answer would end a call
+ * that may be about to connect — or, on an answer, decline a caller who may already be talking
+ * to this machine — so the page keeps its microphone and lets the backend's own frames end or
+ * connect the call. An ending the page missed is caught by the reconcile on the next
+ * successful `call_status` (`callStillHoldsMedia` in ./call.ts).
+ */
+export function requestOutcomeUnknown(error: unknown): boolean {
+  const raw = rawMessage(error);
+  return raw === "connection closed" || raw.startsWith("timeout:");
+}
+
+/**
+ * The sentence for an Answer that did not happen.
+ *
+ * It is the call's own failure sentence, plus " The call is still ringing." when — and only
+ * when — the backend, asked AFTER the failure, says that very call can still be answered. A
+ * failed Answer never declines anybody, so the caller is still waiting, and the one thing the
+ * user needs to know next is that they can still pick up, here or on another device. A call
+ * that stopped ringing meanwhile gets the failure alone: promising a ring that is over would
+ * send them looking for it.
+ */
+export function answerFailureMessage(error: unknown, stillRinging: boolean): string {
+  const failure = callFailureMessage(error);
+  if (!stillRinging) return failure;
+  // A backend refusal is kept word for word, and those do not always end a sentence.
+  const sentence = /[.!?…]$/.test(failure) ? failure : `${failure}.`;
+  return `${sentence} The call is still ringing.`;
+}
+
 /** What an insecure origin costs, and the two things that really mend it.
  *
  *  Both are named because this app is reached three ways and they do not overlap: an https

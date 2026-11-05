@@ -1192,7 +1192,14 @@ function liveCallMedia(
  * the machine and no permission prompt. The app only ever picks this when the backend
  * announced itself as the mock (`backend_info`), which no real backend does.
  */
-export function simulatedCallMedia(options: { answering: boolean }): CallMedia {
+export function simulatedCallMedia(options: { answering: boolean; remoteOffer?: string }): CallMedia {
+  // The browser refusing the microphone, which is the commonest way a real Answer fails —
+  // reproduced the only way the stand-in can be told it: on the wire, the way it already reads
+  // a rejected section. Only the mock writes this line (`{kind:"call_media",
+  // microphone:"refuse"}`), so no real offer can ever carry it.
+  if (options.remoteOffer?.includes(SIMULATED_MICROPHONE_REFUSAL)) {
+    throw new MicrophoneUnavailableError(new DOMException("Permission denied", "NotAllowedError"));
+  }
   let stopped = false;
   // The same reading the live one takes off its own connection: a call this side ANSWERED
   // was negotiated the moment it was taken, and a call it placed is negotiated when the
@@ -1395,6 +1402,11 @@ const VIDEO_LABELS = ["main-video", SHARING_LABEL];
 
 /** A minimal, valid audio offer. Never sent anywhere real: the mock is the only backend
  *  that ever sees it. */
+/** The line the MOCK puts in an offer it wants the stand-in's microphone to refuse
+ *  (`simulatedCallMedia`). Re-spelled in web/mock/server.ts, which cannot import this file,
+ *  and pinned there by `mock-call-media.test.ts`. */
+export const SIMULATED_MICROPHONE_REFUSAL = "a=x-teams-lite-mock:microphone-refused";
+
 const SIMULATED_SDP = [
   "v=0",
   "o=- 0 0 IN IP4 127.0.0.1",

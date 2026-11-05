@@ -489,11 +489,87 @@ export async function mockRpc(
  */
 export async function holdCallStart(
   page: Page,
-  hold: "prepare" | "place",
+  hold: "prepare" | "place" | "accept" | "join",
   holdMs = 1500,
 ): Promise<void> {
   const res = await page.request.post(`http://127.0.0.1:${MOCK_PORT}/__test/emit`, {
     data: { kind: "call_start", hold, hold_ms: holdMs },
+  });
+  expect(res.ok()).toBeTruthy();
+}
+
+/**
+ * Make the next `call_prepare` FAIL, once, on any path — a start or an answer that failed
+ * before anything reached anybody. Always finish with `resetCall`.
+ */
+export async function refuseNextCallPrepare(page: Page): Promise<void> {
+  const res = await page.request.post(`http://127.0.0.1:${MOCK_PORT}/__test/emit`, {
+    data: { kind: "call_start", refuse: "prepare" },
+  });
+  expect(res.ok()).toBeTruthy();
+}
+
+/**
+ * Make the next `call_accept` be REFUSED after it went out, once — the backend ends the call on
+ * its own side and the answer fails. Always finish with `resetCall`.
+ */
+export async function refuseNextCallAccept(page: Page): Promise<void> {
+  const res = await page.request.post(`http://127.0.0.1:${MOCK_PORT}/__test/emit`, {
+    data: { kind: "call_start", refuse: "accept" },
+  });
+  expect(res.ok()).toBeTruthy();
+}
+
+/**
+ * Make the browser refuse the microphone on the next ANSWER, once — the commonest real way an
+ * Answer fails. The mock's offer carries the line the page's stand-in reads it from. Always
+ * finish with `resetCall`.
+ */
+export async function refuseNextMicrophone(page: Page): Promise<void> {
+  const res = await page.request.post(`http://127.0.0.1:${MOCK_PORT}/__test/emit`, {
+    data: { kind: "call_media", microphone: "refuse" },
+  });
+  expect(res.ok()).toBeTruthy();
+}
+
+/** What the mock recorded about the calls a spec drove: every hangup (with what the page MEANT
+ *  and whether the caller was declined), how many status reads it failed on purpose, and how
+ *  many it answered — which is what a spec waits on instead of sleeping for a reconnect. */
+export type CallRecord = {
+  hangups: { intent: string | null; declined: boolean }[];
+  status_refusals: number;
+  status_reads: number;
+};
+
+export async function callRecord(page: Page): Promise<CallRecord> {
+  const res = await page.request.post(`http://127.0.0.1:${MOCK_PORT}/__test/emit`, {
+    data: { kind: "call_record" },
+  });
+  expect(res.ok()).toBeTruthy();
+  return (await res.json()) as CallRecord;
+}
+
+/** The mock's backend RESTARTED under the live call: the call is gone with no frame, the start
+ *  moment moved, and every socket drops. Always finish with `resetCall`. */
+export async function loseBackend(page: Page): Promise<void> {
+  const res = await page.request.post(`http://127.0.0.1:${MOCK_PORT}/__test/emit`, {
+    data: { kind: "calling", lose: true },
+  });
+  expect(res.ok()).toBeTruthy();
+}
+
+/** Drop every socket and keep the call — a network blip as a page sees it. */
+export async function dropBackendSockets(page: Page): Promise<void> {
+  const res = await page.request.post(`http://127.0.0.1:${MOCK_PORT}/__test/emit`, {
+    data: { kind: "calling", reconnect: true },
+  });
+  expect(res.ok()).toBeTruthy();
+}
+
+/** Fail the next `call_status` read, once. Always finish with `resetCall`. */
+export async function failNextCallStatus(page: Page): Promise<void> {
+  const res = await page.request.post(`http://127.0.0.1:${MOCK_PORT}/__test/emit`, {
+    data: { kind: "calling", refuse_status: true },
   });
   expect(res.ok()).toBeTruthy();
 }

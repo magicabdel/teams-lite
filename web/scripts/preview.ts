@@ -2856,10 +2856,31 @@ if (import.meta.main) {
       await shot(`${out}-ringing-card-dark.png`, '[data-testid="call-bar"]');
       await setTheme("light");
 
+      // 3a. A FAILED Answer, which never declines: the browser refused the microphone (the
+      //     mock's offer tells the stand-in to), and the card is STILL THERE with the notice
+      //     stacked over it saying so. The page shot is the one that matters — the notice must
+      //     clear Answer, which is the press the sentence invites.
+      await emit({ kind: "call_media", microphone: "refuse" });
+      await page.locator('[data-testid="call-answer"]').click();
+      await page.waitForSelector('[data-testid="call-notice"]');
+      await page.waitForSelector('[data-testid="call-bar"][data-phase="ringing"][data-media="none"]');
+      await page.waitForTimeout(500);
+      await shot(`${out}-answer-failed-light.png`);
+      await setTheme("dark");
+      await shot(`${out}-answer-failed-dark.png`);
+      await setTheme("light");
+
+      // 3b. The answer TRAVELLING: held at the attach, the card says so and takes no second
+      //     press. Its release is what answers the call for step 4.
+      await emit({ kind: "call_start", hold: "accept", hold_ms: 1500 });
+      await page.locator('[data-testid="call-answer"]').click();
+      await page.waitForSelector('[data-testid="call-bar"][data-media="held"]');
+      await page.waitForTimeout(200);
+      await shot(`${out}-answering-card-light.png`, '[data-testid="call-bar"]');
+
       // 4. Answered: the CALL AS A PAGE — the header, the time, the controls, and the card
       //    with the person in the middle of it. This is the whole surface, so the shot is
       //    the page rather than a crop.
-      await page.locator('[data-testid="call-answer"]').click();
       await page.waitForSelector('[data-testid="call-stage"][data-mode="full"]');
       await page.waitForTimeout(1100);
       await shot(`${out}-stage-light.png`);
@@ -3043,6 +3064,7 @@ if (import.meta.main) {
         `[preview] wrote ${out}-button-light.png, ${out}-off-light.png, ` +
           `${out}-call-unregistered-{light,dark}.png, ` +
           `${out}-ringing-{light,card-light,card-dark}.png and ` +
+          `${out}-answer-failed-{light,dark}.png, ${out}-answering-card-light.png and ` +
           `${out}-stage-{light,header-light,muted-light,dark}.png and ` +
           `${out}-mini-{light,page-light,dragged-light,dark,video-light}.png and ` +
           `${out}-group-{button-light,dialing-light,stage-light}.png and ` +

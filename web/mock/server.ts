@@ -4855,10 +4855,66 @@ let mockSharingOrder: string[] = [];
  *  own media is instant, which left the whole case unreachable from a spec. Which step is
  *  held decides which half is exercised: the offer that must never go out, or the invite
  *  that went out and has to be taken back. */
-let mockCallStartHold: { at: "prepare" | "place"; ms: number } | null = null;
+let mockCallStartHold: { at: MockCallStartStep; ms: number } | null = null;
+
+/** The steps a start can be held at. `accept` is an ANSWER still travelling: the backend's
+ *  phase stays `ringing` until its attach answers, which is the window an End or a Decline
+ *  lands in while the page already holds a microphone. */
+type MockCallStartStep = "prepare" | "place" | "accept" | "join";
+
+/** Armed by `{kind:"call_start", refuse:"prepare"}`: the NEXT `call_prepare` is refused, on
+ *  any path, and only that one — a failure BEFORE anything reached anybody, which is the case
+ *  a failed Answer must leave ringing. */
+let mockRefusesNextPrepare = false;
+
+/** Armed by `{kind:"call_start", refuse:"accept"}`: the NEXT `call_accept` is refused AFTER it
+ *  went out, the way the Rust backend answers when the service refuses the attach — it ends the
+ *  call on its own side (`CallEndReasonAcceptFailed`) and the RPC fails. */
+let mockRefusesNextAccept = false;
+
+/** Armed by `{kind:"call_media", microphone:"refuse"}`: the NEXT answering `call_prepare`
+ *  hands back an offer carrying the line that makes the page's stand-in refuse the
+ *  microphone (`SIMULATED_MICROPHONE_REFUSAL` in web/src/lib/call-media.ts, re-spelled here
+ *  because this file cannot import it, and pinned by `mock-call-media.test.ts`). It is the
+ *  commonest real way an Answer fails, and the page's simulated media is the only place it
+ *  can be reproduced. */
+let mockRefusesNextMicrophone = false;
+const MOCK_MICROPHONE_REFUSAL_LINE = "a=x-teams-lite-mock:microphone-refused";
+
+/** Armed by `{kind:"calling", refuse_status:true}`: the NEXT `call_status` read fails, once —
+ *  what a page meets when its read is lost, and which must never take a live call's
+ *  microphone or its stage away. */
+let mockRefusesNextStatus = false;
+
+/** Every `call_hangup` this mock carried out, with what the page meant and whether the caller
+ *  was DECLINED — read back by `{kind:"call_record"}`. Counted rather than read off the
+ *  screen, because a page that declined and then drew the right card would pass every
+ *  assertion about the card. */
+let mockHangups: { intent: string | null; declined: boolean }[] = [];
+/** How many `call_status` reads the `refuse_status` hook has failed, read back by the same
+ *  hook: a spec proving that a failed read keeps the call has to know the read really failed,
+ *  or it passes on a page that never asked. */
+let mockStatusRefusals = 0;
+/** And how many it ANSWERED, so a spec can wait for the read a reconnect makes rather than
+ *  sleep for it. */
+let mockStatusReads = 0;
+
+/** The backend's refusal of an intent it does not know (`CALL_HANGUP_BAD_INTENT`). */
+const MOCK_CALL_HANGUP_BAD_INTENT = "call_hangup: intent must be decline or end";
+
+/** `hangup_door` in src/bin/server.rs, word for word: only an incoming call that is still
+ *  ringing has a caller to decline, and only `decline` — or a page too old to say — does. */
+function mockHangupDoor(
+  direction: string,
+  phase: string,
+  intent: "decline" | "end" | null,
+): "reject" | "hangup" | "nothing" {
+  if (direction === "incoming" && phase === "ringing") return intent === "end" ? "nothing" : "reject";
+  return "hangup";
+}
 
 /** Wait out the hold armed for `step`, once. */
-async function holdMockCallStart(step: "prepare" | "place"): Promise<void> {
+async function holdMockCallStart(step: MockCallStartStep): Promise<void> {
   const hold = mockCallStartHold;
   if (!hold || hold.at !== step) return;
   mockCallStartHold = null;
@@ -4895,8 +4951,9 @@ const MOCK_CALL_REGISTRATION_STATES: readonly MockCallRegistrationState[] = [
 let mockCallRegistration: MockCallRegistrationState = "registered";
 
 /** When this mock began serving, which is what `backend_started_ms` reports: one value for
- *  the life of the process, exactly as a real backend's never moves until it restarts. */
-const MOCK_BACKEND_STARTED_MS = Date.now();
+ *  the life of the process, exactly as a real backend's never moves until it restarts. The
+ *  `{kind:"calling", lose:true}` hook moves it, because that hook stands for a restart. */
+let mockBackendStartedMs = Date.now();
 
 /** The backend's own rule (`ready = channel.is_some() && connected`), read off the state the
  *  registration is in: a channel exists once the registrar has answered, whatever it said.
@@ -4946,7 +5003,7 @@ function mockCallStatus(): {
     registration: mockCallingEnabled
       ? { state: mockCallRegistration, registrar_status: mockRegistrarStatus(mockCallRegistration) }
       : null,
-    backend_started_ms: MOCK_BACKEND_STARTED_MS,
+    backend_started_ms: mockBackendStartedMs,
   };
 }
 
@@ -10286,6 +10343,12 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
     // end to end (see the calling block above).
 
     case "call_status":
+      if (mockRefusesNextStatus) {
+        mockRefusesNextStatus = false;
+        mockStatusRefusals += 1;
+        throw new Error("call_status: the mock was told to fail this read");
+      }
+      mockStatusReads += 1;
       return mockCallStatus();
 
     case "call_prepare": {
@@ -10293,6 +10356,10 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
       // A read-only backend refuses before the method runs, so on every path, answering
       // included — exactly as its dispatch gate does.
       if (!mockCallingEnabled) throw new Error(MOCK_CALL_PREPARE_READ_ONLY);
+      if (mockRefusesNextPrepare) {
+        mockRefusesNextPrepare = false;
+        throw new Error("call_prepare: that call carried no offer");
+      }
       // Answering: hand back the offer that is ringing, exactly like the Rust one — which
       // does NOT ask whether the registration is up. A call already ringing arrived on a
       // socket that was, and refusing to answer it because that socket dropped a moment
@@ -10301,9 +10368,13 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
         if (!mockCall || mockCall.id !== o.call_id || mockCall.phase !== "ringing") {
           throw new Error("call_prepare: that call is not ringing");
         }
+        const refuseMicrophone = mockRefusesNextMicrophone;
+        mockRefusesNextMicrophone = false;
         return {
           call_id: mockCall.id,
-          offer_sdp: MOCK_ANSWER_SDP,
+          offer_sdp: refuseMicrophone
+            ? `${MOCK_ANSWER_SDP}${MOCK_MICROPHONE_REFUSAL_LINE}\r\n`
+            : MOCK_ANSWER_SDP,
           ice_servers: [{ urls: ["stun:mock.invalid:3478"] }],
         };
       }
@@ -10471,6 +10542,9 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
         throw new Error("call_join: no meeting named — pass join_url or meeting_thread");
       }
       if (!mockCall || mockCall.id !== callId) throw new Error("call_join: no such meeting");
+      // A hold here is the join POST on the wire.
+      await holdMockCallStart("join");
+      if (!mockCall || mockCall.id !== callId) return { call_id: callId, cancelled: true };
       // The lobby first, then somebody lets us in, then the roster arrives. Three
       // frames, in the order the real service sends them — which is what makes the
       // states the UI draws reviewable.
@@ -10521,6 +10595,19 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
       const callId = requireString(params, "call_id");
       requireString(params, "sdp");
       if (!mockCall || mockCall.id !== callId) throw new Error("call_accept: no such call");
+      // A hold here is the attach on the wire: the phase is still `ringing`, which is the
+      // window an End or a Decline lands in while the page already holds a microphone.
+      await holdMockCallStart("accept");
+      if (!mockCall || mockCall.id !== callId) {
+        // The call was let go while the accept travelled. The real backend hangs up whatever
+        // the accept made (`hang_up_orphan`); there is nothing to hang up here.
+        return { call_id: callId, cancelled: true };
+      }
+      if (mockRefusesNextAccept) {
+        mockRefusesNextAccept = false;
+        endMockCall("CallEndReasonAcceptFailed");
+        throw new Error("call_accept: the service refused the answer (403 Forbidden)");
+      }
       mockCall = {
         ...mockCall,
         phase: "connected",
@@ -10634,12 +10721,27 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
       return { call_id: callId, told_service: told };
     }
 
+    // `hangup_request` and `hangup_door` in src/bin/server.rs: the intent is checked first and
+    // refused in the backend's words, and only a Decline — or a page too old to say — declines
+    // a ringing caller. `end` on a ringing call lets it go and tells nobody.
     case "call_hangup": {
+      const o = asObject(params);
+      const intent = o.intent ?? null;
+      if (intent !== null && intent !== "decline" && intent !== "end") {
+        throw new Error(MOCK_CALL_HANGUP_BAD_INTENT);
+      }
       const callId = requireString(params, "call_id");
       if (!mockCall || mockCall.id !== callId) throw new Error("call_hangup: no such call");
-      const declining = mockCall.direction === "incoming" && mockCall.phase === "ringing";
-      endMockCall(declining ? "CallEndReasonDeclined" : "CallEndReasonHangup");
-      return { call_id: callId, told_service: true };
+      const door = mockHangupDoor(mockCall.direction, mockCall.phase, intent);
+      mockHangups.push({ intent, declined: door === "reject" });
+      endMockCall(
+        door === "reject"
+          ? "CallEndReasonDeclined"
+          : door === "nothing"
+            ? "CallEndReasonLeftRinging"
+            : "CallEndReasonHangup",
+      );
+      return { call_id: callId, told_service: door !== "nothing" };
     }
 
     case "call_mute": {
@@ -13520,11 +13622,69 @@ async function handleTestHook(req: Request, url: URL): Promise<Response | null> 
     // call spends on a microphone, and the one it spends posting the invite. Nothing is
     // armed for later than that next step (`holdMockCallStart` disarms as it fires), and
     // `call_invite {reset:true}` clears it with the rest.
+    //
+    // `refuse:"prepare"` instead refuses the next `call_prepare` once, on any path — a start
+    // that failed before anything reached anybody.
+    if (body.kind === "call_start" && body.refuse === "prepare") {
+      mockRefusesNextPrepare = true;
+      return Response.json({ ok: true, refuse: "prepare" }, { status: 200 });
+    }
+    // `refuse:"accept"` refuses the next `call_accept` AFTER it went out, as the backend does
+    // when the service refuses the attach.
+    if (body.kind === "call_start" && body.refuse === "accept") {
+      mockRefusesNextAccept = true;
+      return Response.json({ ok: true, refuse: "accept" }, { status: 200 });
+    }
     if (body.kind === "call_start") {
-      const at = body.hold === "place" ? "place" : "prepare";
+      const at: MockCallStartStep =
+        body.hold === "place" || body.hold === "accept" || body.hold === "join"
+          ? body.hold
+          : "prepare";
       const ms = typeof body.hold_ms === "number" ? body.hold_ms : 1500;
       mockCallStartHold = { at, ms };
       return Response.json({ ok: true, hold: at, hold_ms: ms }, { status: 200 });
+    }
+    // Make the browser refuse the microphone on the NEXT answer, once — the commonest real
+    // way an Answer fails. Armed; `call_invite {reset:true}` clears it.
+    if (body.kind === "call_media" && body.microphone === "refuse") {
+      mockRefusesNextMicrophone = true;
+      return Response.json({ ok: true, microphone: "refuse" }, { status: 200 });
+    }
+    // Every hangup this mock carried out, whether it DECLINED the caller, and how many status
+    // reads were failed on purpose.
+    if (body.kind === "call_record") {
+      return Response.json(
+        {
+          ok: true,
+          hangups: mockHangups,
+          status_refusals: mockStatusRefusals,
+          status_reads: mockStatusReads,
+        },
+        { status: 200 },
+      );
+    }
+    // A backend that RESTARTED under a live call, as a page sees it: the call is gone with no
+    // frame saying so, the start moment moved, and every socket drops. A SIGKILLed backend,
+    // an update and a restart from Settings all look exactly like this to a page — which is
+    // why the page re-reads the call when its socket comes back, and says the restart took it.
+    if (body.kind === "calling" && body.lose === true) {
+      clearMockCallTimers();
+      mockSharingSession = null;
+      mockSharingOrder = [];
+      mockCall = null;
+      mockBackendStartedMs += 1;
+      for (const ws of sockets) ws.close();
+      return Response.json({ ok: true, lose: true }, { status: 200 });
+    }
+    // Drop every socket and keep the call — a network blip, as a page sees it.
+    if (body.kind === "calling" && body.reconnect === true) {
+      for (const ws of sockets) ws.close();
+      return Response.json({ ok: true, reconnect: true }, { status: 200 });
+    }
+    // Fail the next `call_status` read, once. Armed; `call_invite {reset:true}` clears it.
+    if (body.kind === "calling" && body.refuse_status === true) {
+      mockRefusesNextStatus = true;
+      return Response.json({ ok: true, refuse_status: true }, { status: 200 });
     }
     if (body.kind === "call_invite") {
       if (body.reset === true) {
@@ -13535,6 +13695,12 @@ async function handleTestHook(req: Request, url: URL): Promise<Response | null> 
         mockCallRegistration = "registered";
         mockRefusesNextMedia = false;
         mockCallStartHold = null;
+        mockRefusesNextPrepare = false;
+        mockRefusesNextAccept = false;
+        mockRefusesNextMicrophone = false;
+        mockRefusesNextStatus = false;
+        mockHangups = [];
+        mockStatusRefusals = 0;
         broadcastMockCall();
         return Response.json({ ok: true, reset: true }, { status: 200 });
       }

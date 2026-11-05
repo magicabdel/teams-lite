@@ -1,9 +1,12 @@
 import { describe, it, expect } from "vitest";
 import {
+  answerFailureMessage,
   callFailureMessage,
   captureDroppedMessage,
   captureRefusedMessage,
   renegotiationRefusedMessage,
+  requestNeverSent,
+  requestOutcomeUnknown,
 } from "./call-failure";
 import { CaptureUnavailableError, MicrophoneUnavailableError, type SendKind } from "./call-media";
 
@@ -160,6 +163,55 @@ describe("callFailureMessage", () => {
     // A browser WebSocket failure arrives as an Event, which stringifies to "[object Event]".
     expect(callFailureMessage(new Event("error"))).toBe("connection error");
     expect(callFailureMessage({})).toBe("unknown error");
+  });
+});
+
+// Which failures may a start ACT on? A request that never left reached nobody; one whose
+// answer was lost says nothing either way; everything else is the backend's refusal.
+describe("what a failed request says about the call", () => {
+  it("knows a request that never left the page", () => {
+    expect(requestNeverSent(new Error("not connected"))).toBe(true);
+    expect(requestNeverSent(new Error("connection closed"))).toBe(false);
+    expect(requestNeverSent(new Error("timeout: call_accept"))).toBe(false);
+    expect(requestNeverSent(new Error("call_accept: no such call"))).toBe(false);
+  });
+
+  it("knows an answer that was lost, and nothing else", () => {
+    expect(requestOutcomeUnknown(new Error("connection closed"))).toBe(true);
+    expect(requestOutcomeUnknown(new Error("timeout: call_accept"))).toBe(true);
+    expect(requestOutcomeUnknown(new Error("timeout: call_place"))).toBe(true);
+    // Never left: nothing happened, so it is not unknown.
+    expect(requestOutcomeUnknown(new Error("not connected"))).toBe(false);
+    // A refusal is an answer, and the page acts on it.
+    expect(requestOutcomeUnknown(new Error("call_accept: no such call"))).toBe(false);
+    expect(
+      requestOutcomeUnknown(new Error("call_accept needs the write token this backend published")),
+    ).toBe(false);
+    expect(requestOutcomeUnknown(new MicrophoneUnavailableError(new Error("NotAllowedError")))).toBe(
+      false,
+    );
+  });
+});
+
+describe("answerFailureMessage", () => {
+  it("adds that the call still rings only when the backend says so", () => {
+    const refused = new MicrophoneUnavailableError(new Error("NotAllowedError"));
+    expect(answerFailureMessage(refused, true)).toBe(
+      "teams-lite could not open the microphone. Allow it for this site, then try again. " +
+        "The call is still ringing.",
+    );
+    expect(answerFailureMessage(refused, false)).toBe(
+      "teams-lite could not open the microphone. Allow it for this site, then try again.",
+    );
+  });
+
+  it("ends a refusal kept word for word as a sentence before it adds one", () => {
+    expect(answerFailureMessage(new Error("call_accept: the offer was refused"), true)).toBe(
+      "the offer was refused. The call is still ringing.",
+    );
+    expect(answerFailureMessage(new Error("call_accept: the offer was refused"), false)).toBe(
+      "the offer was refused",
+    );
   });
 });
 

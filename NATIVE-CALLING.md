@@ -543,13 +543,14 @@ away. A read-only backend is the only one that never registers.
 | `call_place` | `OUTWARD_METHODS` | The § 2.3 POST, carrying our offer. Rings a person. |
 | `call_join` | `OUTWARD_METHODS` | The same POST for a MEETING: no `to`, plus `meetingInfo`. Rings nobody. |
 | `call_accept` | `OUTWARD_METHODS` | Answers with our SDP. Opens the microphone to them. |
-| `call_hangup` | `OUTWARD_METHODS` | Ends the call, or declines it while it is still ringing. |
+| `call_hangup` | `OUTWARD_METHODS` | Ends the call. `intent: "decline"` — the ringing card's Decline, and nothing else — declines a call still ringing; `intent: "end"` on one lets it go here and tells nobody, so it rings on the user's other devices. No intent is an older page and declines, as it always did. Any other word is refused. |
 | `call_mute` | `OUTWARD_METHODS` | Publishes whether the user can be heard. |
 
-Two events carry the rest: `call_state` (the whole state, every time — so a page that
-reconnects mid-call learns what a live one knows, and so ONE frame releases the
-microphone) and `call_media` (the far side's SDP, the only frame whose body a client is
-given). `call_signal` still forwards every raw calling frame for capture.
+Two events carry the rest: `call_state` (the whole state, every time, so ONE frame releases
+the microphone) and `call_media` (the far side's SDP, the only frame whose body a client is
+given). The greeting carries no call, so a page that reconnects mid-call re-reads `call_status`
+— which is how it learns what a live one knows, or that its call went while it could not hear
+(a restarted backend drops a call with no frame at all). `call_signal` still forwards every raw calling frame for capture.
 
 Two things the backend does on its own, and neither is a decision about a call:
 

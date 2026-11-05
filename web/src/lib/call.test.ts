@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
   UNKNOWN_CALL_STATUS,
   callDurationLabel,
+  CALL_END_LEFT_RINGING,
   CALL_END_UNREACHABLE,
   callEndLabel,
+  callIsStillRinging,
   callPhaseLabel,
   callNamesAConversation,
   callPresenceLabel,
@@ -12,8 +14,9 @@ import {
   canPlaceCall,
   conversationCallAction,
   conversationIsCallable,
-  holdsMicrophone,
+  callStillHoldsMedia,
   isLive,
+  lostCallMessage,
   isMeeting,
   isMeetingJoinLink,
   meetingAddressOf,
@@ -210,16 +213,55 @@ describe("whether a call is live", () => {
     expect(isLive(null)).toBe(false);
   });
 
-  /** The microphone is the thing a mistake here leaves switched on, so it is its own
-   *  question: a call that is only RINGING has not opened it yet, and a call that
-   *  ended must not be holding it. */
-  it("only holds the microphone once the call was answered", () => {
-    expect(holdsMicrophone(call({ phase: "ringing" }))).toBe(false);
-    expect(holdsMicrophone(call({ phase: "dialing" }))).toBe(true);
-    expect(holdsMicrophone(call({ phase: "connecting" }))).toBe(true);
-    expect(holdsMicrophone(call({ phase: "connected" }))).toBe(true);
-    expect(holdsMicrophone(call({ phase: "ended" }))).toBe(false);
-    expect(holdsMicrophone(null)).toBe(false);
+});
+
+describe("whether a page's microphone still belongs to a call", () => {
+  /** The microphone is the thing a mistake here leaves switched on — or takes away from an
+   *  answer that is about to connect — so it is keyed on the CALL and never on the phase. */
+  it("keeps it in every live phase of the call it was opened for, ringing included", () => {
+    // Ringing is the answer still travelling: the backend's phase moves when the attach
+    // answers, and a frame in that moment must not release the microphone under it.
+    const phases: CallPhase[] = ["ringing", "dialing", "connecting", "connected"];
+    for (const phase of phases) {
+      expect(callStillHoldsMedia(call({ id: "call-1", phase }), "call-1")).toBe(true);
+    }
+  });
+
+  it("releases it when the call is over, gone, or another call", () => {
+    expect(callStillHoldsMedia(call({ id: "call-1", phase: "ended" }), "call-1")).toBe(false);
+    // A backend that restarted holds no call at all.
+    expect(callStillHoldsMedia(null, "call-1")).toBe(false);
+    // ...or a different one, already ringing again.
+    expect(callStillHoldsMedia(call({ id: "call-2", phase: "connected" }), "call-1")).toBe(false);
+  });
+
+  it("holds nothing when the page holds nothing", () => {
+    expect(callStillHoldsMedia(call({ id: "call-1", phase: "connected" }), null)).toBe(false);
+    expect(callStillHoldsMedia(null, null)).toBe(false);
+  });
+
+  /** What a failed Answer may promise: that call, still ringing, still answerable. */
+  it("says a call is still ringing only for that call, ringing, and answerable", () => {
+    expect(callIsStillRinging(call({ id: "call-1" }), "call-1")).toBe(true);
+    expect(callIsStillRinging(call({ id: "call-1", can_accept: false }), "call-1")).toBe(false);
+    expect(callIsStillRinging(call({ id: "call-1", phase: "connected" }), "call-1")).toBe(false);
+    expect(callIsStillRinging(call({ id: "call-1", phase: "ended" }), "call-1")).toBe(false);
+    expect(callIsStillRinging(call({ id: "call-2" }), "call-1")).toBe(false);
+    expect(callIsStillRinging(null, "call-1")).toBe(false);
+  });
+
+  /** A page that reconnects holding a microphone for a call the backend no longer has. */
+  it("blames a restart only when the backend's start moment moved", () => {
+    expect(lostCallMessage(1_000, 2_000)).toBe("teams-lite restarted, so you left the call.");
+    expect(lostCallMessage(1_000, 1_000)).toBe("The call ended while this page was disconnected.");
+    // A backend too old to say reads as the second sentence, which is true either way.
+    expect(lostCallMessage(null, 2_000)).toBe("The call ended while this page was disconnected.");
+    expect(lostCallMessage(1_000, undefined)).toBe(
+      "The call ended while this page was disconnected.",
+    );
+    expect(lostCallMessage(undefined, null)).toBe(
+      "The call ended while this page was disconnected.",
+    );
   });
 });
 
@@ -379,6 +421,9 @@ describe("what the bar says", () => {
   it("explains an ending the user did not cause, and stays quiet about the rest", () => {
     expect(callEndLabel(call({ end_reason: "CallEndReasonHangup" }))).toBe("");
     expect(callEndLabel(call({ end_reason: "CallEndReasonDeclined" }))).toBe("");
+    // A ring the user let go without declining: they ended it themselves.
+    expect(CALL_END_LEFT_RINGING).toBe("CallEndReasonLeftRinging");
+    expect(callEndLabel(call({ end_reason: CALL_END_LEFT_RINGING }))).toBe("");
     expect(callEndLabel(call({ end_reason: null }))).toBe("");
     expect(callEndLabel(null)).toBe("");
     expect(callEndLabel(call({ end_reason: "CallEndReasonPlaceFailed" }))).toMatch(/not be placed/);

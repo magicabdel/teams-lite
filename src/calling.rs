@@ -613,6 +613,14 @@ pub fn call_ended_from_frame(frame: &Value) -> Option<CallEnded> {
 /// on prose breaks the day it is reworded.
 pub const END_REASON_UNREACHABLE: &str = "CallEndReasonNobodyReachable";
 
+/// A ringing call this machine let go of WITHOUT declining it: the page ended it with any
+/// press but Decline (`call_hangup`'s `intent: "end"`), so nothing went to the service and the
+/// caller goes on ringing the user's other devices.
+///
+/// It is a name of ours for the reason [`END_REASON_UNREACHABLE`] is, and the page draws
+/// nothing for it: the user ended it themselves, and saying "declined" would be false.
+pub const END_REASON_LEFT_RINGING: &str = "CallEndReasonLeftRinging";
+
 /// The service could not ring anybody it was asked to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InviteFailed {
@@ -2733,6 +2741,18 @@ mod tests {
             call_ts.contains(END_REASON_UNREACHABLE),
             "web/src/lib/call.ts must name {END_REASON_UNREACHABLE}, or an unreachable \
              colleague is reported as \"The call ended.\""
+        );
+    }
+
+    /// The same contract for a ringing call let go without a decline: unnamed on the page it
+    /// falls to the default, and the user is told "The call ended." about a call they ended.
+    #[test]
+    fn the_page_knows_the_name_of_a_ring_let_go() {
+        let call_ts = include_str!("../web/src/lib/call.ts");
+        assert!(
+            call_ts.contains(&format!("\"{END_REASON_LEFT_RINGING}\"")),
+            "web/src/lib/call.ts must name {END_REASON_LEFT_RINGING}, or a ring the user let go \
+             is reported as \"The call ended.\""
         );
     }
 

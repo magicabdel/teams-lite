@@ -6006,8 +6006,8 @@ call does — this side never handles RTP, and the page never learns a Teams URL
 - **Four methods reach a person, and they are `OUTWARD_METHODS` entries**: `call_place`
   starts a device buzzing in somebody's pocket, `call_accept` opens the user's own
   microphone to whoever is on the other end, `call_hangup` ends the call for both of them
-  (or declines it, which the caller is shown), and `call_mute` publishes whether they can
-  be heard. None can be taken back, and each one carries out one click the user just made
+  (or declines it, which the caller is shown — on the Decline press and on nothing else),
+  and `call_mute` publishes whether they can be heard. None can be taken back, and each one carries out one click the user just made
   — nothing in this feature ever acts on its own.
 - **`call_prepare` is a `MACHINE_METHODS` entry**, with its own refusal words: it reserves
   the one call slot and hands the page the relay credentials this backend holds.
@@ -6083,10 +6083,13 @@ call does — this side never handles RTP, and the page never learns a Teams URL
     the risk is that the caller is not told, never that the call survives here.
 - **The microphone is released on ONE path.** Every ending — our hangup, theirs, a
   dropped connection, this machine stopping taking calls — arrives as the backend's
-  `call_state` frame,
-  and the store's handler is the only place that stops the media. A path that released it
-  somewhere else would eventually miss a case and leave the browser's recording indicator
-  on for a call that does not exist.
+  `call_state` frame, or is found by a `call_status` read, and both go through
+  `stopCallMedia`. A path that released it somewhere else would eventually miss a case and
+  leave the browser's recording indicator on for a call that does not exist. What decides is
+  ONE rule, `callStillHoldsMedia`: the media belongs to the call it was opened for
+  (`callMediaFor`), and goes when that call is over, gone or a different call — never on a
+  PHASE, because an answer still travelling holds the microphone while the backend still says
+  `ringing`.
 - **A start the user STOPS is not a failure, and the call it half-made is taken back.** A
   start is three awaits long — reserve, open the microphone, post the offer — and the
   microphone alone takes up to `GATHER_TIMEOUT_MS`, so a call stopped a second after it was
@@ -6109,9 +6112,75 @@ call does — this side never handles RTP, and the page never learns a Teams URL
     only moment they exist, so each handler re-reads the reservation after its answer and
     ends the call when it has gone. `a_call_answered_for_a_cancelled_start_is_hung_up` scans
     all three.
-  - **The mock can hold ONE step of a start** (`{kind:"call_start", hold:"prepare"|"place"}`,
-    over `holdCallStart`), which is what makes the window reachable from a spec at all: the
-    mock's own media is instant, so the window a user cancels in did not exist there.
+  - **The mock can hold ONE step of a start** (`{kind:"call_start",
+    hold:"prepare"|"place"|"accept"}`, over `holdCallStart`), which is what makes the window
+    reachable from a spec at all: the mock's own media is instant, so the window a user
+    cancels in did not exist there.
+- **A FAILED ANSWER NEVER DECLINES, and a LOST answer is not a refusal.** The Answer's catch
+  used to hang the call up, and on a call still ringing that posted the invite's reject — so a
+  microphone the browser refused, a page that timed out or a socket that dropped showed the
+  caller "declined", in the user's name, for a call they had just tried to take. The same was
+  true of Answer pressed in a second window. Seven rules hold the replacement, and each is
+  pinned by a test:
+  - **Only the Decline press declines** (`call_hangup`'s `intent`, read by `hangup_request` and
+    decided by the pure `hangup_door` in src/bin/server.rs;
+    `the_reject_is_posted_only_through_the_decline_door` scans for a second caller of
+    `rejection_payload`). The ringing card's
+    Decline is `declineCall` and sends `decline`; every other ending is `hangUpCall` and sends
+    `end`, which on a call still ringing lets it go HERE and tells nobody
+    (`calling::END_REASON_LEFT_RINGING`, drawn as nothing), so it goes on ringing the user's
+    other devices. No intent is a page too old to say, and declines exactly as it always did; a
+    word the backend does not know is refused (`call_hangup: intent must be decline or end`),
+    never read as either. One function reads a hangup's params so the roadmap's `reason` and a
+    waiting call's `call_id` join one validation table rather than three.
+  - **A failure BEFORE the accept leaves the page sends no hangup at all.** Nothing reached
+    anybody: the microphone is released, the status re-read, and the notice adds "The call is
+    still ringing." only when that read says this very call can still be answered
+    (`answerFailureMessage`, over `callIsStillRinging`) — so the next press answers it, here.
+    A request that never left the page (`not connected`, `requestNeverSent`) is the same case.
+  - **A REFUSAL after it leaves releases the microphone the same way**; the backend has already
+    ended or kept the call on its own side.
+  - **A LOST answer keeps the microphone** (`timeout: …` or `connection closed`,
+    `requestOutcomeUnknown`), on all three starts — answering, placing and joining. Neither says
+    whether the backend did it, and hanging up would end a call that may be connecting, or
+    decline a caller already talking to this machine. The backend's own frames connect it or
+    end it. Without the roadmap's M4 a dropped socket can cancel the backend's handler too, and
+    then what ends it is the ring expiry (`CALL_RING_TIMEOUT`, ringing and dialing) or the
+    stage's own Hang up (a join): bounded, and on screen.
+  - **One answer at a time.** While the page holds a microphone for the ringing call, Answer
+    reads "Answering…" and does nothing: a second press opened a second microphone over the
+    first — which nothing could stop — and accepted the call twice. `adoptCallMedia` also
+    releases a capture still held before it takes a new one.
+  - **A page that reconnects re-reads the call, and reconciles its microphone.** The greeting
+    carries no call and a restarted backend drops one with no frame, so a reconnect used to keep
+    the stage and the microphone for a call that existed nowhere. Now the `reconnected` handler
+    re-reads `call_status`, and a SUCCESSFUL read applies `callStillHoldsMedia` to media that was
+    already held when it was asked — so an answer computed before a call began can never take
+    that call's microphone away — and says why it went: "teams-lite restarted, so you left the
+    call." when `backend_started_ms` moved, else "The call ended while this page was
+    disconnected." (`lostCallMessage`). A read that FAILS decides nothing, and a page holding a
+    microphone keeps the status its stage is drawn from, Hang up included.
+  - **Whether a page holds the microphone is stated** (`data-media="held"` on the ringing card
+    and on the stage, over `callMediaFor`), because it is the one fact about a call a spec
+    cannot read off a button.
+
+  `web/mock/server.ts` mirrors the door word for word and RECORDS every hangup with what the
+  page meant and whether the caller was declined (`{kind:"call_record"}`, over `callRecord`):
+  counted rather than read off the screen, because a page that declined and then drew the right
+  card would pass every assertion about the card. Its hooks reach each failure: `{kind:
+  "call_media", microphone:"refuse"}` makes the page's stand-in refuse the microphone (a line
+  in the offer it hands back, `SIMULATED_MICROPHONE_REFUSAL`, pinned across the two files by
+  `mock-call-media.test.ts`), `{kind:"call_start", refuse:"prepare"}` refuses the next
+  `call_prepare`, `{kind:"calling", lose:true}` is a backend that restarted under the call (no
+  frame, a new start moment, every socket dropped), `{kind:"calling", reconnect:true}` drops the
+  sockets and keeps the call, and `{kind:"calling", refuse_status:true}` fails one status read
+  and counts it. `call_invite {reset:true}` clears them all, and a spec MUST call it. `cd web &&
+  bun run preview -- --out /tmp/call --call` captures the card after a failed answer in both
+  themes and the card while an answer travels. **What is UNVERIFIED against the tenant is the
+  pairing**: nobody has blocked the microphone and had a colleague call to see the caller keep
+  ringing — that is the user's own click — and neither the reject door a real Decline posts
+  nor the `callLeg` door an End during a travelling accept leaves by (`hang_up_orphan` on the
+  attach's answer) has been measured live.
 - **What a call has to SAY is a transient notice, and this app's only one**
   (`web/src/lib/notice.ts`, drawn by `app-toaster.tsx` over `sonner`). Why a call ended for a
   reason the user did not choose, why one never went out, why a capture was refused: by the
@@ -6132,7 +6201,11 @@ call does — this side never handles RTP, and the page never learns a Teams URL
   - **A new attempt takes the old reason back, and a `call_state` frame never does.** Those
     frames arrive all through a call — a roster, a renegotiation, a camera going on — so
     clearing there erased a refusal a beat after it appeared. The dismiss lives where an
-    attempt STARTS, which is the only place that knows one is starting.
+    attempt STARTS, which is the only place that knows one is starting. And the attempt's own
+    reason WAITS for the old one to leave (`NOTICE_EXIT_MS` in lib/notice.ts, pinned by
+    `notice.test.ts`): sonner keeps a dismissed toast mounted for its exit and then deletes the
+    entry by id, so a second failed Answer — dismissed as it started and refused within
+    milliseconds — drew its sentence for a fifth of a second and took it away.
   - **The words are the user's, not the socket's** (`web/src/lib/call-failure.ts`, the twin
     of `send-failure.ts`): the RPC name the backend opens every refusal with is dropped, the
     socket's `not connected` becomes what it costs the call, and a failure that carried no
@@ -6625,7 +6698,7 @@ are stated in the app rather than left to be assumed:
   where it is kept, and Save is offered beside it, which is how a recording becomes a file
   the user really owns.
 
-Ten rules hold it up, and `web/e2e/call-recording.spec.ts` pins each:
+Twelve rules hold it up, and `web/e2e/call-recording.spec.ts` pins each:
 
 - **No RPC exists, and that is the design.** Nothing in this feature reaches the backend, so
   there is no `OUTWARD_METHODS` entry to add and none to want: a recording publishes nothing
@@ -6676,6 +6749,18 @@ Ten rules hold it up, and `web/e2e/call-recording.spec.ts` pins each:
 - **A browser that cannot keep one is not offered the control** (`recordingsCanBeKept`, false
   until the browser is asked, which is the same reading every unanswered capability takes in
   this app). A recording that had nowhere to go is a recording nobody asked for.
+- **Only the page that carries the call's media is offered the control** (`callMediaFor`, in
+  the Record control and again in `startCallRecording`). The voices and the pictures a
+  recording is made of are THAT page's own connection, so a second window showing the same
+  call would record a silent canvas of names — and it holds no microphone for the frames that
+  end a call to release, so nothing would close its file when the call went.
+- **The file is named after the call it RECORDED, never the status in hand when it stops**
+  (`recordingCall`). A reconnect that finds the call gone holds no call at all, and a
+  restarted backend may already be ringing somebody else, so a name read off the status at
+  that moment titled the only copy "Call" and kept it out of its conversation — or filed it
+  under the other caller. The status is used while it still names the recorded call, and the
+  last copy of that call stands in for it otherwise. The reconcile also releases the media
+  before it writes the new status.
 
 `web/mock/server.ts` needs no half of its own — the recording is the page's — and the whole
 surface is still reviewable with nothing leaving the machine: `simulatedCallMedia` hands the
