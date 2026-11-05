@@ -6,6 +6,8 @@ import {
   openConversationNamed,
   emitCall,
   realErrors,
+  resetCall,
+  setCallRegistration,
 } from "./helpers";
 
 // The incoming-call banner surfaces the backend's live `call` event so the user knows a
@@ -83,6 +85,44 @@ test.describe("incoming call banner", () => {
     // The meeting is still ringing as far as awareness knows, so end it: one mock process
     // serves the whole run, and a card left up would stand over every later spec.
     await emitCall(page, { conversation: thread!, event: "ended" });
+    await expect(banner).toHaveCount(0);
+  });
+
+  /** A ringing meeting this machine cannot join YET keeps its Join, disabled, and says why in
+   *  words on the card — the card is met on a phone as often as anywhere, and a disabled
+   *  control fires no pointer events, so a reason held in a tooltip would be no reason. */
+  test("says in words why a ringing meeting cannot be joined yet", async ({ page }) => {
+    await gotoApp(page);
+    await openConversationNamed(page, "Design Sync");
+    const thread = await page
+      .locator('[data-testid="composer-shell"]')
+      .getAttribute("data-conversation-id");
+    const banner = page.locator('[data-testid="incoming-call-banner"]');
+    const sentence = "Calls connect on their own once sign-in works again.";
+    try {
+      await setCallRegistration(page, "waiting_for_sign_in");
+      await emitCall(page, { conversation: thread!, caller: "Riley Carter" });
+      await expect(banner).toBeVisible();
+
+      const join = banner.locator('[data-testid="meeting-join-here"]');
+      await expect(join).toBeDisabled();
+      await expect(join).toHaveAttribute("aria-label", `Join this meeting with audio — ${sentence}`);
+      const reason = banner.locator('[data-testid="meeting-join-reason"]');
+      await expect(reason).toBeVisible();
+      await expect(reason).toHaveText(sentence);
+      // The way to the chat is untouched by it.
+      await expect(banner.getByTestId("incoming-call-open")).toBeEnabled();
+
+      // Registered again, the Join can act and the sentence goes with the reason for it.
+      await resetCall(page);
+      await expect(join).toBeEnabled();
+      await expect(reason).toHaveCount(0);
+    } finally {
+      // One mock process serves the whole run: neither the registration nor the ringing card
+      // may outlive this test.
+      await resetCall(page);
+      await emitCall(page, { conversation: thread!, event: "ended" });
+    }
     await expect(banner).toHaveCount(0);
   });
 

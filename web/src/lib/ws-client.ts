@@ -1022,8 +1022,8 @@ export class Backend {
   // Six methods, and the split between them is the consent design: reading state is
   // open, and every step that rings a person, opens the microphone or hands out the
   // media credentials is a write request. There is nothing here that turns calling on:
-  // the backend registers as a device the user's calls ring on at startup, the way every
-  // other Teams client they signed in on does. See `./call.ts` and NATIVE-CALLING.md.
+  // the backend registers as a device the user's calls ring on as soon as it can sign in, the
+  // way every other Teams client they signed in on does. See `./call.ts` and NATIVE-CALLING.md.
 
   /** Whether this machine can take calls, and what call it is in. A read: it carries
    *  no SDP and no credentials. */

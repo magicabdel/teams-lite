@@ -3020,8 +3020,9 @@ export class TeamsController {
     }
   }
 
-  /** Ask the backend what this machine can do about calls. Called on connect, and
-   *  after the user flips the setting. */
+  /** Ask the backend what this machine can do about calls. Called on connect, and after a
+   *  start or a hang-up, so the page draws what the backend now says rather than what it
+   *  last assumed. There is no setting to re-read it after: calling has no switch. */
   async refreshCallStatus(): Promise<void> {
     try {
       this.set({ callStatus: await this.backend.callStatus() });

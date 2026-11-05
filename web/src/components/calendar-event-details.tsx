@@ -24,7 +24,7 @@ import {
 import { formatEventTime, isDeclined } from "~/lib/calendar";
 import { cn } from "~/lib/utils";
 import { Avatar } from "./avatar";
-import { MeetingJoinButton } from "./meeting-join-button";
+import { MeetingJoinButton, MeetingJoinReason } from "./meeting-join-button";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -210,6 +210,10 @@ export function CalendarEventDetails(props: {
           />
           <OpenIn event={event} />
         </div>
+        {/* Why that Join cannot act right now, in words under the row: the button is
+            disabled, and a disabled control fires no pointer events — on a phone, which has
+            no hover either, a reason held in a tooltip would be no reason at all. */}
+        <MeetingJoinReason meeting={{ kind: "link", joinUrl: event.join_url }} />
         <p className="text-[11px] text-text-faint">
           Answering an invitation happens in Outlook — this app never writes.
         </p>

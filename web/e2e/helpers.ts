@@ -389,20 +389,23 @@ export async function emitCall(
  * otherwise.
  *
  * ALWAYS finish with `resetCall`. One mock process serves the whole run, so a call left
- * ringing would ring inside every later spec.
+ * ringing would ring inside every later spec. Resolves to the ringing call's id, for a spec
+ * that answers it over the mock's own socket ({@link mockRpc}).
  */
-export async function emitCallInvite(page: Page, conversation: string): Promise<void> {
+export async function emitCallInvite(page: Page, conversation: string): Promise<string> {
   const res = await page.request.post(`http://127.0.0.1:${MOCK_PORT}/__test/emit`, {
     data: { kind: "call_invite", conversation },
   });
   expect(res.ok()).toBeTruthy();
+  const { call_id } = (await res.json()) as { call_id: string };
+  return call_id;
 }
 
 /**
  * Make this window's backend one that does not take calls at all.
  *
  * There is no switch in the app — every backend the user launches registers as a device
- * their calls ring on at startup — so this hook is the only way to that state, and it is
+ * their calls ring on as soon as it can — so this hook is the only way to that state, and it is
  * the state ONE real backend reports: a read-only one, which is the install they never
  * opened. What it exercises is that the call and Join controls stay, disabled, saying so.
  * Always finish with `resetCall`.
@@ -412,6 +415,67 @@ export async function disableCalling(page: Page): Promise<void> {
     data: { kind: "calling", enabled: false },
   });
   expect(res.ok()).toBeTruthy();
+}
+
+/**
+ * Put this window's calling REGISTRATION in one state (the mock's
+ * `{kind:"calling", registration}` hook, over `CallingPlane.registration` in the backend).
+ *
+ * `waiting_for_sign_in`, `unavailable`, `connecting` and `starting` make the status not
+ * ready, which is what a disabled call row explains in words; `refused` stays ready, because
+ * a refusal is informational and changes nothing yet; `registered` is the default. Each needs
+ * a real outage to reach otherwise. Always finish with `resetCall`.
+ */
+export async function setCallRegistration(
+  page: Page,
+  registration:
+    | "starting"
+    | "waiting_for_sign_in"
+    | "unavailable"
+    | "connecting"
+    | "registered"
+    | "refused",
+): Promise<void> {
+  const res = await page.request.post(`http://127.0.0.1:${MOCK_PORT}/__test/emit`, {
+    data: { kind: "calling", registration },
+  });
+  expect(res.ok()).toBeTruthy();
+}
+
+/**
+ * Ask the MOCK backend one RPC over a socket of the spec's own, and hand back its answer.
+ *
+ * It exists for a refusal no page reaches on purpose: a disabled call row never sends
+ * `call_prepare`, so the only way to prove the mock still refuses one in the backend's own
+ * words — what a page meets when its state is a beat behind the backend's — is to ask it.
+ * A mock that quietly accepted would let every spec pass over a backend that refuses.
+ *
+ * It dials MOCK_PORT and nothing else. The mock enforces no write token (see CLAUDE.md
+ * § THE MOCK DOES NOT ENFORCE THE WRITE TOKEN), so nothing here holds or reads one.
+ */
+export async function mockRpc(
+  method: string,
+  params: unknown,
+): Promise<{ result?: unknown; error?: string }> {
+  const socket = new WebSocket(`ws://127.0.0.1:${MOCK_PORT}`);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      socket.onopen = () => resolve();
+      socket.onerror = () => reject(new Error(`the mock on ${MOCK_PORT} did not answer`));
+    });
+    // An id no page uses, so the answer is told apart from the events the mock greets with.
+    const id = 990_001;
+    const answer = new Promise<{ result?: unknown; error?: string }>((resolve) => {
+      socket.onmessage = (event) => {
+        const frame = JSON.parse(String(event.data)) as { id?: unknown; result?: unknown; error?: string };
+        if (frame.id === id) resolve(frame);
+      };
+    });
+    socket.send(JSON.stringify({ id, method, params }));
+    return await answer;
+  } finally {
+    socket.close();
+  }
 }
 
 /**
@@ -434,9 +498,10 @@ export async function holdCallStart(
   expect(res.ok()).toBeTruthy();
 }
 
-/** End any mock call and put calling back to what a real backend reports — it calls. It
- *  also clears an armed media refusal, an armed `disableCalling` and an armed start hold,
- *  so none of them needs a separate undo. */
+/** End any mock call and put calling back to what a real backend reports — it calls, and it
+ *  is registered. It also clears an armed media refusal, an armed `disableCalling`, a
+ *  registration set by `setCallRegistration` and an armed start hold, so none of them needs
+ *  a separate undo. */
 export async function resetCall(page: Page): Promise<void> {
   const res = await page.request.post(`http://127.0.0.1:${MOCK_PORT}/__test/emit`, {
     data: { kind: "call_invite", reset: true },

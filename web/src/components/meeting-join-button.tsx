@@ -23,9 +23,13 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
  * that code lives in the event and nowhere in the conversation. So the button takes either
  * {@link MeetingAddress} and states the one it holds.
  *
- * Drawn only for an address this app can really join, and only where a join would work. In a
- * window whose backend does not take calls at all it stays, disabled, with the reason in its
- * tooltip: the meeting is real and this window is not where it is joined.
+ * Drawn only for an address this app can really join. Where a join would not work right now it
+ * stays, disabled — the meeting is real and this machine cannot join it yet — and says why in
+ * WORDS: in its label, after what the control is for, and under its row through
+ * {@link MeetingJoinReason}, which the surface that draws the button puts there. A disabled
+ * control fires no pointer events and a phone has no hover, so a reason held only in a tooltip
+ * is a sentence that does not exist where this app is read most. The tooltip stays for a
+ * pointer, as the nicety it is.
  */
 export function MeetingJoinButton(props: {
   meeting: MeetingAddress;
@@ -48,11 +52,7 @@ export function MeetingJoinButton(props: {
   const status = useAppState((s) => s.callStatus);
   const { meeting } = props;
 
-  // An address this app cannot join is not offered at all. For a LINK the check is a small
-  // port of `calling::MeetingJoin::from_join_url`; a THREAD was checked where the address
-  // was built (`meetingAddressOf`, the port of `from_thread_id`). The backend parses it
-  // again either way, so the worst a mismatch costs is a button that reports a refusal.
-  if (meeting.kind === "link" && !isMeetingJoinLink(meeting.joinUrl)) return null;
+  if (!meetingJoinIsOffered(meeting)) return null;
 
   const ready = canJoinMeeting(status);
   const reason = meetingUnavailableReason(status);
@@ -73,7 +73,10 @@ export function MeetingJoinButton(props: {
       data-join-url={meeting.kind === "link" ? meeting.joinUrl : undefined}
       data-meeting-thread={meeting.kind === "thread" ? meeting.thread : undefined}
       disabled={!ready}
-      aria-label={ready ? "Join this meeting with audio" : reason}
+      // What the control is FOR, and then why it cannot, where there is a reason — the shape
+      // the conversation menu's Join row has. The reason alone used to REPLACE the label, which
+      // cost a screen reader the one thing a button announces first.
+      aria-label={ready ? JOIN_LABEL : `${JOIN_LABEL} — ${reason}`}
       onClick={() => {
         void controller.joinMeeting(meeting, props.subject);
         props.onStarted?.();
@@ -119,4 +122,44 @@ export function MeetingJoinButton(props: {
       </TooltipContent>
     </Tooltip>
   );
+}
+
+/** What the Join control is for — its whole label when it can act, and the first half of it
+ *  when it cannot. */
+const JOIN_LABEL = "Join this meeting with audio";
+
+/**
+ * Why the {@link MeetingJoinButton} beside it cannot join right now, drawn IN FLOW — or
+ * nothing, when it can, or when there is no button at all.
+ *
+ * A component of its own rather than part of the button, because a sentence does not fit in
+ * the row the button shares: the calendar's footer puts it beside "Open in", the incoming-call
+ * card beside "Open chat". So the surface draws the row, and this under it. It reads the same
+ * state through the same two functions the button does, so the two can never disagree about
+ * whether there is a button to explain, or what is wrong with it.
+ */
+export function MeetingJoinReason(props: { meeting: MeetingAddress }) {
+  const status = useAppState((s) => s.callStatus);
+  if (!meetingJoinIsOffered(props.meeting) || canJoinMeeting(status)) return null;
+  const reason = meetingUnavailableReason(status);
+  if (!reason) return null;
+  // The conversation menu's own reason line, to the class: one sentence, one look, wherever a
+  // disabled call or Join control explains itself.
+  return (
+    <p data-testid="meeting-join-reason" className="text-[11px] leading-snug text-text-faint">
+      {reason}
+    </p>
+  );
+}
+
+/**
+ * Whether this app offers a Join for `meeting` at all.
+ *
+ * An address this app cannot join is not offered. For a LINK the check is a small port of
+ * `calling::MeetingJoin::from_join_url`; a THREAD was checked where the address was built
+ * (`meetingAddressOf`, the port of `from_thread_id`). The backend parses it again either way,
+ * so the worst a mismatch costs is a button that reports a refusal.
+ */
+function meetingJoinIsOffered(meeting: MeetingAddress): boolean {
+  return meeting.kind !== "link" || isMeetingJoinLink(meeting.joinUrl);
 }

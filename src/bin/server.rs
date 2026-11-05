@@ -921,6 +921,17 @@ const WRITE_TOKEN_ENV: &str = "TEAMS_LITE_WRITE_TOKEN";
 /// records lives in `write_token`.
 static WRITE_TOKEN_PINNED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
+/// When this backend process began serving, in epoch milliseconds: set ONCE, as the first
+/// line of `serve`, and published in every `call_state` as `backend_started_ms`.
+///
+/// It is what lets a page tell two reconnects apart. A page that comes back holding media
+/// and finds no call has to say either "teams-lite restarted, so you left the call" or "the
+/// call ended while this page was disconnected", and only a MOVED start moment proves the
+/// first (plane-reliability.md § 7) — saying "restarted" on a guess would be the app
+/// claiming something it does not know. A process-wide `OnceLock` rather than a `Ctx` field
+/// because it is a fact about the process, and nothing may move it once it is set.
+static BACKEND_STARTED_MS: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+
 /// Whether this process has already said that a sign-in resolved no display name.
 ///
 /// A session is re-minted every `SESSION_TTL` and after every 401, so the repair in
@@ -2076,6 +2087,15 @@ struct Ctx {
     /// call this machine is in. Empty and idle on a backend that does not call at all
     /// ({@link calling_available}) — see [`CallingPlane`].
     calling: Arc<Mutex<CallingPlane>>,
+    /// Rung by [`Ctx::adopt_session`] every time a session is adopted, and waited on by the
+    /// calling start loop (see [`run_calling_start`]) while it has no session to register with.
+    ///
+    /// It is how the calling plane RECOVERS without ever reaching the broker itself: the
+    /// loop never mints a token and runs no timer, so the session that ends a sign-in
+    /// outage is the one the live feed, a read or a send adopts — and this is what tells the
+    /// loop it has arrived. `notify_one` rather than `notify_waiters`, so a session adopted
+    /// while the loop is busy is kept as a permit and never lost.
+    calling_wake: Arc<tokio::sync::Notify>,
     /// The GitLab reads being refreshed behind the page right now, by cache key.
     ///
     /// Single-flight, and it earns its place on the hot path: the merge-request page polls
@@ -2156,6 +2176,168 @@ struct CallingPlane {
     /// The calling connection's task, so turning the setting off can drop the socket
     /// as well as unregister the endpoint.
     connection: Option<tokio::task::JoinHandle<()>>,
+    /// Where the registration stands — the reason behind `ready` being false. See
+    /// [`Registration`].
+    registration: Registration,
+}
+
+impl CallingPlane {
+    /// The channel a call may be built on RIGHT NOW: registered, and the socket up.
+    ///
+    /// The ONE predicate behind `ready` and behind both `call_prepare` refusals. The placing
+    /// path used to check the channel alone while the meeting path also checked the socket,
+    /// so a call could be placed on an address whose socket was down — the service would
+    /// then answer on callbacks nothing was listening to.
+    fn ready_channel(&self) -> Option<&trouter::CallingChannel> {
+        self.channel.as_ref().filter(|_| self.connected)
+    }
+
+    /// The calling socket ended an attempt: it is down, and the registration says why —
+    /// sign-in when the attempt had no credentials, the network or the service otherwise.
+    /// Returns whether it had been UP, which is the one disconnect worth a journal line: the
+    /// trouter already reports every failed attempt itself, once per distinct failure.
+    fn on_disconnected(&mut self, no_credentials: bool) -> bool {
+        let was_up = self.connected;
+        self.connected = false;
+        self.registration =
+            if no_credentials { Registration::WaitingForSignIn } else { Registration::Connecting };
+        was_up
+    }
+
+    /// The calling connection registered and published its address. Returns whether the
+    /// surl MOVED, which invalidates the links of a call still up.
+    fn on_channel(&mut self, channel: trouter::CallingChannel) -> bool {
+        let moved = self.channel.as_ref().is_some_and(|existing| existing.surl != channel.surl);
+        self.registration = Registration::from_registrar_status(channel.registrar_status);
+        self.channel = Some(channel);
+        self.connected = true;
+        moved
+    }
+}
+
+/// Where this machine's calling registration stands, in the words a page draws from.
+///
+/// `ready` answers "can a call start right now"; this answers "and if not, why not". The
+/// two are different questions with different next moves — a broken sign-in mends itself, a
+/// directory that names no calling service never will, and a socket on its way up needs a
+/// moment — and the sentence a disabled call row carries is chosen from it
+/// (`callUnavailableReason` in web/src/lib/call.ts). The WORDS are a contract with that file,
+/// pinned by a test that reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Registration {
+    /// The process has not tried yet.
+    #[default]
+    Starting,
+    /// There is no session to register with — sign-in is broken, or has not happened yet in
+    /// this process. Nothing in the calling plane mints one: it waits for the session the
+    /// rest of the app adopts (see `Ctx::calling_wake`).
+    WaitingForSignIn,
+    /// The account's directory names no calling service, so there is nothing to register
+    /// with at all.
+    Unavailable,
+    /// The calling connection is being made, or remade after it dropped.
+    Connecting,
+    /// The registrar accepted the registration (a 2xx), with its status.
+    Registered(u16),
+    /// The registrar answered with a non-2xx status. Informational for now: the connection
+    /// proceeds exactly as after a 2xx (see `trouter::CallingChannel::registrar_status`), so
+    /// this normally comes with `ready: true`.
+    Refused(u16),
+}
+
+impl Registration {
+    fn from_registrar_status(status: u16) -> Self {
+        if (200..300).contains(&status) {
+            Registration::Registered(status)
+        } else {
+            Registration::Refused(status)
+        }
+    }
+
+    /// The contract's word for this state.
+    fn word(self) -> &'static str {
+        match self {
+            Registration::Starting => "starting",
+            Registration::WaitingForSignIn => "waiting_for_sign_in",
+            Registration::Unavailable => "unavailable",
+            Registration::Connecting => "connecting",
+            Registration::Registered(_) => "registered",
+            Registration::Refused(_) => "refused",
+        }
+    }
+
+    /// The registrar's status, for the two states that come from its answer.
+    fn registrar_status(self) -> Option<u16> {
+        match self {
+            Registration::Registered(status) | Registration::Refused(status) => Some(status),
+            _ => None,
+        }
+    }
+
+    /// The `registration` object of `call_state`.
+    fn json(self) -> Value {
+        json!({ "state": self.word(), "registrar_status": self.registrar_status() })
+    }
+}
+
+/// Apply `change` to the plane, and say what a page would see differ: whether the
+/// `call_state` payload changed at all, and the new registration when IT moved. Pure, so
+/// "an outage's thirtieth identical retry tells nobody anything" is a tested rule rather
+/// than a hope (see [`Ctx::change_calling_plane`]).
+fn apply_plane_change(
+    plane: &mut CallingPlane,
+    facts: PlaneFacts,
+    change: impl FnOnce(&mut CallingPlane),
+) -> (bool, Option<Registration>) {
+    let before = call_state_json(plane, facts);
+    let was = plane.registration;
+    change(plane);
+    let now = plane.registration;
+    (call_state_json(plane, facts) != before, (was != now).then_some(now))
+}
+
+/// What `call_state` states besides the plane itself: whether this backend calls at all,
+/// and when it began serving.
+///
+/// A value of its own, built in ONE place ([`PlaneFacts::current`]), because two things read
+/// it and they must read the same: the payload every page is sent, and the comparison that
+/// decides whether to send it at all. Spelled at each call site, a payload carrying one
+/// start moment would be compared against another, and a page would be told nothing about
+/// a change it reads — or a `backend_started_ms` nobody ever filled in would reach every
+/// page as `null` with every test green.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlaneFacts {
+    available: bool,
+    backend_started_ms: Option<i64>,
+}
+
+impl PlaneFacts {
+    /// This process's own facts: [`calling_available`] and [`BACKEND_STARTED_MS`].
+    fn current() -> Self {
+        PlaneFacts {
+            available: calling_available(),
+            backend_started_ms: BACKEND_STARTED_MS.get().copied(),
+        }
+    }
+}
+
+/// The `call_state` event and the `call_status` answer for one plane — pure, so its shape
+/// is pinned by a test rather than by a running backend.
+///
+/// `registration` is `null` where this backend does not call at all (`available` false),
+/// because a state about a registration nothing will ever attempt would be a sentence about
+/// nothing. `backend_started_ms` is [`BACKEND_STARTED_MS`].
+fn call_state_json(plane: &CallingPlane, facts: PlaneFacts) -> Value {
+    json!({
+        "enabled": facts.available,
+        // Ready means a call could start right now: the connection is up and
+        // registered. A backend that calls while this is false is honest about a
+        // connection that has not come back yet — and `registration` says why.
+        "ready": plane.ready_channel().is_some(),
+        "call": plane.call.as_ref().map(CallSession::json),
+        "registration": facts.available.then(|| plane.registration.json()),
+        "backend_started_ms": facts.backend_started_ms,
+    })
 }
 
 /// A one-to-one call, a call that rings a whole group chat, or a meeting.
@@ -2420,6 +2602,15 @@ struct CalendarWatch {
 struct SessionCell {
     session: Option<Session>,
     minted: std::time::Instant,
+}
+
+impl SessionCell {
+    /// The session held, when it was minted less than `SESSION_TTL` before `now`.
+    fn fresh_at(&self, now: std::time::Instant) -> Option<&Session> {
+        self.session
+            .as_ref()
+            .filter(|_| now.saturating_duration_since(self.minted) < SESSION_TTL)
+    }
 }
 
 const SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(50 * 60);
@@ -4285,18 +4476,25 @@ impl Ctx {
     /// A fresh clone of the Teams session, rebuilt if the cached one is stale — or
     /// built for the first time, when this process started with the broker down.
     async fn session(&self) -> Result<Session> {
-        {
-            let cell = self.session.lock().await;
-            if let Some(session) = &cell.session {
-                if cell.minted.elapsed() < SESSION_TTL {
-                    return Ok(session.clone());
-                }
-            }
+        if let Some(session) = self.session_if_fresh().await {
+            return Ok(session);
         }
         // stale, or never established: rebuild (skypetoken from a fresh skype token
         // via the broker)
         let fresh = teams::connect(&self.http).await?;
         Ok(self.adopt_session(fresh).await)
+    }
+
+    /// The cached session when it is younger than `SESSION_TTL`, and `None` otherwise.
+    ///
+    /// It NEVER rebuilds and never reaches the broker, which is the whole difference from
+    /// [`Ctx::session`] and the reason it exists: the calling start loop looks again on every
+    /// wake, and a look that minted through the broker would be this backend asking an
+    /// identity broker that is down on calling's behalf — exactly what nothing here may do
+    /// (see the boot order in `serve`). A loop that finds `None` waits for a session somebody
+    /// else adopts.
+    async fn session_if_fresh(&self) -> Option<Session> {
+        self.session.lock().await.fresh_at(std::time::Instant::now()).cloned()
     }
 
     /// Hold on to a session this process just established, and remember the account
@@ -4339,9 +4537,15 @@ impl Ctx {
                 }
             }
         }
-        let mut cell = self.session.lock().await;
-        cell.session = Some(session.clone());
-        cell.minted = std::time::Instant::now();
+        {
+            let mut cell = self.session.lock().await;
+            cell.session = Some(session.clone());
+            cell.minted = std::time::Instant::now();
+        }
+        // AFTER the cell is written, so the calling start loop this wakes finds the session
+        // that woke it (see `calling_wake`): a session adopted anywhere — the live feed's
+        // reconnect, a read, a send — is how calling recovers from a sign-in outage.
+        self.calling_wake.notify_one();
         session
     }
 
@@ -4741,6 +4945,10 @@ fn main() -> Result<()> {
 /// The backend: everything `server` does when it was not started as one of the hidden
 /// subcommands above.
 async fn serve() -> Result<()> {
+    // The moment this backend began, before anything else can take time: a page compares it
+    // across reconnects to know whether the process it talks to is the one it left.
+    BACKEND_STARTED_MS.get_or_init(now_ms);
+
     // CLAIM THE PORT FIRST, before anything with a side effect.
     //
     // The listener used to be bound at the very end, after authentication, the store
@@ -4856,6 +5064,7 @@ async fn serve() -> Result<()> {
         calendar_watch: Arc::new(Mutex::new(None)),
         signin: Arc::new(Mutex::new(None)),
         calling: Arc::new(Mutex::new(CallingPlane::default())),
+        calling_wake: Arc::new(tokio::sync::Notify::new()),
         gitlab_refreshing: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
         csa_syncing: Arc::new(Mutex::new((false, None))),
         tracker_people: Arc::new(Mutex::new(None)),
@@ -7407,10 +7616,8 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
                 let (session, endpoint_id, surl) = {
                     let (endpoint_id, surl) = {
                         let plane = ctx.calling.lock().unwrap();
-                        let channel = plane.channel.as_ref().filter(|_| plane.connected).context(
-                            "call_prepare: calling is not connected yet — turn it on in \
-                             Settings, then try again",
-                        )?;
+                        let channel =
+                            plane.ready_channel().context(CALL_PREPARE_NOT_CONNECTED)?;
                         (channel.endpoint_id.clone(), channel.surl.clone())
                     };
                     (ctx.session().await?, endpoint_id, surl)
@@ -7506,17 +7713,15 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
                 None => {
                     let conversation = param_str(params, "conversation")?;
                     let (session, endpoint_id) = {
+                        // The same predicate the meeting path and `ready` use: a channel
+                        // whose socket is down is an address nothing listens on.
                         let endpoint_id = ctx
                             .calling
                             .lock()
                             .unwrap()
-                            .channel
-                            .as_ref()
+                            .ready_channel()
                             .map(|c| c.endpoint_id.clone())
-                            .context(
-                                "call_prepare: calling is not connected yet — turn it on in \
-                                 Settings, then try again",
-                            )?;
+                            .context(CALL_PREPARE_NOT_CONNECTED)?;
                         (ctx.session().await?, endpoint_id)
                     };
                     // Who to ring: the roster, minus us. One person is a one-to-one call;
@@ -7581,12 +7786,13 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
                         let title = ctx.store()?.conversation_context(&conversation, "")?;
                         if title.trim().is_empty() { "Group call".to_string() } else { title }
                     };
+                    // Read again after the roster fetch, on the same predicate: a socket that
+                    // dropped meanwhile is an address the service's answers would not reach.
                     let surl = ctx
                         .calling
                         .lock()
                         .unwrap()
-                        .channel
-                        .as_ref()
+                        .ready_channel()
                         .map(|c| c.surl.clone())
                         .context("call_prepare: the calling connection went away")?;
 
@@ -14416,23 +14622,75 @@ fn calling_available() -> bool {
     !read_only()
 }
 
+/// What `call_prepare` answers while no call can start — in BOTH of its paths, placing and
+/// joining, which used to carry two copies of a sentence that sent the reader to Settings
+/// for a switch that no longer exists (calling is on wherever it can be — see
+/// [`calling_available`]). What is true is that the machine registers by itself, so that is
+/// what it says. The page recognises the phrase "calling is not connected yet" and turns it
+/// into its own words (`web/src/lib/call-failure.ts`), so the phrase is a contract and a
+/// test pins the whole sentence.
+const CALL_PREPARE_NOT_CONNECTED: &str = "call_prepare: calling is not connected yet — this \
+                                          machine registers for calls on its own once it can; \
+                                          try again in a moment";
+
+/// Why the calling connection could not be started.
+///
+/// Typed so the start loop can tell the failure a page has a sentence for — the account's
+/// directory names no calling service — from anything else, rather than matching on text.
+/// It has one variant because `start_calling` has one way to fail now that it is handed
+/// its session instead of fetching one: a missing session is the loop's to notice, before
+/// it ever calls a start. And that one failure is a pure read of the session it was handed
+/// (`calling::endpoints`), which is why nothing retries it on a timer: the same session
+/// fails the same way, and only a NEW session can answer differently (see
+/// [`run_calling_start`]). A second way to fail — one a retry could heal — is a new variant
+/// with its own wait, decided when it exists.
+#[derive(Debug)]
+enum CallingStartError {
+    /// `calling::endpoints` found no calling service in the session's directory.
+    NoCallingEndpoints(anyhow::Error),
+}
+
+impl std::fmt::Display for CallingStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CallingStartError::NoCallingEndpoints(e) => {
+                write!(f, "this account's directory names no calling service ({e:#})")
+            }
+        }
+    }
+}
+
 impl Ctx {
     /// The `call_state` event and the `call_status` answer, in one shape so a client
     /// that reconnects mid-call learns exactly what a live one already knows.
     fn call_state_payload(&self) -> Value {
-        let plane = self.calling.lock().unwrap();
-        json!({
-            "enabled": calling_available(),
-            // Ready means a call could start right now: the connection is up and
-            // registered. A backend that calls while this is false is honest about a
-            // connection that has not come back yet.
-            "ready": plane.channel.is_some() && plane.connected,
-            "call": plane.call.as_ref().map(CallSession::json),
-        })
+        call_state_json(&self.calling.lock().unwrap(), PlaneFacts::current())
     }
 
     fn emit_call_state(&self) {
         self.emit("call_state", self.call_state_payload());
+    }
+
+    /// Change the calling plane, and tell the pages only when something they READ changed.
+    ///
+    /// The connection reports a lifecycle step on every attempt — during an outage, one
+    /// every 30 s — and the status task used to emit `call_state` on each of them, so every
+    /// open page re-drew an unchanged call row twice a minute for as long as the outage
+    /// lasted. "Something a page reads" is the payload itself (the readiness, the call, the
+    /// registration), so that is what is compared rather than a hand-picked list of fields
+    /// that could fall behind it. A change of registration is one journal line, which is
+    /// how a reader of the journal sees calling come back.
+    fn change_calling_plane(&self, change: impl FnOnce(&mut CallingPlane)) {
+        let (changed, registration) =
+            apply_plane_change(&mut self.calling.lock().unwrap(), PlaneFacts::current(), change);
+        // The registrar's own status is already in the line the connection logs as it
+        // registers (`[calling] registered: …`), so this one names the state alone.
+        if let Some(registration) = registration {
+            eprintln!("[calling] registration: {}", registration.word());
+        }
+        if changed {
+            self.emit_call_state();
+        }
     }
 
     /// Our own identity for one call: our mri and name, the calling endpoint's
@@ -14446,17 +14704,27 @@ impl Ctx {
         }
     }
 
-    /// Start the calling connection, unless it is already up.
+    /// Start the calling connection on `session`, unless it is already up.
     ///
     /// One connection of its own, on the calling trouter, registered as the web
-    /// client registers it. It reconnects forever on its own (`trouter::run`), so
-    /// this is called once per process, at boot (see `spawn_calling`).
-    async fn start_calling(&self) -> Result<()> {
+    /// client registers it. Once started it reconnects forever on its own
+    /// (`trouter::run`, which asks for fresh credentials before every attempt), so it is
+    /// started once per process — by [`run_calling_start`], as soon as there is a session
+    /// to start it with, which at boot may be long after the process came up.
+    ///
+    /// It is HANDED the session rather than fetching one, and that is the fix for calling
+    /// never registering after a boot-time outage: fetching one here meant rebuilding it
+    /// through the broker, so a broker still booting (the embedded image's first sign-in
+    /// always loses that race) failed the one start this process made, for good. A missing
+    /// session is the start loop's to notice; the one failure left here is a directory
+    /// that names no calling service, and it is typed so the loop can say so.
+    fn start_calling(&self, session: &Session) -> Result<(), CallingStartError> {
+        // Idempotent, and it can be: the one caller is the start loop, and nothing between
+        // this check and the handle being stored below awaits.
         if self.calling.lock().unwrap().connection.is_some() {
             return Ok(());
         }
-        let session = self.session().await?;
-        let endpoints = calling::endpoints(&session)?;
+        let endpoints = calling::endpoints(session).map_err(CallingStartError::NoCallingEndpoints)?;
         // A registration id of its own, persisted beside the messaging one: two
         // workers are two endpoints, and one id would make the second registration
         // replace the first. Per BACKEND as well as per worker, for the same reason
@@ -14469,6 +14737,8 @@ impl Ctx {
             "[calling] registering as {} on {} (epid {epid})",
             endpoint.template_key, endpoint.allocate
         );
+        // Before the connection exists, so nothing it reports can be overwritten by this.
+        self.change_calling_plane(|plane| plane.registration = Registration::Connecting);
 
         let (frames_tx, mut frames_rx) = tokio::sync::mpsc::unbounded_channel();
         let (chan_tx, mut chan_rx) =
@@ -14486,20 +14756,14 @@ impl Ctx {
                     calling::surl_shape(&channel.surl),
                     channel.endpoint_id
                 );
-                let changed = {
-                    let mut plane = ctx_chan.calling.lock().unwrap();
-                    let changed = plane
-                        .channel
-                        .as_ref()
-                        .is_some_and(|existing| existing.surl != channel.surl);
-                    plane.channel = Some(channel);
-                    plane.connected = true;
-                    changed
-                };
-                if changed {
+                let mut moved = false;
+                ctx_chan.change_calling_plane(|plane| moved = plane.on_channel(channel));
+                if moved {
                     ctx_chan.end_call_locally("CallEndReasonReconnected").await;
+                    // `end_call_locally` publishes the ENDING and then frees the slot, so
+                    // the page is told once more that there is no call at all.
+                    ctx_chan.emit_call_state();
                 }
-                ctx_chan.emit_call_state();
             }
         });
 
@@ -14512,18 +14776,31 @@ impl Ctx {
 
         // The calling socket's lifecycle is worth one journal line each way — a call
         // that never rings is diagnosed from here — and it decides whether this machine
-        // says it is ready. It does NOT end a live call: a socket that comes back with
-        // the same surl comes back to the same links, and only a CHANGED surl breaks
-        // them (see the channel task above).
+        // says it is ready, and why not. It does NOT end a live call: a socket that comes
+        // back with the same surl comes back to the same links, and only a CHANGED surl
+        // breaks them (see the channel task above).
+        //
+        // `Connecting` changes nothing, deliberately: it is sent before EVERY attempt, so a
+        // state drawn from it would flip the page between two sentences every 30 s of an
+        // outage. The registration moves on what an attempt FOUND — the address (the channel
+        // task), or the reason it ended (`on_disconnected`).
         let ctx_status = self.clone();
         tokio::spawn(async move {
             while let Some(status) = st_rx.recv().await {
                 match status {
                     trouter::Status::Connected => eprintln!("[calling] connected"),
-                    trouter::Status::Disconnected { retry_in_secs } => {
-                        eprintln!("[calling] disconnected, retrying in {retry_in_secs}s");
-                        ctx_status.calling.lock().unwrap().connected = false;
-                        ctx_status.emit_call_state();
+                    trouter::Status::Disconnected { retry_in_secs, no_credentials } => {
+                        let mut dropped = false;
+                        ctx_status.change_calling_plane(|plane| {
+                            dropped = plane.on_disconnected(no_credentials);
+                        });
+                        // One line when a live socket DROPS. A failed attempt is already in
+                        // the journal, from the connection itself and once per distinct
+                        // failure, so a line here per retry would be the very noise that
+                        // filter exists to remove.
+                        if dropped {
+                            eprintln!("[calling] disconnected, retrying in {retry_in_secs}s");
+                        }
                     }
                     trouter::Status::Connecting => {}
                 }
@@ -15651,21 +15928,123 @@ fn spawn_broker_health(ctx: Ctx) {
     });
 }
 
-/// Bring the calling connection up at boot, on every backend that calls at all.
+/// Bring the calling connection up, on every backend that calls at all — as soon as it can
+/// be, and whenever that is.
 ///
 /// This is the whole of "calling is on": the app registers as a device the user's calls
-/// ring on, once, at startup (see {@link calling_available} for the one backend that does
-/// not). A failure is one journal line and nothing else: the rest of the app does not
-/// depend on it, and `trouter::run` reconnects on its own.
+/// ring on (see {@link calling_available} for the one backend that does not). It used to be
+/// ONE attempt at boot, and a failure was one journal line — so a backend whose first
+/// sign-in failed (the embedded image's always does: its broker is still booting) never
+/// registered for calls for the life of the process, while everything else recovered on
+/// its own. [`run_calling_start`] is the loop that replaces it; once the connection has
+/// started, `trouter::run` owns every reconnect from then on.
 fn spawn_calling(ctx: Ctx) {
     tokio::spawn(async move {
         if !calling_available() {
             return;
         }
-        if let Err(e) = ctx.start_calling().await {
-            eprintln!("[calling] could not start: {e:#}");
-        }
+        run_calling_start(&ctx).await;
     });
+}
+
+/// What the calling start loop needs from the backend, and nothing more.
+///
+/// A seam rather than `Ctx` methods called directly so the loop's DECISIONS are tested on
+/// their own: a fake proves that hours of waiting attempt nothing and that a wake attempts at
+/// once, which a whole `Ctx` — a broker, a store, a network — could not show. There is no
+/// method here that reaches the broker, and that absence is the point: nothing the loop
+/// can call may poll it.
+trait CallingStart: Send + Sync {
+    /// The cached session when it is young enough to register with, `None` otherwise.
+    /// Never rebuilds one (see [`Ctx::session_if_fresh`]).
+    fn fresh_session(&self) -> impl std::future::Future<Output = Option<Session>> + Send;
+    /// Start the calling connection on that session (see [`Ctx::start_calling`]).
+    fn start(
+        &self,
+        session: Session,
+    ) -> impl std::future::Future<Output = Result<(), CallingStartError>> + Send;
+    /// Resolves once a session has been adopted since the last wait (see
+    /// [`Ctx::calling_wake`]). A wake that landed while nobody waited resolves at once.
+    fn woken(&self) -> impl std::future::Future<Output = ()> + Send;
+    /// Record where the registration stands.
+    fn note(&self, registration: Registration);
+}
+
+impl CallingStart for Ctx {
+    async fn fresh_session(&self) -> Option<Session> {
+        self.session_if_fresh().await
+    }
+
+    async fn start(&self, session: Session) -> Result<(), CallingStartError> {
+        self.start_calling(&session)
+    }
+
+    async fn woken(&self) {
+        self.calling_wake.notified().await;
+    }
+
+    fn note(&self, registration: Registration) {
+        self.change_calling_plane(|plane| plane.registration = registration);
+    }
+}
+
+/// Start the calling connection as soon as there is a session to start it with, and return
+/// once it has started.
+///
+/// **It never mints a token or rebuilds a session, and runs no timer.** An attempt is made
+/// only with [`CallingStart::fresh_session`], and recovery from a sign-in outage rides the
+/// session that the rest of the app adopts — the live feed reconnecting, a read, a send —
+/// which wakes this loop through `calling_wake`. So it adds no load to a broker that is
+/// down, which is the rule the whole boot order is built on (§ A broken sign-in costs the
+/// LIVE feed, never the history).
+///
+/// Three states, and each waits on exactly what can end it — which in both waiting states is
+/// a NEW session, so both wait on the wake ALONE, with no timer at all:
+///
+/// - **no fresh session** — no amount of waiting here produces one. The registration says it
+///   is waiting for sign-in, and the journal says so once per waiting period.
+/// - **a session, but the start failed** (the directory names no calling service) — the
+///   failure is a pure read of that session (`calling::endpoints`), so the same session can
+///   only fail the same way again and a timer would retry a function on identical input. A
+///   new session re-reads the directory, and its adoption is the wake. The registration says
+///   `unavailable` until then — the last directory read is the evidence there is, and nothing
+///   newer exists to contradict it — and the failure is logged when its text changes.
+/// - **started** — returns; `trouter::run` reconnects for ever from here.
+///
+/// What that costs is stated rather than hidden: a directory that answered "no calling
+/// service" keeps the call row on that sentence through a sign-in outage that follows it,
+/// because no new directory has been read. The outage itself is the sign-in banner's to say.
+async fn run_calling_start(starter: &impl CallingStart) {
+    let mut last_error: Option<String> = None;
+    let mut announced_waiting = false;
+    loop {
+        let Some(session) = starter.fresh_session().await else {
+            starter.note(Registration::WaitingForSignIn);
+            if !announced_waiting {
+                eprintln!(
+                    "[calling] waiting for sign-in before registering for calls — this \
+                     starts on its own once a session is adopted"
+                );
+                announced_waiting = true;
+            }
+            starter.woken().await;
+            continue;
+        };
+        announced_waiting = false;
+        let error = match starter.start(session).await {
+            Ok(()) => return,
+            Err(error) => error,
+        };
+        match &error {
+            CallingStartError::NoCallingEndpoints(_) => starter.note(Registration::Unavailable),
+        }
+        let text = error.to_string();
+        if last_error.as_deref() != Some(text.as_str()) {
+            eprintln!("[calling] could not start: {text} — trying again with the next session");
+            last_error = Some(text);
+        }
+        starter.woken().await;
+    }
 }
 
 /// Format one decoded call frame as a single JSON-lines (JSONL) capture record:
@@ -17706,17 +18085,724 @@ mod tests {
     #[test]
     fn readiness_needs_both_the_registration_and_a_live_socket() {
         let mut plane = CallingPlane::default();
-        assert!(plane.channel.is_none() && !plane.connected, "a fresh plane is not ready");
+        assert!(plane.ready_channel().is_none(), "a fresh plane is not ready");
 
         plane.channel = Some(trouter::CallingChannel {
             surl: "https://tr/v4/f/abc/".into(),
             endpoint_id: "epid".into(),
+            registrar_status: 201,
         });
         // Registered but the socket is down: not ready, and the address is kept so a
         // reconnect can still tell a surl that MOVED from one that came back.
-        assert!(plane.channel.is_some() && !plane.connected);
+        assert!(plane.channel.is_some() && plane.ready_channel().is_none());
         plane.connected = true;
-        assert!(plane.channel.is_some() && plane.connected);
+        assert_eq!(plane.ready_channel().map(|c| c.endpoint_id.as_str()), Some("epid"));
+    }
+
+    fn calling_channel(surl: &str, registrar_status: u16) -> trouter::CallingChannel {
+        trouter::CallingChannel { surl: surl.into(), endpoint_id: "epid".into(), registrar_status }
+    }
+
+    /// The registration moves on what an attempt FOUND — the registrar's answer, or why the
+    /// attempt ended — and a refusal is carried without touching readiness: the registrar's
+    /// status has never been measured, so acting on it could block calls that work today.
+    #[test]
+    fn the_registration_follows_what_the_connection_found() {
+        let mut plane = CallingPlane::default();
+        assert_eq!(plane.registration, Registration::Starting, "nothing has been tried yet");
+
+        assert!(!plane.on_channel(calling_channel("https://tr/a/", 201)), "nothing to move from");
+        assert_eq!(plane.registration, Registration::Registered(201));
+        assert!(plane.ready_channel().is_some());
+
+        // A refusal is informational: the connection proceeds and stays ready.
+        assert!(!plane.on_channel(calling_channel("https://tr/a/", 403)));
+        assert_eq!(plane.registration, Registration::Refused(403));
+        assert!(plane.ready_channel().is_some(), "a refused registration does not change `ready`");
+
+        // A live socket that drops for want of credentials is waiting for sign-in, and the
+        // drop is reported once: the attempts after it were never up.
+        assert!(plane.on_disconnected(true), "it had been up");
+        assert_eq!(plane.registration, Registration::WaitingForSignIn);
+        assert!(plane.ready_channel().is_none());
+        assert!(!plane.on_disconnected(false), "it was already down");
+        assert_eq!(plane.registration, Registration::Connecting, "credentials, but no connection");
+
+        // Back, on another address: a call still up has links nobody answers any more.
+        assert!(plane.on_channel(calling_channel("https://tr/b/", 200)), "the surl moved");
+        assert_eq!(plane.registration, Registration::Registered(200));
+        assert!(plane.connected);
+
+        // "Registered" is a 2xx and nothing else, at both edges: the page draws a different
+        // sentence for each, so a 1xx or a 3xx read as accepted is a refusal the reader is never
+        // told about.
+        for (status, registered) in
+            [(199, false), (200, true), (204, true), (299, true), (300, false), (500, false)]
+        {
+            let expected =
+                if registered { Registration::Registered(status) } else { Registration::Refused(status) };
+            assert_eq!(Registration::from_registrar_status(status), expected, "{status}");
+        }
+
+        // And the connection's two tasks report what they FOUND through exactly these two
+        // methods — the reason the attempt ended, as the trouter said it, and the address with
+        // the registrar's answer — or the rules above hold for a plane nothing ever drives.
+        // Scanned with whitespace collapsed, so a reflow cannot hide a change of argument.
+        fn squash(text: &str) -> String {
+            text.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
+        let source = include_str!("server.rs");
+        let code = squash(source.split("#[cfg(test)]").next().unwrap_or(source));
+        let calls = |needle: &str| code.matches(needle).count();
+        assert_eq!(
+            calls("ctx_status.change_calling_plane(|plane| { dropped = plane.on_disconnected(no_credentials); });"),
+            1,
+            "the status task passes the trouter's own `no_credentials` to the plane"
+        );
+        assert_eq!(
+            calls("ctx_chan.change_calling_plane(|plane| moved = plane.on_channel(channel));"),
+            1,
+            "the channel task hands the plane the address the registrar answered for"
+        );
+        assert_eq!(calls("trouter::Status::Connecting => {}"), 1, "an attempt STARTING changes nothing");
+    }
+
+    /// The `call_state` shape is a contract with the page: `registration` is an object with
+    /// exactly a `state` and a `registrar_status` — the status only where the registrar
+    /// answered — `null` where this backend never calls, and the process's start moment
+    /// travels beside it. `enabled`, `ready` and `call` keep their meaning.
+    #[test]
+    fn call_state_carries_the_registration_and_the_backend_start() {
+        let mut plane = CallingPlane::default();
+        let state = call_state_json(&plane, facts(true, Some(1_762_300_000_000)));
+        let keys: std::collections::BTreeSet<&str> =
+            state.as_object().expect("an object").keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            ["backend_started_ms", "call", "enabled", "ready", "registration"].into_iter().collect()
+        );
+        assert_eq!(state["enabled"], true);
+        assert_eq!(state["ready"], false);
+        assert_eq!(state["call"], Value::Null);
+        assert_eq!(state["registration"], json!({ "state": "starting", "registrar_status": null }));
+        assert_eq!(state["backend_started_ms"], 1_762_300_000_000_i64);
+
+        for (registration, state, status) in [
+            (Registration::WaitingForSignIn, "waiting_for_sign_in", Value::Null),
+            (Registration::Unavailable, "unavailable", Value::Null),
+            (Registration::Connecting, "connecting", Value::Null),
+            (Registration::Registered(201), "registered", json!(201)),
+            (Registration::Refused(403), "refused", json!(403)),
+        ] {
+            plane.registration = registration;
+            assert_eq!(
+                call_state_json(&plane, facts(true, None))["registration"],
+                json!({ "state": state, "registrar_status": status }),
+                "{registration:?}"
+            );
+        }
+
+        // Refused normally comes with `ready: true` — the connection proceeds.
+        plane.on_channel(calling_channel("https://tr/a/", 403));
+        let refused = call_state_json(&plane, facts(true, None));
+        assert_eq!(refused["ready"], true);
+        assert_eq!(refused["registration"]["state"], "refused");
+        assert_eq!(refused["backend_started_ms"], Value::Null, "an unknown start is null");
+
+        // A backend that never calls states no registration at all.
+        let off = call_state_json(&plane, facts(false, Some(1)));
+        assert_eq!(off["enabled"], false);
+        assert_eq!(off["registration"], Value::Null);
+    }
+
+    fn facts(available: bool, backend_started_ms: Option<i64>) -> PlaneFacts {
+        PlaneFacts { available, backend_started_ms }
+    }
+
+    /// The facts both readers use are this PROCESS's own, from one constructor, and both
+    /// readers go through it: the payload every page is sent (`call_state_payload`) and the
+    /// comparison that decides whether to send it (`change_calling_plane`). Pinned twice,
+    /// because each half alone passes over a broken one: the behaviour proves the start moment
+    /// arrives once it is set, and the scan proves `available` is `calling_available()` — which
+    /// in this test process is `true` either way — and that neither reader spells its own.
+    #[test]
+    fn the_published_facts_are_this_processs_own() {
+        let started = *BACKEND_STARTED_MS.get_or_init(now_ms);
+        let current = PlaneFacts::current();
+        assert_eq!(current.backend_started_ms, Some(started));
+        assert_eq!(current.available, calling_available());
+
+        let source = include_str!("server.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let method = |signature: &str| -> &str {
+            let start = code.find(signature).unwrap_or_else(|| panic!("{signature} exists"));
+            let end = code[start..].find("\n    }\n").expect("it ends");
+            &code[start..start + end]
+        };
+        let constructor = method("    fn current() -> Self {\n        PlaneFacts {");
+        assert!(constructor.contains("available: calling_available(),"), "{constructor}");
+        assert!(
+            constructor.contains("backend_started_ms: BACKEND_STARTED_MS.get().copied(),"),
+            "{constructor}"
+        );
+        for reader in ["fn call_state_payload(&self)", "fn change_calling_plane(&self"] {
+            let body = method(reader);
+            assert_eq!(body.matches("PlaneFacts::current()").count(), 1, "{reader}: {body}");
+            for own in ["calling_available()", "BACKEND_STARTED_MS", "PlaneFacts {"] {
+                assert!(!body.contains(own), "{reader} spells its own {own}: {body}");
+            }
+        }
+    }
+
+    /// The contract's words, and the page's own copy of them: a word the backend sends that
+    /// `web/src/lib/call.ts` does not name is a state the page draws the fallback sentence for.
+    #[test]
+    fn the_registration_words_are_the_pages_own() {
+        let words: Vec<&str> = [
+            Registration::Starting,
+            Registration::WaitingForSignIn,
+            Registration::Unavailable,
+            Registration::Connecting,
+            Registration::Registered(200),
+            Registration::Refused(500),
+        ]
+        .into_iter()
+        .map(Registration::word)
+        .collect();
+        assert_eq!(
+            words,
+            ["starting", "waiting_for_sign_in", "unavailable", "connecting", "registered", "refused"]
+        );
+        // The page's TYPE, and only the type: the same words are quoted in its doc comments
+        // and "connecting" is also a call phase, so a scan of the whole file would pass with a
+        // word dropped from the one place that decides what the page accepts.
+        let page = include_str!("../../web/src/lib/call.ts");
+        let declaration = "export type CallRegistrationState =";
+        let start = page.find(declaration).expect("call.ts declares CallRegistrationState");
+        let body = &page[start + declaration.len()..];
+        let body = &body[..body.find(';').expect("the type ends")];
+        let declared: Vec<&str> = body
+            .split('|')
+            .map(str::trim)
+            .filter(|member| !member.is_empty())
+            .map(|member| member.trim_matches('"'))
+            .collect();
+        assert_eq!(declared, words, "the page's type names exactly the backend's words, in order");
+    }
+
+    /// The refusal a page meets when no call can start, pinned in full: the page reads its
+    /// phrase "calling is not connected yet", and the rest is what the reader is told to do —
+    /// wait, because the machine registers by itself. And BOTH `call_prepare` paths refuse
+    /// with it, on the one predicate `ready` is built from.
+    #[test]
+    fn call_prepare_refuses_in_one_sentence_on_one_predicate() {
+        assert_eq!(
+            CALL_PREPARE_NOT_CONNECTED,
+            "call_prepare: calling is not connected yet \u{2014} this machine registers for calls \
+             on its own once it can; try again in a moment"
+        );
+        // The phrase is a contract across two process boundaries: the page turns any refusal
+        // carrying it into its own sentence, and the mock — which stands in for this backend
+        // in every spec — refuses in this very sentence. Reworded here and not there, the page
+        // would show the backend's raw words while every web test passed on the old ones.
+        let phrase = "calling is not connected yet";
+        assert!(CALL_PREPARE_NOT_CONNECTED.contains(phrase));
+        let failure = include_str!("../../web/src/lib/call-failure.ts");
+        assert!(failure.contains(&format!("/{phrase}/i.test(raw)")), "the page matches the phrase");
+        let mock = include_str!("../../web/mock/server.ts");
+        assert!(
+            mock.contains(&format!("\"{CALL_PREPARE_NOT_CONNECTED}\"")),
+            "web/mock/server.ts refuses in this backend's own sentence"
+        );
+        // And a window that does not call at all is a READ-ONLY backend, which never reaches
+        // this arm: its dispatch gate refuses first. The mock's stand-in for that window must
+        // refuse in the gate's words, or a spec passes on a promise ("they connect on their
+        // own") the real window would never make.
+        let read_only = check_write_allowed("call_prepare", &json!({}), None)
+            .expect_err("a read-only backend refuses call_prepare");
+        assert!(
+            mock.contains(&format!("\"{read_only}\"")),
+            "web/mock/server.ts refuses a read-only window's call_prepare in the gate's words: \
+             {read_only}"
+        );
+        let source = include_str!("server.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let start = code
+            .find("if let Some(meeting) = meeting_address(params)?")
+            .expect("call_prepare's meeting path");
+        let arm = &code[start..];
+        let arm = &arm[..arm.find("\"call_place\" =>").expect("the next arm")];
+        assert_eq!(
+            arm.matches(".context(CALL_PREPARE_NOT_CONNECTED)").count(),
+            2,
+            "the meeting path and the placing path both refuse with the one sentence"
+        );
+        // Every read of the calling address in this arm goes through the one predicate, so
+        // no path can build a call on an address whose socket is down.
+        assert!(arm.matches(".ready_channel()").count() >= 2, "both paths use the predicate");
+        // A read of the FIELD is refused in every spelling, not only the one that shipped: the
+        // `.channel` token wherever it is not the start of a longer name — `.as_ref()`,
+        // `.clone()`, `.iter()` and a bare `.channel` on a line of its own are all the address
+        // remembered rather than a socket that is up, and each reads as an ordinary Option.
+        let field = ".channel";
+        let bare_reads: Vec<&str> = arm
+            .match_indices(field)
+            .filter(|(at, _)| {
+                let next = arm[at + field.len()..].chars().next();
+                !next.is_some_and(|c| c.is_alphanumeric() || c == '_')
+            })
+            .map(|(at, _)| arm[at..].lines().next().unwrap_or_default().trim())
+            .collect();
+        assert!(
+            bare_reads.is_empty(),
+            "both paths require a socket that is UP, not merely an address remembered: {bare_reads:?}"
+        );
+    }
+
+    /// The status task's identical reports — an outage retries every 30 s — tell no page
+    /// anything, while every real change does. That is the difference between a call row
+    /// that is redrawn twice a minute for the length of an outage and one that changes when
+    /// something did.
+    #[test]
+    fn an_identical_report_tells_no_page_anything() {
+        let mut plane = CallingPlane::default();
+        plane.on_channel(calling_channel("https://tr/a/", 201));
+        let disconnect = |plane: &mut CallingPlane, no_credentials: bool| {
+            apply_plane_change(plane, facts(true, Some(1)), |p| {
+                p.on_disconnected(no_credentials);
+            })
+        };
+        let publish = |plane: &mut CallingPlane| {
+            apply_plane_change(plane, facts(true, Some(1)), |p| {
+                p.on_channel(calling_channel("https://tr/a/", 201));
+            })
+        };
+
+        // The socket drops: the page's readiness and its sentence both change.
+        assert_eq!(disconnect(&mut plane, false), (true, Some(Registration::Connecting)));
+        // The same report on every retry after it: nothing for anybody.
+        assert_eq!(disconnect(&mut plane, false), (false, None));
+        // Sign-in breaks: a different sentence, so a change.
+        assert_eq!(disconnect(&mut plane, true), (true, Some(Registration::WaitingForSignIn)));
+        // Back on the same address with the same answer: readiness changed, so a page is told.
+        assert_eq!(publish(&mut plane), (true, Some(Registration::Registered(201))));
+        // The very same address again (a re-publish): nothing moved.
+        assert_eq!(publish(&mut plane), (false, None));
+
+        // And the backend carries the rule out where it SENDS. The pure half above passes over
+        // a `change_calling_plane` that ignores the answer it is given and broadcasts anyway, so
+        // what a page is really sent is counted, on a backend of the test's own.
+        let ctx = test_ctx();
+        let mut page = ctx.events.subscribe();
+        let mut sent = || {
+            let mut call_states = 0;
+            while let Ok(event) = page.try_recv() {
+                if event["event"] == "call_state" {
+                    call_states += 1;
+                }
+            }
+            call_states
+        };
+        ctx.change_calling_plane(|p| {
+            p.on_channel(calling_channel("https://tr/a/", 201));
+        });
+        assert_eq!(sent(), 1, "the address arrived: a page is told");
+        ctx.change_calling_plane(|p| {
+            p.on_disconnected(false);
+        });
+        assert_eq!(sent(), 1, "the socket dropped: a page is told");
+        for _ in 0..3 {
+            ctx.change_calling_plane(|p| {
+                p.on_disconnected(false);
+            });
+        }
+        assert_eq!(sent(), 0, "an outage's identical retries tell no page anything");
+
+        // …and the status task reports through that comparison, never around it.
+        let source = include_str!("server.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let pattern = "trouter::Status::Disconnected { retry_in_secs, no_credentials } =>";
+        assert_eq!(code.matches(pattern).count(), 1, "the status task's disconnect arm");
+        let arm = &code[code.find(pattern).expect("the arm")..];
+        let arm = &arm[..arm.find("trouter::Status::Connecting => {}").expect("the arm after it")];
+        assert!(arm.contains("ctx_status.change_calling_plane("), "{arm}");
+        assert!(
+            !arm.contains("emit_call_state") && !arm.contains(".emit("),
+            "a disconnect is published by the comparison alone: {arm}"
+        );
+    }
+
+    /// No file may send a reader to Settings for the calling switch that no longer exists.
+    /// It is scanned with Rust string continuations joined and whitespace collapsed, because
+    /// the sentence that shipped was split across a `\` continuation — a search for the whole
+    /// sentence found nothing while it was in two places.
+    #[test]
+    fn no_file_offers_a_calling_switch_that_is_gone() {
+        fn walk(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, files);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        fn normalized(text: &str) -> String {
+            // A `\` at a line's end joins the next line minus its indentation.
+            let mut joined = String::with_capacity(text.len());
+            let mut rest = text;
+            while let Some(at) = rest.find("\\\n") {
+                joined.push_str(&rest[..at]);
+                rest = rest[at + 2..].trim_start();
+            }
+            joined.push_str(rest);
+            joined.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
+        // Built rather than written, so this file does not find its own needle.
+        let phrase = ["turn", "it", "on", "in"].join(" ");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        for dir in ["src", "web/src", "web/mock"] {
+            walk(&root.join(dir), &mut files);
+        }
+        assert!(files.len() > 50, "the walk found the source tree ({} files)", files.len());
+        let offenders: Vec<String> = files
+            .iter()
+            .filter(|path| {
+                let bytes = std::fs::read(path).unwrap_or_default();
+                normalized(&String::from_utf8_lossy(&bytes)).contains(&phrase)
+            })
+            .map(|path| path.strip_prefix(root).unwrap_or(path).display().to_string())
+            .collect();
+        assert!(offenders.is_empty(), "{offenders:?} still say {phrase:?}");
+        // And the normalization is what finds a phrase split by a continuation or a wrap.
+        let head = ["turn", "it", "on"].join(" ");
+        let continued = format!("\"x \u{2014} {head} \\\n      in Settings\"");
+        assert!(!continued.contains(&phrase) && normalized(&continued).contains(&phrase));
+        let wrapped = format!("{head}\n   in Settings");
+        assert!(!wrapped.contains(&phrase) && normalized(&wrapped).contains(&phrase));
+    }
+
+    /// A session is FRESH for `SESSION_TTL` after it was minted and not a moment after —
+    /// the start loop reads this, and a stale session must never be mistaken for one it
+    /// may register with (registering with an expired skypetoken is a refusal it cannot
+    /// explain).
+    #[test]
+    fn a_cached_session_is_fresh_only_inside_its_ttl() {
+        let minted = std::time::Instant::now();
+        let cell = SessionCell { session: Some(test_session()), minted };
+        assert!(cell.fresh_at(minted).is_some());
+        assert!(cell.fresh_at(minted + SESSION_TTL - Duration::from_secs(1)).is_some());
+        assert!(cell.fresh_at(minted + SESSION_TTL).is_none(), "stale at the TTL");
+        let empty = SessionCell { session: None, minted };
+        assert!(empty.fresh_at(minted).is_none());
+    }
+
+    fn test_session() -> Session {
+        Session {
+            skypetoken: "test".into(),
+            region: "test".into(),
+            gtms: json!({}),
+            self_name: String::new(),
+            self_mri: String::new(),
+        }
+    }
+
+    /// A REAL backend context, built field for field as `serve` builds it, for the rules whose
+    /// half lives in `Ctx` itself — what it broadcasts, and what wakes its calling start loop.
+    ///
+    /// Building it reaches nothing: the HTTP client and the token cache are idle until asked,
+    /// and nothing these tests call asks them (a session with no mri skips the directory read
+    /// in `adopt_session`). Its store is a fresh in-memory database, so `adopt_session`'s
+    /// `remember_self` writes nowhere that outlives the test.
+    fn test_ctx() -> Ctx {
+        let (events, _) = broadcast::channel::<Value>(256);
+        Ctx {
+            http: reqwest::Client::new(),
+            tokens: auth::TokenCache::new(),
+            session: Arc::new(tokio::sync::Mutex::new(SessionCell {
+                session: None,
+                minted: std::time::Instant::now(),
+            })),
+            db_path: Arc::new(":memory:".to_string()),
+            events,
+            update: Arc::new(std::sync::Mutex::new(UpdateSlot::default())),
+            engine: Arc::new(std::sync::Mutex::new(EngineSlot::default())),
+            chess_sounds_fetching: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            mail_watch: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+            calendar_watch: Arc::new(Mutex::new(None)),
+            signin: Arc::new(Mutex::new(None)),
+            calling: Arc::new(Mutex::new(CallingPlane::default())),
+            calling_wake: Arc::new(tokio::sync::Notify::new()),
+            gitlab_refreshing: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+            csa_syncing: Arc::new(Mutex::new((false, None))),
+            tracker_people: Arc::new(Mutex::new(None)),
+            agent_runs_inflight: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            channel_layouts: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// A pretend backend for the calling start loop: what `fresh_session` answers, whether a
+    /// start works, and a record of every attempt and every state it noted. It has no way to
+    /// mint a session at all — neither has the loop.
+    #[derive(Default)]
+    struct FakeStart {
+        session: std::sync::Mutex<Option<Session>>,
+        start_works: AtomicBool,
+        /// Simulates a session adopted in the window between the loop's look and its wait.
+        adopt_after_first_look: AtomicBool,
+        looks: std::sync::atomic::AtomicUsize,
+        attempts: std::sync::Mutex<Vec<tokio::time::Instant>>,
+        noted: std::sync::Mutex<Vec<Registration>>,
+        wake: tokio::sync::Notify,
+    }
+
+    impl CallingStart for FakeStart {
+        async fn fresh_session(&self) -> Option<Session> {
+            let looks = self.looks.fetch_add(1, Ordering::SeqCst);
+            let answer = self.session.lock().unwrap().clone();
+            if looks == 0 && self.adopt_after_first_look.load(Ordering::SeqCst) {
+                *self.session.lock().unwrap() = Some(test_session());
+                self.wake.notify_one();
+            }
+            answer
+        }
+
+        async fn start(&self, _session: Session) -> Result<(), CallingStartError> {
+            self.attempts.lock().unwrap().push(tokio::time::Instant::now());
+            if self.start_works.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(CallingStartError::NoCallingEndpoints(anyhow::anyhow!(
+                    "no calling_trouterUrl in regionGtms"
+                )))
+            }
+        }
+
+        async fn woken(&self) {
+            self.wake.notified().await;
+        }
+
+        fn note(&self, registration: Registration) {
+            self.noted.lock().unwrap().push(registration);
+        }
+    }
+
+    /// Let every task that can run, run, without moving the paused clock.
+    async fn settle() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// With no session, the loop waits for a wake and for NOTHING else: hours go by and it
+    /// neither looks again nor attempts — so it can never be what polls a broker that is down.
+    #[tokio::test(start_paused = true)]
+    async fn the_calling_start_loop_without_a_session_waits_for_a_wake_alone() {
+        let fake = Arc::new(FakeStart::default());
+        let looping = fake.clone();
+        let handle = tokio::spawn(async move { run_calling_start(&*looping).await });
+        tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
+        assert_eq!(fake.looks.load(Ordering::SeqCst), 1, "it looked once, then only waited");
+        assert!(fake.attempts.lock().unwrap().is_empty(), "nothing was attempted");
+        assert_eq!(*fake.noted.lock().unwrap(), [Registration::WaitingForSignIn]);
+        assert!(!handle.is_finished(), "still waiting for a session");
+        handle.abort();
+    }
+
+    /// A wake with a session attempts at ONCE — no timer stands between a session being
+    /// adopted and calling registering — and a start that works ends the loop.
+    #[tokio::test(start_paused = true)]
+    async fn a_wake_with_a_session_starts_calling_at_once() {
+        let fake = Arc::new(FakeStart::default());
+        fake.start_works.store(true, Ordering::SeqCst);
+        let looping = fake.clone();
+        let handle = tokio::spawn(async move { run_calling_start(&*looping).await });
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        assert!(fake.attempts.lock().unwrap().is_empty());
+
+        *fake.session.lock().unwrap() = Some(test_session());
+        let woken_at = tokio::time::Instant::now();
+        fake.wake.notify_one();
+        settle().await;
+        assert!(handle.is_finished(), "the loop returned once the connection started");
+        assert_eq!(*fake.attempts.lock().unwrap(), [woken_at], "attempted at the moment of the wake");
+    }
+
+    /// A session adopted between the loop's look and its wait is not lost: the wake is kept
+    /// as a permit (`notify_one`), so the loop goes straight on to it instead of waiting for
+    /// a second adoption that may be an hour away.
+    #[tokio::test(start_paused = true)]
+    async fn a_session_adopted_before_the_loop_waits_is_not_lost() {
+        let fake = Arc::new(FakeStart::default());
+        fake.start_works.store(true, Ordering::SeqCst);
+        fake.adopt_after_first_look.store(true, Ordering::SeqCst);
+        let started = tokio::time::Instant::now();
+        let looping = fake.clone();
+        let handle = tokio::spawn(async move { run_calling_start(&*looping).await });
+        settle().await;
+        assert!(handle.is_finished(), "the kept wake found the session");
+        assert_eq!(*fake.attempts.lock().unwrap(), [started]);
+    }
+
+    /// The same two rules on the REAL backend, which the fake above cannot speak for: its wake
+    /// is the fake's own. A session `adopt_session` takes with nobody waiting is a wake KEPT —
+    /// `notify_waiters` would drop it, and the loop would sleep through the very session that
+    /// ends a sign-in outage — and the backend's own loop, woken by an adoption, reads the
+    /// session that woke it and registers from that session's directory. That directory names
+    /// no calling service here, which is what lets the test see the attempt was made (the
+    /// registration reads `unavailable`) without a connection being opened.
+    #[tokio::test(start_paused = true)]
+    async fn the_backends_own_start_loop_is_woken_by_the_session_it_adopts() {
+        let ctx = test_ctx();
+        ctx.adopt_session(test_session()).await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), ctx.calling_wake.notified()).await.is_ok(),
+            "a session adopted while nobody waited is a wake the loop still gets"
+        );
+
+        let ctx = test_ctx();
+        let looping = ctx.clone();
+        let handle = tokio::spawn(async move { run_calling_start(&looping).await });
+        settle().await;
+        assert_eq!(ctx.calling.lock().unwrap().registration, Registration::WaitingForSignIn);
+        ctx.adopt_session(test_session()).await;
+        settle().await;
+        assert_eq!(
+            ctx.calling.lock().unwrap().registration,
+            Registration::Unavailable,
+            "the adopted session was read, and its directory names no calling service"
+        );
+        assert!(ctx.calling.lock().unwrap().connection.is_none(), "nothing was connected");
+        assert!(!handle.is_finished(), "it waits for the next session");
+        handle.abort();
+    }
+
+    /// A start that fails WITH a session in hand — a directory naming no calling service —
+    /// waits for the NEXT session and for nothing else. The failure is a pure read of the
+    /// session it was handed, so a timer would only fail the same way again: hours go by and
+    /// the loop neither looks nor attempts. The state is `unavailable` throughout — the
+    /// directory's answer is the evidence there is, and a session that merely ages out is not
+    /// a new directory — and a new session is attempted the moment it is adopted.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_start_waits_for_the_next_session_alone() {
+        let fake = Arc::new(FakeStart::default());
+        *fake.session.lock().unwrap() = Some(test_session());
+        let t0 = tokio::time::Instant::now();
+        let looping = fake.clone();
+        let handle = tokio::spawn(async move { run_calling_start(&*looping).await });
+
+        tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
+        assert_eq!(*fake.attempts.lock().unwrap(), [t0], "one attempt, and no retry on a clock");
+        assert_eq!(fake.looks.load(Ordering::SeqCst), 1, "it looked once, then only waited");
+
+        // The cached session ages out: still nothing to do, and still the directory's answer.
+        *fake.session.lock().unwrap() = None;
+        tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
+        assert_eq!(fake.looks.load(Ordering::SeqCst), 1);
+        assert_eq!(*fake.noted.lock().unwrap(), [Registration::Unavailable]);
+
+        // A new session is adopted — a directory read again — and is attempted at once.
+        *fake.session.lock().unwrap() = Some(test_session());
+        fake.start_works.store(true, Ordering::SeqCst);
+        let woken_at = tokio::time::Instant::now();
+        fake.wake.notify_one();
+        settle().await;
+        assert!(handle.is_finished(), "the loop returned once the connection started");
+        assert_eq!(*fake.attempts.lock().unwrap(), [t0, woken_at]);
+    }
+
+    /// The start loop and everything it calls on the real backend stay off the broker: no
+    /// `session()` (which rebuilds through it), no `teams::connect`, no token cache. And a
+    /// session adopted anywhere wakes it — AFTER the cell is written, so the loop finds it.
+    #[test]
+    fn the_calling_start_loop_never_reaches_the_broker() {
+        let source = include_str!("server.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap_or(source);
+        fn body<'a>(code: &'a str, signature: &str) -> &'a str {
+            let start = code.find(signature).unwrap_or_else(|| panic!("{signature} exists"));
+            let end = code[start..].find("\n}\n").expect("it ends");
+            &code[start..start + end]
+        }
+        fn method<'a>(code: &'a str, signature: &str) -> &'a str {
+            let start = code.find(signature).unwrap_or_else(|| panic!("{signature} exists"));
+            let end = code[start..].find("\n    }\n").expect("it ends");
+            &code[start..start + end]
+        }
+        let broker = [
+            ".session().await",
+            "teams::connect",
+            "tokens.get(",
+            "tokens.refresh(",
+            // The trouter's own provider rebuilds a stale session through the broker too, and
+            // so does a sign-in: a list of the one spelling that shipped would miss both.
+            ".credentials(",
+            "CredentialProvider::credentials",
+            "sign_in(",
+        ];
+        for (name, text) in [
+            ("run_calling_start", body(code, "async fn run_calling_start(")),
+            ("impl CallingStart for Ctx", body(code, "impl CallingStart for Ctx {")),
+            ("session_if_fresh", method(code, "async fn session_if_fresh(")),
+            ("start_calling", method(code, "fn start_calling(&self, session: &Session)")),
+        ] {
+            for call in broker {
+                assert!(!text.contains(call), "{name} reaches the broker through {call}");
+            }
+        }
+        // And the two that a denylist can only ever approximate are pinned WHOLE: the seam the
+        // loop calls on the real backend, and the read it looks with. Each is a line or two,
+        // and any other line in either — a rebuild, a fallback, the cell read without its TTL —
+        // is a change to what the loop may reach, which is worth a deliberate edit here.
+        fn statements(text: &str) -> Vec<&str> {
+            text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("//")).collect()
+        }
+        assert_eq!(
+            statements(body(code, "impl CallingStart for Ctx {")),
+            [
+                "impl CallingStart for Ctx {",
+                "async fn fresh_session(&self) -> Option<Session> {",
+                "self.session_if_fresh().await",
+                "}",
+                "async fn start(&self, session: Session) -> Result<(), CallingStartError> {",
+                "self.start_calling(&session)",
+                "}",
+                "async fn woken(&self) {",
+                "self.calling_wake.notified().await;",
+                "}",
+                "fn note(&self, registration: Registration) {",
+                "self.change_calling_plane(|plane| plane.registration = registration);",
+                "}",
+            ]
+        );
+        assert_eq!(
+            statements(method(code, "async fn session_if_fresh(")),
+            [
+                "async fn session_if_fresh(&self) -> Option<Session> {",
+                "self.session.lock().await.fresh_at(std::time::Instant::now()).cloned()",
+            ]
+        );
+
+        let adopt = method(code, "async fn adopt_session(");
+        let written = adopt.find("cell.minted = ").expect("adopt_session writes the cell");
+        let woken = adopt.find("self.calling_wake.notify_one()").expect("adopt_session wakes calling");
+        assert!(written < woken, "the wake goes out before the session it announces is there");
+        assert!(!adopt.contains("notify_waiters"), "a wake nobody waited for must be kept");
+    }
+
+    /// The start moment is taken FIRST, before anything that can take time: a page compares
+    /// it across reconnects, and a moment taken after a slow bind would still be honest, but
+    /// one taken after sign-in could be tens of seconds into the process.
+    #[test]
+    fn the_backend_start_moment_is_taken_first() {
+        let source = include_str!("server.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let serve = &code[code.find("async fn serve() -> Result<()> {").expect("serve")..];
+        let taken = serve.find("BACKEND_STARTED_MS.get_or_init(now_ms)").expect("serve takes it");
+        let bound = serve.find("TcpListener::bind(").expect("serve binds");
+        assert!(taken < bound, "the start moment comes before anything else in serve");
     }
 
     /// The keep-alive is shorter than any plausible server timeout, and it exists at all

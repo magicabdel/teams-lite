@@ -2825,6 +2825,27 @@ if (import.meta.main) {
       await emit({ kind: "call_invite", reset: true });
       await page.waitForTimeout(300);
 
+      // 2b. A backend that calls, whose REGISTRATION is waiting for sign-in to come back.
+      //     The row is disabled again, and the sentence under it says the machine mends
+      //     this on its own — the state an ordinary sign-in outage leaves, and the one a
+      //     reader is likeliest to meet. Both themes, because the reason is 11px faint ink.
+      await emit({ kind: "calling", registration: "waiting_for_sign_in" });
+      await page.waitForTimeout(300);
+      await openConversationMenu(page);
+      await page.waitForSelector('[data-testid="conversation-call-reason"]');
+      await page.waitForTimeout(200);
+      await shot(`${out}-call-unregistered-light.png`, '[data-testid="conversation-menu-content"]');
+      await setTheme("dark");
+      // The live feed can re-render the pane between two shots, so the menu is re-opened
+      // (idempotently) rather than assumed to still be there.
+      await openConversationMenu(page);
+      await page.waitForSelector('[data-testid="conversation-call-reason"]');
+      await shot(`${out}-call-unregistered-dark.png`, '[data-testid="conversation-menu-content"]');
+      await setTheme("light");
+      await closeConversationMenu(page);
+      await emit({ kind: "call_invite", reset: true });
+      await page.waitForTimeout(300);
+
       // 3. Ringing, with an Answer that works.
       await emit({ kind: "call_invite", conversation: conversationId });
       await page.waitForSelector('[data-testid="call-bar"][data-phase="ringing"]');
@@ -3020,6 +3041,7 @@ if (import.meta.main) {
 
       console.log(
         `[preview] wrote ${out}-button-light.png, ${out}-off-light.png, ` +
+          `${out}-call-unregistered-{light,dark}.png, ` +
           `${out}-ringing-{light,card-light,card-dark}.png and ` +
           `${out}-stage-{light,header-light,muted-light,dark}.png and ` +
           `${out}-mini-{light,page-light,dragged-light,dark,video-light}.png and ` +

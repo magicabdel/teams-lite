@@ -4824,7 +4824,7 @@ function mockSectionRejection(label: string, mid = "2"): string {
 }
 
 /** ON, exactly like every Rust backend the user launches: each registers as a device their
- *  calls ring on at startup, and there is no switch to find. The
+ *  calls ring on as soon as it can sign in, and there is no switch to find. The
  *  `{kind:"calling", enabled:false}` test hook is the only way back, and it reproduces the
  *  ONE backend that really answers `false` — a read-only one, which is the install the user
  *  never opened. */
@@ -4865,13 +4865,88 @@ async function holdMockCallStart(step: "prepare" | "place"): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, hold.ms));
 }
 
-function mockCallStatus(): { enabled: boolean; ready: boolean; call: MockCall | null } {
+/** The registration words the backend publishes (`CallRegistrationState` in
+ *  web/src/lib/call.ts), re-spelled here because this file stands in for the backend. */
+type MockCallRegistrationState =
+  | "starting"
+  | "waiting_for_sign_in"
+  | "unavailable"
+  | "connecting"
+  | "registered"
+  | "refused";
+
+const MOCK_CALL_REGISTRATION_STATES: readonly MockCallRegistrationState[] = [
+  "starting",
+  "waiting_for_sign_in",
+  "unavailable",
+  "connecting",
+  "registered",
+  "refused",
+];
+
+/** Where the mock's calling registration stands. REGISTERED out of the box, like a Rust
+ *  backend a moment after it starts: the mock has no connection to wait for, and a state
+ *  stuck on "connecting…" is one the real backend leaves in seconds.
+ *
+ *  The `{kind:"calling", registration:…}` test hook is the only way to the other states,
+ *  which is what makes the per-state sentences on a disabled call row reviewable at all —
+ *  the real ones need a sign-in outage, a tenant with no calling service or a dropped
+ *  socket. `call_invite {reset:true}` puts it back, and a spec MUST call it. */
+let mockCallRegistration: MockCallRegistrationState = "registered";
+
+/** When this mock began serving, which is what `backend_started_ms` reports: one value for
+ *  the life of the process, exactly as a real backend's never moves until it restarts. */
+const MOCK_BACKEND_STARTED_MS = Date.now();
+
+/** The backend's own rule (`ready = channel.is_some() && connected`), read off the state the
+ *  registration is in: a channel exists once the registrar has answered, whatever it said.
+ *  A refusal is informational in this milestone — the connection proceeds as before — so a
+ *  `refused` registration is still ready. */
+function mockCallRegistrationIsUp(): boolean {
+  return mockCallRegistration === "registered" || mockCallRegistration === "refused";
+}
+
+/** The registrar's HTTP status the backend would report: the code it answered for the two
+ *  states that HAVE an answer, and nothing for the rest. */
+function mockRegistrarStatus(state: MockCallRegistrationState): number | null {
+  if (state === "registered") return 200;
+  if (state === "refused") return 403;
+  return null;
+}
+
+/** The backend's refusal of a `call_prepare` that would START a call while the calling
+ *  registration is not up — its meeting path and its placing path, word for word (the dash
+ *  is an em dash). A mock that phrased it otherwise would let the page's mapping
+ *  (`callFailureMessage`) pass over a sentence the backend never sends. */
+const MOCK_CALL_PREPARE_NOT_CONNECTED =
+  "call_prepare: calling is not connected yet — this machine registers for calls on its own once it can; try again in a moment";
+
+/** The backend's refusal of `call_prepare` in a window that does not call at all — which is a
+ *  READ-ONLY backend, and `{kind:"calling", enabled:false}` stands for nothing else. That
+ *  backend never reaches the method: its dispatch gate refuses a `MACHINE_METHODS` entry first
+ *  (`check_write_allowed` in src/bin/server.rs, worded over `machine_effect`), so this is that
+ *  gate's sentence rather than the not-connected one — which would tell the reader calls come
+ *  back on their own in a window that never takes them. */
+const MOCK_CALL_PREPARE_READ_ONLY =
+  "refused: `call_prepare` reserves this machine's one call and hands out the media credentials it holds, and this server runs read-only (TEAMS_LITE_READ_ONLY=1). Tooling never changes the user's own machine — their own backend does.";
+
+function mockCallStatus(): {
+  enabled: boolean;
+  ready: boolean;
+  call: MockCall | null;
+  registration: { state: MockCallRegistrationState; registrar_status: number | null } | null;
+  backend_started_ms: number;
+} {
   return {
     enabled: mockCallingEnabled,
-    // Ready as soon as it calls at all: the mock has no connection to wait for, and a
-    // state stuck on "connecting…" is one the real backend leaves in seconds.
-    ready: mockCallingEnabled,
+    ready: mockCallingEnabled && mockCallRegistrationIsUp(),
     call: mockCall,
+    // Null where nothing registers at all, exactly as the backend publishes it: a read-only
+    // backend has no registration to describe.
+    registration: mockCallingEnabled
+      ? { state: mockCallRegistration, registrar_status: mockRegistrarStatus(mockCallRegistration) }
+      : null,
+    backend_started_ms: MOCK_BACKEND_STARTED_MS,
   };
 }
 
@@ -4991,8 +5066,11 @@ function injectMockCallInvite(conversation: string): MockCall | null {
   };
   // A backend that does not call is a backend no invite reaches, so an invite implies
   // one that does: a spec ringing a window that reported `enabled:false` would be
-  // testing a state no backend can be in.
+  // testing a state no backend can be in. For the same reason it implies a registration
+  // that is UP — an invite arrives on the very socket a registration that is down has not
+  // got — while one that is up keeps what it was (a `refused` one is still connected).
   mockCallingEnabled = true;
+  if (!mockCallRegistrationIsUp()) mockCallRegistration = "registered";
   broadcastMockCall();
   return mockCall;
 }
@@ -10212,8 +10290,13 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
 
     case "call_prepare": {
       const o = asObject(params);
-      if (!mockCallingEnabled) throw new Error("call_prepare: calling is not connected yet");
-      // Answering: hand back the offer that is ringing, exactly like the Rust one.
+      // A read-only backend refuses before the method runs, so on every path, answering
+      // included — exactly as its dispatch gate does.
+      if (!mockCallingEnabled) throw new Error(MOCK_CALL_PREPARE_READ_ONLY);
+      // Answering: hand back the offer that is ringing, exactly like the Rust one — which
+      // does NOT ask whether the registration is up. A call already ringing arrived on a
+      // socket that was, and refusing to answer it because that socket dropped a moment
+      // later would be this mock refusing what the backend accepts.
       if (typeof o.call_id === "string") {
         if (!mockCall || mockCall.id !== o.call_id || mockCall.phase !== "ringing") {
           throw new Error("call_prepare: that call is not ringing");
@@ -10224,6 +10307,11 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
           ice_servers: [{ urls: ["stun:mock.invalid:3478"] }],
         };
       }
+      // Both paths that START a call — a meeting join and a call placed — refuse while the
+      // registration is not up, in the backend's own words. The mock decides it from the
+      // very field it publishes (`ready`), so the refusal and the disabled row a page draws
+      // from that field can never disagree.
+      if (!mockCallStatus().ready) throw new Error(MOCK_CALL_PREPARE_NOT_CONNECTED);
       // Joining a meeting: reserve it from the address the caller named, exactly like the
       // Rust one — the link a calendar event carries, or the meeting's own thread out of
       // the chat list. The mock checks both shapes, so a spec can prove either refusal.
@@ -13407,6 +13495,27 @@ async function handleTestHook(req: Request, url: URL): Promise<Response | null> 
       broadcastMockCall();
       return Response.json({ ok: true, enabled: false }, { status: 200 });
     }
+    // Where the calling REGISTRATION stands, which is what a disabled call row explains:
+    // `waiting_for_sign_in`, `unavailable` and `connecting` (and `starting`) make the status
+    // not ready, while `refused` stays ready with the registrar's 403 — a refusal changes
+    // nothing yet in the backend either. A registration is only reported by a backend that
+    // calls, so this implies one. A live call is left exactly where it is: the backend does
+    // not end a call when its calling socket drops. Broadcast as `call_state`, because that
+    // is how a real backend tells every page the moment its registration moves. A spec MUST
+    // reset afterwards (`call_invite {reset:true}`), since one mock process serves the run.
+    if (body.kind === "calling" && typeof body.registration === "string") {
+      const state = MOCK_CALL_REGISTRATION_STATES.find((known) => known === body.registration);
+      if (!state) {
+        return Response.json(
+          { ok: false, error: `unknown registration state: ${body.registration}` },
+          { status: 400 },
+        );
+      }
+      mockCallingEnabled = true;
+      mockCallRegistration = state;
+      broadcastMockCall();
+      return Response.json({ ok: true, registration: state }, { status: 200 });
+    }
     // Hold ONE step of the next start, so a spec can hang up inside it — the window a real
     // call spends on a microphone, and the one it spends posting the invite. Nothing is
     // armed for later than that next step (`holdMockCallStart` disarms as it fires), and
@@ -13420,9 +13529,10 @@ async function handleTestHook(req: Request, url: URL): Promise<Response | null> 
     if (body.kind === "call_invite") {
       if (body.reset === true) {
         endMockCall("CallEndReasonHangup");
-        // Back to what a real backend reports: it calls. The hook above is the only way
-        // out of that, and it must not leak into the next spec.
+        // Back to what a real backend reports: it calls, and it is registered. The hooks
+        // above are the only way out of either, and neither must leak into the next spec.
         mockCallingEnabled = true;
+        mockCallRegistration = "registered";
         mockRefusesNextMedia = false;
         mockCallStartHold = null;
         broadcastMockCall();

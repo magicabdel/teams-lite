@@ -8,9 +8,12 @@
  *   browser and the microphone is only reachable from one, so an SDP crosses the local
  *   WebSocket in each direction and nothing else about a call does. See
  *   {@link ./call-media}.
- * - **Calling is off until the user turns it on**, because turning it on registers this
- *   machine with Teams as a device their calls ring on. So this is not a display of a
- *   setting — it IS the consent gate, exactly like the agent's per-thread mode.
+ * - **Calling is ON, with no switch anywhere.** Every backend the user can open registers as
+ *   a device their calls ring on, the way every other Teams client they are signed in on
+ *   does, and registering reaches nobody by itself: the actions that do (place, answer,
+ *   hang up, mute) are each the user's own click, gated one by one in the backend. So what
+ *   this module reports about the registration is a STATE to explain, never a setting to
+ *   change — and no sentence in it ever sends the user to look for one.
  *
  * Everything here is pure. The state comes from the backend, the actions live on the
  * controller, and nothing in this file reaches the network.
@@ -111,6 +114,47 @@ export type PublishedStream = {
   camera: boolean;
 };
 
+/**
+ * Where this machine's calling registration stands, as the backend states it
+ * (`CallingPlane.registration` in src/bin/server.rs).
+ *
+ * It exists because `ready: false` alone was one sentence for situations with different next
+ * moves: a sign-in outage (nothing to do here — it comes back on its own once sign-in does), a
+ * directory that names no calling service at all (nothing will ever ring here), a connection
+ * on its way up, and a registration the registrar has already answered. Read as one,
+ * the user was told "not registered yet" about an account that cannot call, and about a
+ * machine that was a sign-in away from calling again.
+ *
+ * - `"starting"` — the backend has not tried yet.
+ * - `"waiting_for_sign_in"` — the last attempt had no session to start from.
+ * - `"unavailable"` — the account's Teams directory names no calling service.
+ * - `"connecting"` — the calling socket is (re)connecting.
+ * - `"registered"` — the registrar answered 2xx (`registrar_status`).
+ * - `"refused"` — the registrar answered something else (`registrar_status`). Informational
+ *   for now: the connection proceeds exactly as before, so it normally comes with
+ *   `ready: true`.
+ *
+ * The backend's own test reads THIS TYPE for its words (`the_registration_words_are_the_pages_own`
+ * in src/bin/server.rs) and holds it to exactly the backend's six, in this order: a word one side
+ * spells and the other does not would otherwise silently put the user back in front of "not
+ * registered yet". So keep the members one quoted word each — that is the shape the test reads.
+ */
+export type CallRegistrationState =
+  | "starting"
+  | "waiting_for_sign_in"
+  | "unavailable"
+  | "connecting"
+  | "registered"
+  | "refused";
+
+/** The registration as `call_status` / `call_state` carry it. It names no URL and no
+ *  token: a state word, and the registrar's HTTP status where it answered one. */
+export type CallRegistration = {
+  state: CallRegistrationState;
+  /** The registrar's HTTP status for `"registered"` and `"refused"`; null otherwise. */
+  registrar_status: number | null;
+};
+
 /** Everything `call_status` reports, and the payload of every `call_state` event. */
 export type CallStatus = {
   /** Whether this window's backend takes calls at all. True on every install the user
@@ -120,9 +164,17 @@ export type CallStatus = {
   enabled: boolean;
   /** Whether a call could start right now: the calling connection is up and
    *  registered. A backend that calls while this is false is honest about a connection
-   *  that has not come back yet. */
+   *  that has not come back yet — and {@link CallStatus.registration} says why. */
   ready: boolean;
   call: ActiveCall | null;
+  /** Where the registration stands. Null where `enabled` is false (nothing registers), and
+   *  ABSENT from a backend too old to say — which reads as today's "not registered yet",
+   *  never as a guess. A word this build does not know reads the same way. */
+  registration?: CallRegistration | null;
+  /** When this backend process began serving (epoch ms), or null when it cannot say. A
+   *  process start time rather than an identity: what it tells a page is that the backend
+   *  it is talking to is not the one it was talking to before. */
+  backend_started_ms?: number | null;
 };
 
 /** What `call_prepare` hands back: what one `RTCPeerConnection` needs, and — when
@@ -412,28 +464,71 @@ export function canJoinMeeting(status: CallStatus): boolean {
   return status.enabled && status.ready && !isLive(status.call);
 }
 
-/** Why a meeting cannot be joined right now, for the tooltip on a disabled Join button.
- *  Empty when it can.
+/** Why a meeting cannot be joined right now, for a disabled Join control. Empty when it can.
  *
- *  `enabled` false is no longer something the user can fix — there is no switch, so it
- *  says what this window IS rather than what to go and turn on. It is a read-only backend
- *  or a second install, and the app they launched is the one that joins. */
+ *  The same three questions, in the same order, as {@link callUnavailableReason} — they share
+ *  one helper so the two controls can never give two answers about one machine. Only the
+ *  first sentence names the act, because only the first is about what this WINDOW is. */
 export function meetingUnavailableReason(status: CallStatus): string {
-  if (!status.enabled) return "This window cannot take calls, so it cannot join a meeting.";
-  if (!status.ready) return "This machine is not registered for calls yet.";
+  return unavailableReason(status, "This window cannot take calls, so it cannot join a meeting.");
+}
+
+/** Why calling cannot be used right now, for a disabled call control. Empty when it can.
+ *
+ *  It names only the three things about this MACHINE, because the control is drawn where a
+ *  call is possible in the first place ({@link conversationCallAction}) — a conversation
+ *  nothing can be done with has no control to hang a reason off. */
+export function callUnavailableReason(status: CallStatus): string {
+  return unavailableReason(status, "This window cannot take calls, so it cannot place one.");
+}
+
+/**
+ * The one decision behind both reasons, in the order the user can act on.
+ *
+ * 1. **This window does not call at all** (`enabled` false): a read-only backend. There is no
+ *    switch, so the sentence says what the window IS rather than what to go and turn on.
+ * 2. **The registration is not up** (`ready` false): say WHY, from
+ *    {@link CallStatus.registration} — see {@link notReadyReason}.
+ * 3. **A call is already live**: one microphone, one call.
+ *
+ * The order is the point: a read-only window has no registration to explain, and a machine
+ * whose registration is down has nothing to say about a call it could not have placed.
+ */
+function unavailableReason(status: CallStatus, cannotTakeCalls: string): string {
+  if (!status.enabled) return cannotTakeCalls;
+  if (!status.ready) return notReadyReason(status.registration);
   if (isLive(status.call)) return "This app holds one call at a time.";
   return "";
 }
 
-/** Why calling cannot be used right now, for the tooltip on a disabled call button.
- *  Empty when it can.
+/**
+ * Why a backend that calls is not ready, one sentence per registration state.
  *
- *  It names only the three things about this MACHINE, because the button is drawn where a
- *  call is possible in the first place ({@link conversationCallAction}) — a conversation
- *  nothing can be done with has no control to hang a reason off. */
-export function callUnavailableReason(status: CallStatus): string {
-  if (!status.enabled) return "This window cannot take calls, so it cannot place one.";
-  if (!status.ready) return "This machine is not registered for calls yet.";
-  if (isLive(status.call)) return "This app holds one call at a time.";
-  return "";
+ * Two rules shape the words. NONE of them promises a time — a sign-in outage or a network can
+ * last for hours, and "in a few seconds" that turns out false is a promise this app broke. And
+ * none sends the user to do something this machine does on its own: a registration comes back
+ * by itself once sign-in or the connection does, which is the whole of what
+ * "waiting_for_sign_in" and "connecting" have to say.
+ *
+ * A registration that is up (`"registered"`, or `"refused"`, which is informational and
+ * changes nothing yet) while `ready` is false is a connection the backend has not finished
+ * reporting, which is today's sentence — and so are an ABSENT field (a backend too old to
+ * say) and a word this build does not know. Read from the wire, so it never assumes the
+ * shape it was promised: anything that is not one of the known words falls through.
+ */
+function notReadyReason(registration: CallRegistration | null | undefined): string {
+  const state: unknown = registration?.state;
+  switch (state) {
+    case "waiting_for_sign_in":
+      return "Calls connect on their own once sign-in works again.";
+    case "unavailable":
+      return "This account's Teams directory names no calling service, so this machine cannot take calls.";
+    case "starting":
+    case "connecting":
+      return "Connecting for calls…";
+    case "registered":
+    case "refused":
+    default:
+      return "This machine is not registered for calls yet.";
+  }
 }

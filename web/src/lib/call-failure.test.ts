@@ -94,14 +94,47 @@ describe("callFailureMessage", () => {
   });
 
   it("drops the RPC name off a backend refusal and keeps the rest word for word", () => {
-    expect(
-      callFailureMessage(
-        new Error("call_prepare: calling is not connected yet — turn it on in Settings"),
-      ),
-    ).toBe("calling is not connected yet — turn it on in Settings");
+    expect(callFailureMessage(new Error("call_prepare: that call is not ringing"))).toBe(
+      "that call is not ringing",
+    );
     expect(callFailureMessage(new Error("call_offer_media: the service refused it"))).toBe(
       "the service refused it",
     );
+  });
+
+  /** The backend reached, and ITS calling registration not up yet. The sentence says what it
+   *  costs and that the machine mends it on its own — and an older backend's wording, which
+   *  went on to send the user to a switch that no longer exists, is told the same thing. */
+  it("says calls connect on their own when the calling registration is not up", () => {
+    const sentence =
+      "Calls are not connected on this machine yet. They connect on their own — try again in a moment.";
+    for (const raw of [
+      // Today's backend, word for word (the dash is an em dash).
+      "call_prepare: calling is not connected yet — this machine registers for calls on its own once it can; try again in a moment",
+      // The same, without the RPC's name in front.
+      "calling is not connected yet — this machine registers for calls on its own once it can; try again in a moment",
+      // The bare phrase an older mock and an older backend opened with.
+      "call_prepare: calling is not connected yet",
+      // An older backend's tail. Its literal sentence is deliberately not spelled here: the
+      // crate scans web/src for it, because that advice must not survive anywhere — and what
+      // this asserts is that any tail after the shared phrase is replaced, not that one is.
+      "call_prepare: calling is not connected yet — open Settings, then try again",
+    ]) {
+      const message = callFailureMessage(new Error(raw));
+      expect(message).toBe(sentence);
+      expect(message).not.toMatch(/Settings|call_prepare/);
+    }
+  });
+
+  /** The SOCKET's `not connected` is a different failure — the page could not reach its
+   *  backend at all — and it keeps its own sentence rather than being read as a calling
+   *  registration that is down. */
+  it("never reads the socket's own not-connected as the calling registration", () => {
+    for (const raw of ["not connected", "connection closed", "closed"]) {
+      expect(callFailureMessage(new Error(raw))).toBe(
+        "The backend is not reachable, so nothing can be called from here.",
+      );
+    }
   });
 
   it("leaves a colon that is not an RPC name alone", () => {

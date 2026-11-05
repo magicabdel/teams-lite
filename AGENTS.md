@@ -5847,12 +5847,13 @@ one. So an SDP crosses the local WebSocket in each direction and nothing else ab
 call does — this side never handles RTP, and the page never learns a Teams URL.
 
 - **Calling is ON, with no switch anywhere** (`calling_available` in `src/bin/server.rs`).
-  The app IS a Teams client, so it REGISTERS a calling endpoint at startup the way every
-  other client the user is signed in on does, and their real incoming calls are offered
-  here as well as on their phone. There used to be a Settings switch, off by default; it
-  was the wrong shape for the one thing it gated — registering reaches nobody by itself,
-  and the actions that reach a person are gated one by one below. Four things hold the
-  new shape, and each is pinned by a test:
+  The app IS a Teams client, so it REGISTERS a calling endpoint the way every other client
+  the user is signed in on does — as soon as it can sign in, and again BY ITSELF after a
+  sign-in outage, with no restart — and their real incoming calls are offered here as well
+  as on their phone. There used to be a Settings switch, off by default; it was the wrong
+  shape for the one thing it gated — registering reaches nobody by itself, and the actions
+  that reach a person are gated one by one below. Six things hold the new shape, and each
+  is pinned by a test:
   - **A READ-ONLY backend says no, and nothing else does.** A screenshot backend must not
     become a device the user's calls ring on; every install they can open registers, and
     no environment value takes that back (`no_environment_value_silences_calling` scans
@@ -5864,6 +5865,46 @@ call does — this side never handles RTP, and the page never learns a Teams URL
     and Join control in that window, drawn disabled — and the front a phone had open was
     the silenced one, so the app read as one that cannot call at all. A second ring is
     cheap; a call the user cannot place is not. Never trade one for the other again.
+  - **It registers when it CAN, not once at boot — and the start never polls the broker to get
+    there** (`run_calling_start`, spawned by `spawn_calling`). It used to be ONE attempt at
+    startup, by a `start_calling` that fetched its own session, and a failure was one journal
+    line: a backend whose first sign-in failed never registered for calls for the life of the
+    process, while everything else recovered on its own. The embedded image ALWAYS lost that
+    race — its broker is still booting when the backend starts (§ Running teams-lite in a
+    container image) — so every call and Join control there stayed disabled until somebody
+    restarted the backend. Three rules hold the replacement:
+    - **No session, no timer.** The loop reads `Ctx::session_if_fresh` and nothing else, which
+      never rebuilds a session and never reaches the broker; `start_calling` is HANDED that
+      session. With nothing fresh it waits on `Ctx::calling_wake` ALONE, which
+      `Ctx::adopt_session` rings whenever any path adopts a session — the live feed
+      reconnecting, a read, a send — with `notify_one`, so a wake nobody was waiting for is
+      kept as a permit, and only AFTER the session cell is written, so the loop finds what
+      woke it. Recovery therefore rides a session somebody else had to mint anyway, and a
+      broker that is down is asked nothing more on calling's behalf.
+      `the_calling_start_loop_without_a_session_waits_for_a_wake_alone`,
+      `a_wake_with_a_session_starts_calling_at_once` and
+      `a_session_adopted_before_the_loop_waits_is_not_lost` drive a fake through the
+      `CallingStart` seam, and `the_calling_start_loop_never_reaches_the_broker` scans the loop,
+      its `Ctx` impl, `session_if_fresh` and `start_calling` for every way to the broker and
+      pins the wake after the write.
+    - **A start that fails WITH a session** — a directory that names no calling service — waits
+      for the NEXT session too, on the same wake and with NO timer either. That is a deviation
+      from the design's 5 s → 300 s fallback timer, and the reason is that the failure is a
+      pure read of the session it was handed (`calling::endpoints`): the same session can only
+      fail the same way again, so a timer would retry a function on identical input, while a
+      new session re-reads the directory and its adoption is already the wake. The journal
+      says it when the reason CHANGES rather than on every retry, and the state is
+      `unavailable` until a new session says otherwise — a session that merely ages out is
+      not a new directory (`a_failed_start_waits_for_the_next_session_alone`). The cost is
+      stated rather than hidden: a directory that answered "no calling service" keeps the call
+      row on that sentence through a sign-in outage that follows it, because no newer
+      directory exists to contradict it; the outage itself is the sign-in banner's to say.
+    - **Once started, the loop returns and `trouter::run` owns every reconnect**, with the
+      bounds and the backoff NATIVE-CALLING.md § 2.1a records. Stated rather than hidden: those
+      reconnects still take their credentials from `Ctx::session()`, which REBUILDS through
+      the broker when the cached session is stale — exactly as the live feed's do, once per
+      backoff step — so the no-polling rule is the START's, and the calling socket after it is
+      the shape it always had.
   - **The registration is TAKEN BACK as the app goes away.** `stop_calling` runs on the
     idle shutdown, because a registration Teams still believes in keeps routing their
     calls to a process that is gone, and a call offered to a device that never rings is a
@@ -5874,10 +5915,91 @@ call does — this side never handles RTP, and the page never learns a Teams URL
     gap, recorded in § Running teams-lite in a container image, and mending it is a separate
     change (a backend that answers TERM with `stop_calling`, and a launcher that sends TERM and
     waits before it KILLs).
-  - **What a window cannot do, it says.** `enabled: false` is no longer something the user
-    can fix, so the disabled call and Join controls say what that window IS — never "turn
-    it on in Settings", which would name a switch that does not exist
-    (`callUnavailableReason` / `meetingUnavailableReason`).
+  - **What a window cannot do, it says — and a window that calls says WHY it cannot yet, one
+    sentence per registration state** (`callUnavailableReason` / `meetingUnavailableReason`,
+    over one `unavailableReason` so the call row and the Join row can never give two answers
+    about one machine). `enabled: false` is no longer something the user can fix, so it says
+    what that window IS ("This window cannot take calls, so it cannot place one." / "… cannot
+    join a meeting.") — never a sentence that sends the reader to Settings for a switch that
+    does not exist. `ready: false` used to be ONE sentence for four situations with four
+    different next moves, so an account that can never call and a machine a sign-in away from
+    calling again were both told "not registered yet". Now it is read from
+    `call_status.registration`:
+    - `waiting_for_sign_in` → "Calls connect on their own once sign-in works again."
+    - `unavailable` → "This account's Teams directory names no calling service, so this
+      machine cannot take calls."
+    - `starting`, `connecting` → "Connecting for calls…" — and no promise of seconds, because
+      a network can be down for hours;
+    - `registered` or `refused` while not ready, an ABSENT field (a backend too old to say) and
+      a word this build does not know → "This machine is not registered for calls yet.", the
+      sentence every state used to get, so an older backend reads exactly as it did.
+
+    EVERY disabled call or Join control draws the sentence IN FLOW as well as in its
+    `aria-label` — after what the control is for, never instead of it: a disabled control
+    fires no pointer events and a phone has no hover. The conversation menu's row has its
+    `conversation-call-reason` under it; the calendar event's and the incoming-call card's
+    "Join here" pill (`MeetingJoinButton`) has `MeetingJoinReason` (`meeting-join-reason`)
+    drawn by its surface under the row it shares — it held its reason in a tooltip alone,
+    and its label was the reason with the action gone. And
+    `call_prepare` refuses with ONE sentence on both of its paths, placing and joining
+    (`CALL_PREPARE_NOT_CONNECTED`: the machine registers on its own, try again in a moment),
+    which the page turns into "Calls are not connected on this machine yet. They connect on
+    their own — try again in a moment." (`callFailureMessage`, keyed on the phrase "calling is
+    not connected yet", so an OLDER backend's refusal — which still sent the reader to that
+    switch — is told the same true thing). `no_file_offers_a_calling_switch_that_is_gone` scans
+    `src/`, `web/src` and `web/mock` with Rust `\` continuations joined and whitespace
+    collapsed, because the old sentence was split across one and a search for it found nothing
+    while it shipped in two places; `the_registration_words_are_the_pages_own` holds the page's
+    `CallRegistrationState` TYPE to exactly the six words — the type and nothing else, because
+    the same words are quoted in that file's doc comments and a whole-file scan passed with one
+    dropped from the type; `call_prepare_refuses_in_one_sentence_on_one_predicate` reads
+    `call-failure.ts` for the phrase and the mock for the whole sentence; and
+    `web/e2e/calling.spec.ts` ("says why the calling registration is not up, in words, per
+    state", plus the calendar's own Join) and `incoming-call.spec.ts` hold every surface to each
+    sentence, spelled out rather than matched on "cannot take calls" — which is also the tail of
+    the directory's sentence.
+  - **Where the registration stands is the BACKEND's to say, and it says it only when it
+    moves** (`CallingPlane.registration`, built into `call_status` and every `call_state` by
+    `call_state_json`). Two fields join `enabled`, `ready` and `call`, which keep their meaning:
+    `registration` — `null` where the backend never calls, else `{state, registrar_status}`,
+    the state one of the six words above and the status the registrar's HTTP code for
+    `registered` and `refused` — and `backend_started_ms`, the epoch ms this process began
+    serving (taken first thing in `serve`, `the_backend_start_moment_is_taken_first`), which is
+    what lets a page tell a backend that restarted from one that did not; nothing on the page
+    reads it yet. `call_state_carries_the_registration_and_the_backend_start` pins the shape.
+    Four rules ride it:
+    - **The registrar's answer is READ, and changes NOTHING yet.** `trouter::register` returns
+      the status, the connection logs it as
+      `[calling] registered: <code> <reason> (ttl 3600 s)` — which the first re-staged run puts
+      in the journal (NATIVE-CALLING.md § 2.1a) — and it travels as
+      `CallingChannel::registrar_status`. A non-2xx is `refused` and the connection proceeds
+      exactly as after a 2xx, so it normally comes with `ready: true`: the status had never
+      been read, whether this tenant's registrar refuses anything is unmeasured, and acting on
+      a refusal before it is measured could block calls that work today
+      (`the_registration_follows_what_the_connection_found`).
+    - **The state moves on what an attempt FOUND** — the registrar's answer, or why the attempt
+      ended (`trouter::Status::Disconnected { no_credentials }` is what tells a sign-in outage
+      from the network) — and never on `Status::Connecting`, which goes out before EVERY attempt
+      and would flip the row between two sentences every 30 s of an outage. `no_credentials`
+      is the credentials failing FOR SIGN-IN, and not every credentials failure is: once the
+      cached session is 50 minutes old the provider rebuilds it with an authz POST, and a
+      network that is down fails that POST exactly as it fails the allocate. Read as sign-in,
+      a plain network outage told the reader "Calls connect on their own once sign-in works
+      again." while the sign-in banner said nothing was wrong. So a failure whose error chain
+      carries a `reqwest::Error` — the broker is D-Bus and never HTTP — is the network and
+      reads `connecting` (`trouter::failed_on_the_network`,
+      `after_an_attempt_the_sleep_the_line_and_the_reason_are_decided_together`).
+    - **A page is told only when what it reads changed** (`apply_plane_change`, which compares
+      the payload itself rather than a hand-picked list of fields). `call_state` used to go out
+      on every retry — every open page redrew an unchanged call row twice a minute for the
+      length of an outage (`an_identical_report_tells_no_page_anything`). A move of the state is
+      one journal line, `[calling] registration: <word>`, which is how a reader sees calling
+      come back.
+    - **`ready` and both `call_prepare` refusals are ONE predicate** (`CallingPlane::ready_channel`,
+      the registration AND a live socket). The placing path used to check the address alone, so
+      a call could be placed on an surl whose socket was down and the service would answer on
+      callbacks nothing listened to (`call_prepare_refuses_in_one_sentence_on_one_predicate`,
+      which also refuses a bare read of the channel anywhere in that arm).
   - **The page never assumes it.** `UNKNOWN_CALL_STATUS` is still both flags false until
     the backend answers: a hopeful `true` would claim the user's calls ring here while
     nothing is registered.
@@ -5890,8 +6012,9 @@ call does — this side never handles RTP, and the page never learns a Teams URL
 - **`call_prepare` is a `MACHINE_METHODS` entry**, with its own refusal words: it reserves
   the one call slot and hands the page the relay credentials this backend holds.
   `call_status` stays open: it returns no SDP, no links and no credentials, only what the
-  UI has to draw. There is no method that turns calling on — the registration is the
-  backend's own act at startup, so no client can ask for it and none can take it away.
+  UI has to draw — now including where the registration stands (above). There is no method
+  that turns calling on — the registration is the backend's own act, made the moment it can
+  sign in, so no client can ask for it and none can take it away.
 - **One call at a time.** A second simultaneous call needs a second microphone and a UI
   that can hold two. An invite that arrives while a call is up is left for the user's
   other devices to ring, which is what Teams does with a client that does not answer.
@@ -6076,11 +6199,22 @@ call does — this side never handles RTP, and the page never learns a Teams URL
   microphone**, and the page pairs it with `simulatedCallMedia` because that backend
   announces itself as a mock. That is what makes this surface reviewable with nothing
   leaving the machine: `cd web && bun run preview -- --out /tmp/call --call` captures the
-  button, the ring, the page, the window it folds into and the notice, and
+  button, the ring, the page, the window it folds into, the notice and the call row a
+  registration that is not up leaves (`-call-unregistered`, both themes), and
   `web/e2e/calling.spec.ts` pins every rule above. That mock CALLS out of the box, like the
-  backend it stands for, and its `{kind:"calling", enabled:false}` test hook is the only
-  way to the window that does not — a spec MUST reset it (`call_invite {reset:true}`), since
-  one mock process serves the whole run. A MID-CALL failure is reachable only through that
+  backend it stands for — `registered`, with a 200 — and its `{kind:"calling",
+  enabled:false}` test hook is the only way to the window that does not, as
+  `{kind:"calling", registration:"<word>"}` is the only way to the other five states (an
+  unknown word is a 400; `refused` stays ready, as the backend's does) — a spec MUST reset
+  both (`call_invite {reset:true}`), since one mock process serves the whole run. Its
+  `call_prepare` refuses in the backend's own sentence on the placing and the joining path
+  whenever it is not ready, and deliberately NOT on the answering one, which the backend does
+  not gate on readiness either: a ringing call arrived on a socket that was up. In the window
+  that does not call at all it refuses on EVERY path in the read-only dispatch gate's words,
+  because a read-only backend never reaches the method — the not-connected sentence there
+  would promise calls that come back on their own in a window that never takes them (both
+  sentences are pinned against the backend by `call_prepare_refuses_in_one_sentence_on_one_predicate`).
+  A MID-CALL failure is reachable only through that
   mock's own `call_media` test hooks, because the page's simulated media never refuses anything
   and the service that does is a real tenant. There are FOUR of them, and each stands for one
   ending a capture really has: `{refuse:true}` refuses the NEXT offer outright (armed — a spec
@@ -11983,6 +12117,25 @@ and `the_store_opens_before_sign_in_and_a_broken_sign_in_is_not_fatal` pins it.
   followed on the next attempt with no restart of the backend either. Before that, the
   address was frozen at exec and a container restart cost every backend a restart of its own
   (§ The Intune container is a LIBRARY).
+  **CALLING recovers on that same session, and that took a change.** Its start used to be
+  ONE attempt at boot, through a `session()` that rebuilt through the broker, so a sign-in
+  outage at boot — every boot of the embedded image, whose broker is still coming up — cost
+  calling for the life of the process while the live feed recovered beside it. The start is
+  now a loop that reads only the cached session (`Ctx::session_if_fresh`, which never
+  rebuilds) and, with none, waits on `Ctx::calling_wake` with NO timer at all — rung by
+  `adopt_session` once the cell is written, so the session the live feed's reconnect, a read
+  or a send adopts is what registers the machine for calls, and the broker is asked nothing
+  for it (§ Audio calls; `the_calling_start_loop_without_a_session_waits_for_a_wake_alone` and
+  `the_calling_start_loop_never_reaches_the_broker` pin both halves). While it waits, the call
+  row says so — "Calls connect on their own once sign-in works again." — rather than "not
+  registered yet". Two journal consequences: the calling socket's own failed attempt now
+  logs `[calling] no credentials …` where it logged `[realtime] no credentials …`, and BOTH
+  connections now log that line once per distinct failure rather than on every attempt
+  (the first line of an outage still names the broker), so from this build on a count of
+  the line counts outages, not attempts — the 775 measured below predate both changes, and
+  may hold both connections'. A credentials failure the NETWORK caused (the authz POST a
+  stale session is rebuilt with) is no longer that line at all: it is
+  `[<role>] could not get a session …`, and the call row says "Connecting for calls…".
 - **AND THE AUTOMATIC REPAIR SAYS WHEN IT STANDS DOWN, which it did not** (`say_standing_down`
   in src/auth.rs). `auth::rescue` is the thing that ends most sign-in outages with nobody being
   told there was one (§ Signing in again), and it had THREE silent early returns: a read-only

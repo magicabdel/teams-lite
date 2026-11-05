@@ -1,5 +1,6 @@
 import { expect } from "@playwright/test";
 import { CALL_END_UNREACHABLE } from "../src/lib/call";
+import { callFailureMessage } from "../src/lib/call-failure";
 import {
   calendarEvent,
   callFromMenu,
@@ -14,6 +15,7 @@ import {
   gotoApp,
   holdCallStart,
   joinMeetingFromMenu,
+  mockRpc,
   openCalendarTab,
   openCalendarView,
   openConversationMenu,
@@ -21,6 +23,7 @@ import {
   refuseNextCallMedia,
   rejectCallCapture,
   resetCall,
+  setCallRegistration,
   test,
 } from "./helpers";
 
@@ -62,8 +65,8 @@ test.describe("Audio calling", () => {
     await openConversationNamed(page, "Ava Thompson");
 
     // No step in between but the menu the header's controls became: the backend registered as
-    // a device the user's calls ring on at startup, the way every other Teams client they are
-    // signed in on does, so the row is live the moment the app is.
+    // a device the user's calls ring on as soon as it could, the way every other Teams client
+    // they are signed in on does, so the row is live the moment the app is.
     await openConversationMenu(page);
     const button = page.locator('[data-testid="call-button"]');
     await expect(button).toBeEnabled();
@@ -101,15 +104,17 @@ test.describe("Audio calling", () => {
     const button = page.locator('[data-testid="call-button"]');
     await expect(button).toBeVisible();
     await expect(button).toBeDisabled();
-    await expect(button).toHaveAttribute("aria-label", /cannot take calls/);
-    await expect(button).not.toHaveAttribute("aria-label", /Settings/);
+    // The WINDOW's sentence, spelled out: "cannot take calls" alone is also the tail of the
+    // sentence a directory with no calling service earns, and a window drawing that one
+    // instead would be a different defect this must not pass over.
+    const windowCannotCall = "This window cannot take calls, so it cannot place one.";
+    await expect(button).toHaveAttribute("aria-label", `Call Ava Thompson — ${windowCannotCall}`);
     // And the sentence is drawn as a ROW under the one it explains, which is what the menu
     // bought: it used to be a tooltip, and a disabled control fires no pointer events — so on
     // a phone the whole explanation was a sentence that did not exist.
     const reason = page.locator('[data-testid="conversation-call-reason"]');
     await expect(reason).toBeVisible();
-    await expect(reason).toContainText(/cannot take calls/);
-    await expect(reason).not.toContainText(/Settings/);
+    await expect(reason).toHaveText(windowCannotCall);
     await closeConversationMenu(page);
 
     // A meeting is the other half of the same sentence.
@@ -117,10 +122,131 @@ test.describe("Audio calling", () => {
     await openConversationMenu(page);
     const join = page.locator('[data-testid="meeting-join-here"]');
     await expect(join).toBeDisabled();
-    await expect(page.locator('[data-testid="conversation-call-reason"]')).toContainText(
-      /cannot take calls/,
-    );
+    const joinReason = page.locator('[data-testid="conversation-call-reason"]');
+    await expect(joinReason).toBeVisible();
+    await expect(joinReason).toHaveText("This window cannot take calls, so it cannot join a meeting.");
     await closeConversationMenu(page);
+  });
+
+  /** A backend that calls but whose REGISTRATION is not up says why, one sentence per state,
+   *  and says it in WORDS under the row — a phone has no hover, and a disabled control fires
+   *  no pointer events, so a sentence only in an attribute would be one that does not exist
+   *  there. The sentence for a state the machine mends on its own says that it does, rather
+   *  than "not registered yet" about a machine a sign-in away from calling again. */
+  test("says why the calling registration is not up, in words, per state", async ({ page }) => {
+    const states = [
+      ["waiting_for_sign_in", "Calls connect on their own once sign-in works again."],
+      [
+        "unavailable",
+        "This account's Teams directory names no calling service, so this machine cannot take calls.",
+      ],
+      ["connecting", "Connecting for calls…"],
+    ] as const;
+
+    await gotoApp(page);
+    for (const [state, sentence] of states) {
+      await setCallRegistration(page, state);
+
+      // The call row in a one-to-one.
+      await openConversationNamed(page, "Ava Thompson");
+      await openConversationMenu(page);
+      const button = page.locator('[data-testid="call-button"]');
+      await expect(button).toBeVisible();
+      await expect(button).toBeDisabled();
+      // What the row is FOR, and why it cannot, for a screen reader…
+      await expect(button).toHaveAttribute("aria-label", `Call Ava Thompson — ${sentence}`);
+      // …and the same words drawn in flow, at a size a phone can read, for everybody else.
+      const reason = page.locator('[data-testid="conversation-call-reason"]');
+      await expect(reason).toBeVisible();
+      await expect(reason).toHaveText(sentence);
+      await expect(reason).not.toContainText(/Settings/);
+      await closeConversationMenu(page);
+
+      // The Join row a meeting's own chat offers is the other half of the same sentence: one
+      // helper decides both, so the two controls never give two answers about one machine.
+      await openConversationNamed(page, "Design Sync");
+      await openConversationMenu(page);
+      const join = page.locator('[data-testid="meeting-join-here"]');
+      await expect(join).toBeVisible();
+      await expect(join).toBeDisabled();
+      await expect(join).toHaveAttribute("aria-label", `Join this meeting with audio — ${sentence}`);
+      const joinReason = page.locator('[data-testid="conversation-call-reason"]');
+      await expect(joinReason).toBeVisible();
+      await expect(joinReason).toHaveText(sentence);
+      await closeConversationMenu(page);
+    }
+
+    // A REFUSED registration is informational in this milestone — the connection proceeds as
+    // it always did — so it changes nothing about the row: live, with nothing said under it.
+    await setCallRegistration(page, "refused");
+    await openConversationNamed(page, "Ava Thompson");
+    await openConversationMenu(page);
+    await expect(page.locator('[data-testid="call-button"]')).toBeEnabled();
+    await expect(page.locator('[data-testid="conversation-call-reason"]')).toHaveCount(0);
+    await closeConversationMenu(page);
+
+    // And back to the default — registered — everything is exactly as it was: the row is live,
+    // its label is the bare action, and nothing explains a refusal that is not there.
+    await resetCall(page);
+    await openConversationMenu(page);
+    const button = page.locator('[data-testid="call-button"]');
+    await expect(button).toBeEnabled();
+    await expect(button).toHaveAttribute("aria-label", "Call Ava Thompson");
+    await expect(page.locator('[data-testid="conversation-call-reason"]')).toHaveCount(0);
+    await closeConversationMenu(page);
+  });
+
+  /** The mock refuses a START the way the backend does, which no disabled row can show: a page
+   *  never sends `call_prepare` while its row is disabled, so the refusal is met only when the
+   *  page is a beat behind the backend — and a mock that accepted there would let every spec
+   *  pass over a backend that refuses. So it is ASKED directly, in each state that decides it:
+   *  a registration that is down refuses both starts in the backend's own words (which the page
+   *  turns into its own sentence), an ANSWER is not a start and is not refused for it, and a
+   *  window that never calls refuses in its read-only gate's words rather than promising that
+   *  calls come back on their own. */
+  test("refuses to start a call in the backend's words while calling is not up", async ({ page }) => {
+    const notConnected =
+      "call_prepare: calling is not connected yet — this machine registers for calls on its own once it can; try again in a moment";
+    await gotoApp(page);
+    await openConversationNamed(page, "Ava Thompson");
+    const conversation = await page
+      .locator('[data-testid="composer-shell"]')
+      .getAttribute("data-conversation-id");
+    expect(conversation).toBeTruthy();
+    try {
+      // A registration that is down: both paths that START a call refuse, word for word.
+      await setCallRegistration(page, "connecting");
+      for (const params of [{ conversation }, { meeting_thread: "19:meeting_e2e@thread.v2" }]) {
+        const refused = await mockRpc("call_prepare", params);
+        expect(refused.result).toBeUndefined();
+        expect(refused.error).toBe(notConnected);
+        expect(callFailureMessage(new Error(refused.error))).toBe(
+          "Calls are not connected on this machine yet. They connect on their own — try again in a moment.",
+        );
+      }
+
+      // An ANSWER is not a start: a call already ringing arrived on a socket that was up, and
+      // the backend answers it whatever the registration says a moment later.
+      const call_id = await emitCallInvite(page, conversation!);
+      await setCallRegistration(page, "waiting_for_sign_in");
+      const answered = await mockRpc("call_prepare", { call_id });
+      expect(answered.error).toBeUndefined();
+      expect(answered.result).toMatchObject({ call_id });
+      await resetCall(page);
+
+      // A window that does not call at all is a read-only backend, which refuses at its gate.
+      await disableCalling(page);
+      const gated = await mockRpc("call_prepare", { conversation });
+      expect(gated.error).toContain("this server runs read-only (TEAMS_LITE_READ_ONLY=1)");
+      expect(gated.error).not.toContain("calling is not connected yet");
+      expect(callFailureMessage(new Error(gated.error))).toBe(
+        "This backend runs read-only, so no call can leave it.",
+      );
+    } finally {
+      // One mock process serves the whole run: neither a state nor a ringing call may outlive
+      // this test.
+      await resetCall(page);
+    }
   });
 
   /** A group chat is CALLED, and the label says what that reaches: every member at once,
@@ -478,13 +604,30 @@ test.describe("Joining a meeting", () => {
     const join = details.locator('[data-testid="meeting-join-here"]');
     await expect(join).toBeVisible();
     await expect(join).toBeEnabled();
-    await expect(join).toHaveAttribute("aria-label", /Join this meeting/);
+    await expect(join).toHaveAttribute("aria-label", "Join this meeting with audio");
+    // A Join that can act explains nothing.
+    const reason = details.locator('[data-testid="meeting-join-reason"]');
+    await expect(reason).toHaveCount(0);
 
-    // And in a window whose backend does not take calls at all — a read-only one, or the
-    // second install — it stays, disabled, saying that rather than naming a switch.
+    // A machine whose calling registration is waiting for sign-in keeps the button, disabled,
+    // and says why in WORDS under the row — the calendar is read from a phone too, where a
+    // tooltip on a control that fires no pointer events is a sentence nobody can reach — and
+    // in the label, after what the control is for.
+    const signIn = "Calls connect on their own once sign-in works again.";
+    await setCallRegistration(page, "waiting_for_sign_in");
+    await expect(join).toBeDisabled();
+    await expect(join).toHaveAttribute("aria-label", `Join this meeting with audio — ${signIn}`);
+    await expect(reason).toBeVisible();
+    await expect(reason).toHaveText(signIn);
+
+    // And in a window whose backend does not take calls at all — a read-only one — it stays,
+    // disabled, saying that rather than naming a switch.
+    const windowCannotJoin = "This window cannot take calls, so it cannot join a meeting.";
     await disableCalling(page);
     await expect(join).toBeDisabled();
-    await expect(join).toHaveAttribute("aria-label", /cannot take calls/);
+    await expect(join).toHaveAttribute("aria-label", `Join this meeting with audio — ${windowCannotJoin}`);
+    await expect(reason).toBeVisible();
+    await expect(reason).toHaveText(windowCannotJoin);
   });
 
   test("joins a meeting: the lobby, then the meeting, then who is in it", async ({ page }) => {

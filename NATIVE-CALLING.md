@@ -127,6 +127,102 @@ connection. The web client adds **no worker suffix**.
 `/NGCallManagerWin/auth` only for platforms 51 and 49, `/NGCallManagerOsx/auth` for
 platform 50, and `/auth` everywhere else — the web included.
 
+### 2.1a What teams-lite reads off its own registration and socket, and what is NOT yet measured
+
+§ 2.1 is the client's shape. This is what this app's own trouter connection (`src/trouter.rs`)
+now READS and LOGS on every attempt — milestone M1 of `docs/calling-roadmap/plane-reliability.md`.
+None of it had been read before, and each number decides a later change: extending a registration
+on a live socket, detecting a half-open socket, and what to do with a refused registration.
+**Nothing here changes the wire**: the bodies, the headers and their order are the ones § 2.1 and
+§ 8 measured. Both connections run the same code, and their lines differ only by label —
+`[realtime]` for messaging (the spelling every older line used) and `[calling]` for calling.
+
+- **The registrar's HTTP status.** `register()` returns it and the connection logs one line per
+  registration: `[calling] registered: <code> <reason> (ttl 3600 s)` (messaging's carries
+  `ttl 86400 s`). It travels on as `CallingChannel::registrar_status`, into `call_status` and
+  `call_state` as `registration: {state: "registered" | "refused", registrar_status}`. **A non-2xx
+  proceeds exactly as a 2xx does** — the channel is published and `Status::Connected` is sent —
+  because acting on a refusal before one has been seen could block calls that work today. The
+  client's own registrar client re-sends a 401 with a fresh token and throws on a 5xx
+  (plane-reliability.md § 4.1, from `cmd-trouter.js`); this app does neither yet.
+- **The allocate answer's `ttl`** (`connection_ttl_secs`): a number or a numeric string, exactly as
+  the client's `populateConnectionStateFields` reads it (`typeof e.ttl=="string"?parseInt(e.ttl,10):e.ttl`).
+  Anything else is UNKNOWN, never zero.
+- **The handshake's heartbeat and close timeouts** (`parse_handshake`). socket.io v1 answers
+  `sid:heartbeat:close:transports`, and only `split(':').next()` used to be kept. The session id is
+  still the one required field; the two timeouts are read when they are numbers and are measured,
+  not acted on, so a body that stops stating them still connects.
+- **A frame tally per connection** (`FrameTally`): text frames by their socket.io type — `1`
+  connect, `2` heartbeat, `3` message, `6` ack, and other. The read loop acts on `1` and `3` only
+  and sends `5:{n}+::{"name":"ping"}` every 30 s without ever reading an answer, so the `2` and `6`
+  counts are what will say whether the service answers those pings at all.
+- **One line when a connection whose WEBSOCKET OPENED ends** (`connection_ended_line`):
+
+  ```
+  [calling] connection ended after <s>s (allocate ttl <t>s; heartbeat <h>s close <c>s; frames 1:<a> 2:<b> 3:<c> 6:<d> other:<e>)
+  ```
+
+  followed by ` — <error>` when an error ended it. An unknown number is written `?`: "the service
+  stated no ttl" and "it stated zero" are different answers.
+- **A failure BEFORE the websocket opened** — the credentials, the allocate, the handshake, the
+  upgrade — is one line when it differs from the previous attempt's, and silent while it repeats:
+  `[calling] could not connect, retrying in <n>s — <reason> (the same failure again is not logged)`.
+  A connection that opens clears that memory, so the first failure of the next outage is news
+  again. Every request error is stripped of its URL first (`reqwest::Error::without_url`): the
+  handshake's query carries the allocation's `connectparams`, a signature among them, and those
+  change per allocation — so the URL would both put a credential in the journal and make every
+  failure look new. The credentials have two lines of their own, through the same filter, and
+  which one is decided by the error itself (`failed_on_the_network`): a sign-in failure names the
+  broker — `[calling] no credentials, retrying in <n>s — is the identity broker up? (…)` (the
+  calling connection's said `[realtime]` before this build) — and one whose error chain carries a
+  `reqwest::Error` is the provider's OWN request getting no answer, the authz POST a stale session
+  is rebuilt with: `[calling] could not get a session, retrying in <n>s — <reason>`, which is the
+  network and is NOT counted as sign-in. Both used to be the first line, on every attempt.
+- **Every step is BOUNDED, at the client's own numbers** (`timeoutOptions` in `cmd-trouter.js`:
+  `fetchTimeoutMs:1e4`, `connectionTimeoutMs:3e4`). `CONNECT_TIMEOUT` is 10 s for TCP and TLS
+  under every request; `FETCH_TIMEOUT` is 10 s on each of the allocate POST, the handshake GET and
+  the registrar POST; `WEBSOCKET_TIMEOUT` is 30 s around the upgrade. Each request carries its own
+  bound rather than the client carrying a total, which would also cut the websocket's long life.
+  Nothing bounded an attempt before, so one hung allocate stopped the reconnect loop — the live
+  feed's or calling's — for the life of the process, with nothing in the journal. The client's
+  tighter in-call set (`incallTimeoutOptions`: `connectionTimeoutMs:1e4`, `fetchTimeoutMs:5e3`) is
+  NOT adopted. `every_step_of_an_attempt_is_bounded_at_the_clients_own_numbers` pins the values
+  and that each step carries one.
+- **The backoff RESETS** (`next_backoff(prev, lived)`): 1, 2, 4, 8, 16, then 30 s, holding there
+  (the client's `maxBackoffMs` outside its slow tier is `3e4`) — and back to 1 s after a connection
+  whose websocket stayed open 60 s or more. It used to double for ever and never reset, so a socket
+  that dropped after a week reconnected up to 30 s late: for the calling plane, 30 s in which an
+  incoming call rings nowhere. `Status::Disconnected` carries the sleep really taken and
+  `no_credentials` — true for a credentials failure that is SIGN-IN, false for the network —
+  which is what lets the calling plane say "waiting for sign-in" rather than "connecting". All of
+  it is decided by one pure function over the attempt's own report and the clock
+  (`after_attempt`), so the reset, the filter and the reason are tested as rules
+  (`after_an_attempt_the_sleep_the_line_and_the_reason_are_decided_together`,
+  `the_backoff_resets_after_a_connection_that_lived`,
+  `a_disconnect_says_whether_the_attempt_had_credentials`), and a paused clock holds the loop
+  to sleeping exactly what it announces (`run_sleeps_the_backoff_it_announces`).
+- **What the backend adds about the START** (`src/bin/server.rs`, AGENTS.md § Audio calls):
+  `[calling] registration: <word>` once per change of state;
+  `[calling] waiting for sign-in before registering for calls — this starts on its own once a session is adopted`
+  once per waiting period; `[calling] could not start: … — trying again with the next session`
+  when the reason changes (and no timer: the start's one failure is a pure read of the session,
+  so only the next session can change it); and `[calling] disconnected, retrying in <n>s` only when a socket that
+  was UP drops — a failed attempt is already in the connection's own line.
+
+**NOT YET MEASURED against the tenant, and the next thing to write down here.** The registrar's
+real status (whether it ever answers anything but a 2xx), the allocate `ttl`, the handshake's
+heartbeat and close values, how long calling sockets really live, and what frames they carry. The
+tests pin the parsers and the line formats (`the_allocate_ttl_is_read_as_a_number_or_a_numeric_string`,
+`the_handshake_keeps_its_heartbeat_and_close_timeouts`,
+`a_connection_that_ended_says_how_long_it_lived_and_what_it_carried`,
+`a_repeated_failure_is_logged_once`), never a value: no build reading them has run against the
+tenant. The first re-staged run puts them in the journal —
+`journalctl --user -u teams-lite-backend.service | grep -E '\[calling\] (registered|connection ended|registration)'`
+for the staged backend; a launcher-run backend (the released build, `teams`) writes the same
+lines to its log (`backendLogPath`: `/tmp/teams-lite-server.log` on the default port,
+`/tmp/teams-lite-server-<port>.log` on any other), and the image to `docker logs` — and what they show belongs in this section before anything acts on
+them. Do not write a number here that nothing measured.
+
 ### 2.2 The client publishes its own callback URLs
 
 Every action link the service may later call is a URL the client builds on its trouter
@@ -433,14 +529,16 @@ WebRTC or the microphone.
 ## 6. The surface, and what each part is for
 
 Six RPCs, and the split between them IS the consent design (see § 7). There is no RPC
-that turns calling on: the backend registers as a device the user's calls ring on at
-startup, the way every Teams client they are signed in on does (`calling_available` in
-`src/bin/server.rs`), so no client can ask for the registration and none can take it
+that turns calling on: the backend registers as a device the user's calls ring on as soon
+as it can sign in — and again by itself after a sign-in outage, waking on the session the
+rest of the app adopts rather than polling the broker (`run_calling_start`, AGENTS.md
+§ Audio calls) — the way every Teams client they are signed in on does (`calling_available`
+in `src/bin/server.rs`), so no client can ask for the registration and none can take it
 away. A read-only backend is the only one that never registers.
 
 | Method | Gate | What it does |
 | --- | --- | --- |
-| `call_status` | open | The state the UI draws. No SDP, no links, no credentials. |
+| `call_status` | open | The state the UI draws — `enabled`, `ready`, `call`, `registration` (`{state, registrar_status}`, null where the backend never calls) and `backend_started_ms`. No SDP, no links, no credentials. |
 | `call_prepare` | `MACHINE_METHODS` | Reserves the one call, and returns the ICE servers (plus the offer, when answering). |
 | `call_place` | `OUTWARD_METHODS` | The § 2.3 POST, carrying our offer. Rings a person. |
 | `call_join` | `OUTWARD_METHODS` | The same POST for a MEETING: no `to`, plus `meetingInfo`. Rings nobody. |
@@ -461,7 +559,13 @@ Two things the backend does on its own, and neither is a decision about a call:
   plausible server timeout: too often costs one request, too late drops the call.
 - **`ready` needs the registration AND a live socket.** They are tracked apart because a
   reconnect has to tell a surl that came back UNCHANGED from one that MOVED — a moved surl
-  invalidates a live call's links, and only that ends the call.
+  invalidates a live call's links, and only that ends the call. It is ONE predicate
+  (`CallingPlane::ready_channel`), and both `call_prepare` paths — placing and joining —
+  refuse on it with one sentence; the placing path used to check the address alone. Beside
+  it, `registration.state` says where the registration stands, and so why `ready` is false:
+  `starting`, `waiting_for_sign_in`, `unavailable` (the directory names no calling service)
+  or `connecting`; `registered` and `refused` carry the registrar's status, and `refused` is
+  informational only, so it normally comes with `ready: true` (§ 2.1a).
 
 The browser half is two files: `web/src/lib/call.ts` (pure state model) and
 `call-media.ts` (the microphone, one `RTCPeerConnection`, the remote audio element). The UI
@@ -500,8 +604,9 @@ that hold `send` hold here, and one is stricter:
 - **`call` / `answer` / `hangup` are `OUTWARD_METHODS` entries**: the write token,
   refused on a read-only backend, and named in the automation hook.
 - **Registering the calling endpoint changes where Teams routes the user's real calls**,
-  and the app does it at startup, because that is what a Teams client is: their calls are
-  offered here as well as on their other clients. It reaches nobody by itself — every
+  and the app does it as soon as it can sign in, because that is what a Teams client is:
+  their calls are offered here as well as on their other clients. It reaches nobody by
+  itself — every
   action that does is gated one by one above — and it is taken back as the app shuts down.
   A read-only backend is the only one that never registers; a second install on the same
   machine DOES, as a device of its own, so every window the user opens can call.
@@ -936,8 +1041,10 @@ The rest of this section is unchanged, and is what a 1:1 answers:
 
 - **`/v3/c` against the `/v4/a` allocate flow.** `trouter::allocate_url_for` keeps the
   directory's regional host and speaks the allocate protocol this client already had. If
-  the calling trouter refuses it, the journal says so in one line
-  (`[calling] disconnected`), and the fix is that function alone.
+  the calling trouter refuses it, the journal says so in one line —
+  `[calling] could not connect, retrying in <n>s — <reason>`, once per distinct failure
+  (§ 2.1a); `[calling] disconnected` is now kept for a socket that was UP — and the fix is
+  that function alone.
 - **The path the initial invite is pushed to**, and the field names the notification
   really carries on this tenant. `calling::incoming_call_from_frame` reads several
   spellings and every `links` object at any depth for exactly this reason, and

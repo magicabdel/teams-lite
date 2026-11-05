@@ -55,9 +55,10 @@ export function JoinWithLinkDialog() {
   // Said only once there is something to be wrong about: a sentence under an empty field is
   // a complaint about a form the reader has not filled in yet.
   const refusal = trimmed.length > 0 && !joinable ? NOT_A_MEETING_LINK : "";
-  // Why a joinable link still cannot be joined HERE — a read-only backend, or a second
-  // install that is not the one the user launched. The button states it too; this states it
-  // where the reader is looking.
+  // Why a joinable link still cannot be joined from this machine right now — whatever
+  // `meetingUnavailableReason` says: a window that does not call at all, a calling
+  // registration that is not up yet (and why), or a call already live. The Join button is
+  // drawn only when it could act, so this is where the reader is told why it is not there.
   const unavailable = joinable ? meetingUnavailableReason(status) : "";
 
   return (

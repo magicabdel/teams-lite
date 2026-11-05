@@ -6,7 +6,7 @@ import { isLive, meetingAddressOfThread } from "~/lib/call";
 import { incomingCallTitle, type Channel, type Conversation, type IncomingCall } from "~/lib/protocol";
 import { useAppState, useController } from "./controller-context";
 import { CallParticipants } from "./call-event-line";
-import { MeetingJoinButton } from "./meeting-join-button";
+import { MeetingJoinButton, MeetingJoinReason } from "./meeting-join-button";
 import { Button } from "./ui/button";
 
 /**
@@ -140,6 +140,9 @@ function IncomingCallCard(props: { call: IncomingCall }) {
           Open chat
         </Button>
       </div>
+      {/* Why that Join cannot act yet, in words: a disabled button fires no pointer events,
+          and this card is met on a phone as often as anywhere. */}
+      {meeting && <MeetingJoinReason meeting={meeting} />}
     </motion.div>
   );
 }

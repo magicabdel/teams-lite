@@ -21,6 +21,7 @@ import {
   meetingUnavailableReason,
   type ActiveCall,
   type CallPhase,
+  type CallRegistrationState,
   type CallStatus,
 } from "./call";
 import type { Conversation } from "./protocol";
@@ -55,14 +56,149 @@ function status(overrides: Partial<CallStatus> = {}): CallStatus {
 }
 
 describe("the unknown state", () => {
-  /** The backend defaults to off, so the client's own default has to say off. A
-   *  hopeful `enabled` would tell the user their calls ring here while nothing is
-   *  registered — the same rule the agent's mode switch follows. */
+  /** Before the backend has spoken, nothing is known to be registered, so the client's own
+   *  default says so. A hopeful `enabled` would tell the user their calls ring here while
+   *  nothing is registered — the same rule the agent's mode switch follows. */
   it("claims nothing before the backend answers", () => {
     expect(UNKNOWN_CALL_STATUS.enabled).toBe(false);
     expect(UNKNOWN_CALL_STATUS.ready).toBe(false);
     expect(UNKNOWN_CALL_STATUS.call).toBeNull();
     expect(canPlaceCall(UNKNOWN_CALL_STATUS)).toBe(false);
+  });
+});
+
+describe("why the registration is not up", () => {
+  /** One sentence per state, each saying what is really going on — and, for the two the
+   *  machine mends on its own, that it does. `ready` is what decides whether a call can
+   *  start; the registration only decides which sentence explains a `false`. */
+  const notReady = (state: CallRegistrationState, registrar_status: number | null = null) =>
+    status({ ready: false, registration: { state, registrar_status } });
+
+  it("says a sign-in outage mends itself", () => {
+    for (const reason of [callUnavailableReason, meetingUnavailableReason]) {
+      expect(reason(notReady("waiting_for_sign_in"))).toBe(
+        "Calls connect on their own once sign-in works again.",
+      );
+    }
+  });
+
+  it("says an account with no calling service cannot take calls at all", () => {
+    for (const reason of [callUnavailableReason, meetingUnavailableReason]) {
+      expect(reason(notReady("unavailable"))).toBe(
+        "This account's Teams directory names no calling service, so this machine cannot take calls.",
+      );
+    }
+  });
+
+  /** "starting" and "connecting" are one fact to the user: a connection on its way up. The
+   *  sentence promises no number of seconds, because a network can be down for hours. */
+  it("says a connection on its way up, and promises no time", () => {
+    for (const reason of [callUnavailableReason, meetingUnavailableReason]) {
+      for (const state of ["starting", "connecting"] as const) {
+        const sentence = reason(notReady(state));
+        expect(sentence).toBe("Connecting for calls…");
+        // The ellipsis is the single character, not three full stops.
+        expect(sentence.endsWith("…")).toBe(true);
+        expect(sentence).not.toMatch(/second|minute|\d/i);
+      }
+    }
+  });
+
+  /** A registration that is up while `ready` is false is a connection the backend has not
+   *  finished reporting — today's sentence. `refused` changes nothing yet (it comes with
+   *  `ready: true` in the ordinary case), so it reads the same. */
+  it("keeps today's sentence for a registration that is up but not ready", () => {
+    for (const reason of [callUnavailableReason, meetingUnavailableReason]) {
+      expect(reason(notReady("registered", 200))).toBe(
+        "This machine is not registered for calls yet.",
+      );
+      expect(reason(notReady("refused", 403))).toBe(
+        "This machine is not registered for calls yet.",
+      );
+    }
+  });
+
+  /** A backend too old to send the field, and one that sends `null`, are both today's
+   *  backend: the sentence it always had. */
+  it("keeps today's sentence when the backend says nothing about it", () => {
+    for (const reason of [callUnavailableReason, meetingUnavailableReason]) {
+      expect(reason(status({ ready: false }))).toBe("This machine is not registered for calls yet.");
+      expect(reason(status({ ready: false, registration: null }))).toBe(
+        "This machine is not registered for calls yet.",
+      );
+    }
+  });
+
+  /** A word a NEWER backend invents must not throw and must not be guessed at: it reads as
+   *  the narrowest true thing, which is that this machine is not registered yet. So must a
+   *  field whose shape is not the one promised at all. */
+  it("reads a word it does not know as not registered yet, and never throws", () => {
+    const strange = [
+      { state: "rebooting", registrar_status: null },
+      { state: "", registrar_status: null },
+      { state: 7, registrar_status: null },
+      "registered",
+      42,
+      {},
+    ];
+    for (const reason of [callUnavailableReason, meetingUnavailableReason]) {
+      for (const registration of strange) {
+        const odd = { ready: false, registration } as unknown as Partial<CallStatus>;
+        expect(reason(status(odd))).toBe("This machine is not registered for calls yet.");
+      }
+    }
+  });
+
+  /** A read-only window has no registration to explain, so its own sentence wins whatever
+   *  the registration says; and a ready machine in a call talks about the call, not the
+   *  registration. The order is what the user can act on. */
+  it("puts the window first and the live call last", () => {
+    const off = {
+      enabled: false,
+      ready: false,
+      registration: { state: "waiting_for_sign_in", registrar_status: null },
+    } as const;
+    expect(callUnavailableReason(status(off))).toBe(
+      "This window cannot take calls, so it cannot place one.",
+    );
+    expect(meetingUnavailableReason(status(off))).toBe(
+      "This window cannot take calls, so it cannot join a meeting.",
+    );
+    // Not ready AND in a call is a real state — a dropped calling socket does not end a live
+    // call — and the registration is said first: it is the one that has to come back before
+    // a second call could start at all.
+    expect(
+      callUnavailableReason(
+        status({ ...notReady("connecting"), call: call({ phase: "connected" }) }),
+      ),
+    ).toBe("Connecting for calls…");
+    // Ready, registered, and in a call: one call at a time, whatever the registration says.
+    const busy = status({
+      registration: { state: "registered", registrar_status: 200 },
+      call: call({ phase: "connected" }),
+    });
+    expect(callUnavailableReason(busy)).toBe("This app holds one call at a time.");
+    expect(meetingUnavailableReason(busy)).toBe("This app holds one call at a time.");
+    // Ready and REFUSED changes nothing about a call that can be placed: it is informational.
+    const refused = status({ registration: { state: "refused", registrar_status: 403 } });
+    expect(callUnavailableReason(refused)).toBe("");
+    expect(canPlaceCall(refused)).toBe(true);
+  });
+
+  /** No state sends the user to a switch, because there is none. */
+  it("never names Settings", () => {
+    const states: CallRegistrationState[] = [
+      "starting",
+      "waiting_for_sign_in",
+      "unavailable",
+      "connecting",
+      "registered",
+      "refused",
+    ];
+    for (const state of states) {
+      expect(callUnavailableReason(notReady(state))).not.toMatch(/Settings|turn it on/i);
+      expect(meetingUnavailableReason(notReady(state))).not.toMatch(/Settings|turn it on/i);
+    }
   });
 });
 

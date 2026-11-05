@@ -45,6 +45,17 @@ export function callFailureMessage(error: unknown): string {
   if (raw.startsWith("timeout:")) {
     return "The backend did not answer. Try again.";
   }
+  // The CALLING registration, which is a different thing from the socket above: the page
+  // reached its backend, and that backend's own connection to Teams' calling service is not
+  // up yet (`call_prepare`'s refusal, in src/bin/server.rs). It is matched on the phrase both
+  // of the backend's wordings share, so a page talking to an OLDER backend — whose sentence
+  // went on to send the user to a Settings switch that no longer exists — is told the same
+  // true thing, and the old advice never reaches a screen. It cannot catch the socket's own
+  // `not connected`, which is the whole message, says nothing about calling, and is mapped
+  // above. It names no time: the registration comes back when sign-in or the network does.
+  if (/calling is not connected yet/i.test(raw)) {
+    return "Calls are not connected on this machine yet. They connect on their own — try again in a moment.";
+  }
   // The write lock, after a backend restart minted a new token. The client already re-read
   // the token and retried once (`retryWithAFreshToken` in lib/ws-client.ts), so reaching
   // this means the fresh one was refused too.
@@ -159,10 +170,10 @@ function rawMessage(error: unknown): string {
 /**
  * Drop the RPC's own name off the front of a backend refusal.
  *
- * The backend opens each one with the method it refused (`call_prepare: calling is not
- * connected yet — turn it on in Settings`), which is right for its reader and wrong for
- * this one: `call_offer_media` is not something the user can act on, and it reads as a
- * fault code in front of a plain sentence. The rest of the sentence is kept word for word.
+ * The backend opens each one with the method it refused (`call_prepare: that call is not
+ * ringing`), which is right for its reader and wrong for this one: `call_offer_media` is not
+ * something the user can act on, and it reads as a fault code in front of a plain sentence.
+ * The rest of the sentence is kept word for word.
  *
  * The name must be followed by whitespace or be the whole of it, which is what leaves a
  * URL's `https://` and a time's `10:30` alone — and a refusal that is NOTHING but the
