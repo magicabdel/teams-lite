@@ -169,6 +169,10 @@ export type CallMedia = {
   /** Stop sending audio, or start again. The backend publishes the same state so the
    *  other side sees the crossed-out microphone. */
   setMuted(muted: boolean): void;
+  /** Whether the microphone is muted right now, as the TRACK says — which is what the window
+   *  holding the call draws its own button from (`callShowsMuted` in lib/call.ts). It starts
+   *  false: a call opens with the microphone live. */
+  readonly muted: boolean;
   /** Release the microphone and tear everything down. Safe to call twice. */
   stop(): void;
   /** Whether the peer connection is carrying media right now. */
@@ -1087,6 +1091,12 @@ function liveCallMedia(
     setMuted(muted: boolean): void {
       for (const track of stream.getAudioTracks()) track.enabled = !muted;
     },
+    get muted() {
+      // Read off the tracks themselves rather than remembered: the track is what the far side
+      // hears, and a capture with no audio track at all has nothing live to report.
+      const tracks = stream.getAudioTracks();
+      return tracks.length > 0 && tracks.every((track) => !track.enabled);
+    },
     async startSending(kind: SendKind): Promise<string> {
       if (stopped) throw new CaptureUnavailableError(kind, new Error("the call is over"));
       await senders.start(pc, kind);
@@ -1286,9 +1296,16 @@ export function simulatedCallMedia(options: { answering: boolean; remoteOffer?: 
       media.onRemoteVideoChange?.(media.remoteVideo);
       return SIMULATED_SDP;
     },
-    // Muting is the one thing that needs no stand-in: there is no track to disable, and
-    // the state the UI draws comes from the backend either way.
-    setMuted(): void {},
+    // The silent voice above IS a track, so muting disables it exactly as the live path
+    // disables the microphone's — which is what lets a spec read, off the window that holds the
+    // call, whether a press in ANOTHER window really closed it.
+    setMuted(muted: boolean): void {
+      for (const track of microphone.getAudioTracks()) track.enabled = !muted;
+    },
+    get muted() {
+      const tracks = microphone.getAudioTracks();
+      return tracks.length > 0 && tracks.every((track) => !track.enabled);
+    },
     // Sending is reproduced too, and it opens NOTHING: the preview is a canvas, so a capture
     // asks no permission and no camera light comes on. That is what lets the buttons, the
     // preview and the offer be reviewed without a device — and a mock that called

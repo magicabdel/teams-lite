@@ -4664,6 +4664,10 @@ type MockCall = {
   in_lobby: boolean;
   waiting_in_lobby: number;
   muted: boolean;
+  /** How many mute presses this call has accepted — the backend's `mute_seq`, moved on EVERY
+   *  accepted press, a repeat of the state included. A mock that left it out would let a page
+   *  that read a frame from before its own press as an answer to it pass every spec. */
+  mute_seq: number;
   connected_at_ms: number | null;
   end_reason: string | null;
   /** What the others publish, and the source ids a subscription is addressed by — the
@@ -4885,6 +4889,28 @@ const MOCK_MICROPHONE_REFUSAL_LINE = "a=x-teams-lite-mock:microphone-refused";
  *  what a page meets when its read is lost, and which must never take a live call's
  *  microphone or its stage away. */
 let mockRefusesNextStatus = false;
+
+/** Armed by `{kind:"call_mute", fail:true}`, `{kind:"call_mute", hold_ms}` and
+ *  `{kind:"call_mute", lose_answer:true}`: what the NEXT `call_mute` does. `fail` refuses it
+ *  before anything moves — a press that never reached the backend, which is what a dropped
+ *  socket costs a real page. `hold_ms` holds it that long before it is recorded, which is the
+ *  window in which a frame from BEFORE the press can still arrive. `lose_answer` records it and
+ *  tells every page, then drops every socket before answering — a press the backend made while
+ *  its answer was lost. Each fires once; `call_invite {reset:true}` clears them. */
+let mockMuteFailsNext = false;
+let mockMuteHoldMs = 0;
+let mockMuteLosesAnswer = false;
+
+/** Presses are recorded ONE AT A TIME, in the order they arrive — the backend's own
+ *  `record_mute` runs under a lock at the head of each request — so a held press holds the ones
+ *  behind it. Without it a held Mute would be overtaken by the Unmute pressed after it, and the
+ *  mock would decide the opposite of what the backend does. */
+let mockMuteQueue: Promise<void> = Promise.resolve();
+
+/** Every `call_mute` this mock received, in order, and whether it was refused on purpose — read
+ *  back by `{kind:"call_record"}`. A press sent AGAIN after a reconnect is only provable by
+ *  counting: the state it leaves is the same state the first press would have left. */
+let mockMutes: { muted: boolean; refused: boolean }[] = [];
 
 /** Every `call_hangup` this mock carried out, with what the page meant and whether the caller
  *  was DECLINED — read back by `{kind:"call_record"}`. Counted rather than read off the
@@ -5113,6 +5139,7 @@ function injectMockCallInvite(conversation: string): MockCall | null {
     in_lobby: false,
     waiting_in_lobby: 0,
     muted: false,
+    mute_seq: 0,
     connected_at_ms: null,
     end_reason: null,
     publishing: [],
@@ -10419,6 +10446,7 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
           in_lobby: false,
           waiting_in_lobby: 0,
           muted: false,
+          mute_seq: 0,
           connected_at_ms: null,
           end_reason: null,
           publishing: [],
@@ -10465,6 +10493,7 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
         in_lobby: false,
         waiting_in_lobby: 0,
         muted: false,
+        mute_seq: 0,
         connected_at_ms: null,
         end_reason: null,
         publishing: [],
@@ -10748,10 +10777,44 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
       const callId = requireString(params, "call_id");
       const o = asObject(params);
       if (typeof o.muted !== "boolean") throw new Error("`muted` must be true or false");
-      if (!mockCall || mockCall.id !== callId) throw new Error("call_mute: no such call");
-      mockCall = { ...mockCall, muted: o.muted };
-      broadcastMockCall();
-      return { call_id: callId, muted: o.muted, told_service: true };
+      const muted = o.muted;
+      const ifSeq = o.if_seq ?? null;
+      if (ifSeq !== null && (typeof ifSeq !== "number" || !Number.isInteger(ifSeq) || ifSeq < 0)) {
+        throw new Error("`if_seq` must be a whole number");
+      }
+      if (mockMuteFailsNext) {
+        mockMuteFailsNext = false;
+        mockMutes.push({ muted, refused: true });
+        throw new Error("call_mute: the request did not reach the backend (simulated)");
+      }
+      mockMutes.push({ muted, refused: false });
+      const hold = mockMuteHoldMs;
+      mockMuteHoldMs = 0;
+      const losesAnswer = mockMuteLosesAnswer;
+      mockMuteLosesAnswer = false;
+      const turn = mockMuteQueue.then(async () => {
+        if (hold > 0) await new Promise((resolve) => setTimeout(resolve, hold));
+        if (!mockCall || mockCall.id !== callId) throw new Error("call_mute: no such call");
+        // A press sent AGAIN after a reconnect is refused once another was recorded since — the
+        // backend's own `if_seq`, word for word.
+        if (ifSeq !== null && mockCall.mute_seq > ifSeq) {
+          throw new Error(
+            `call_mute: another press was recorded since this one (mute_seq ${mockCall.mute_seq} > ${ifSeq})`,
+          );
+        }
+        // The state and its sequence move together and every page is told — the backend's own
+        // `record_mute`, so a press in one window reaches the microphone another one holds.
+        mockCall = { ...mockCall, muted, mute_seq: mockCall.mute_seq + 1 };
+        broadcastMockCall();
+      });
+      mockMuteQueue = turn.catch(() => {});
+      await turn;
+      const recorded = { call_id: callId, muted, mute_seq: mockCall!.mute_seq, told_service: true };
+      if (losesAnswer) {
+        // The frame above has gone out; the answer never will.
+        for (const ws of sockets) ws.close();
+      }
+      return recorded;
     }
 
     case "get_settings":
@@ -13657,6 +13720,7 @@ async function handleTestHook(req: Request, url: URL): Promise<Response | null> 
         {
           ok: true,
           hangups: mockHangups,
+          mutes: mockMutes,
           status_refusals: mockStatusRefusals,
           status_reads: mockStatusReads,
         },
@@ -13675,6 +13739,36 @@ async function handleTestHook(req: Request, url: URL): Promise<Response | null> 
       mockBackendStartedMs += 1;
       for (const ws of sockets) ws.close();
       return Response.json({ ok: true, lose: true }, { status: 200 });
+    }
+    // What the NEXT `call_mute` does: fail before anything moves, or wait `hold_ms` before it
+    // is recorded. Armed; `call_invite {reset:true}` clears both.
+    // `offline:true, muted` is a press another window makes while every page here is
+    // disconnected: the state moves, nobody is told, and every socket drops — so the one way a
+    // page learns of it is the status read it makes when it reconnects.
+    if (body.kind === "call_mute" && body.offline === true) {
+      if (!mockCall) return Response.json({ ok: false, error: "no call" }, { status: 409 });
+      const muted = body.muted === true;
+      mockMutes.push({ muted, refused: false });
+      mockCall = { ...mockCall, muted, mute_seq: mockCall.mute_seq + 1 };
+      for (const ws of sockets) ws.close();
+      return Response.json({ ok: true, muted, mute_seq: mockCall.mute_seq }, { status: 200 });
+    }
+    if (body.kind === "call_mute") {
+      if (body.fail === true) mockMuteFailsNext = true;
+      if (typeof body.hold_ms === "number" && body.hold_ms > 0) mockMuteHoldMs = body.hold_ms;
+      if (body.lose_answer === true) mockMuteLosesAnswer = true;
+      return Response.json(
+        { ok: true, fail: mockMuteFailsNext, hold_ms: mockMuteHoldMs, lose_answer: mockMuteLosesAnswer },
+        { status: 200 },
+      );
+    }
+    // One more frame of the call's state, changed in nothing — what a roster update or a
+    // renegotiation looks like to a page that reads only `muted` and `mute_seq` off it. It is
+    // the frame that must never undo a press it went out before.
+    if (body.kind === "call_state") {
+      if (!mockCall) return Response.json({ ok: false, error: "no call" }, { status: 409 });
+      broadcastMockCall();
+      return Response.json({ ok: true, muted: mockCall.muted, mute_seq: mockCall.mute_seq }, { status: 200 });
     }
     // Drop every socket and keep the call — a network blip, as a page sees it.
     if (body.kind === "calling" && body.reconnect === true) {
@@ -13701,6 +13795,10 @@ async function handleTestHook(req: Request, url: URL): Promise<Response | null> 
         mockRefusesNextStatus = false;
         mockHangups = [];
         mockStatusRefusals = 0;
+        mockMuteFailsNext = false;
+        mockMuteHoldMs = 0;
+        mockMuteLosesAnswer = false;
+        mockMutes = [];
         broadcastMockCall();
         return Response.json({ ok: true, reset: true }, { status: 200 });
       }

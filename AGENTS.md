@@ -6141,6 +6141,58 @@ call does — this side never handles RTP, and the page never learns a Teams URL
   (`callMediaFor`), and goes when that call is over, gone or a different call — never on a
   PHASE, because an answer still travelling holds the microphone while the backend still says
   `ringing`.
+- **MUTE FOLLOWS THE CALL, and a frame can only ever CLOSE a microphone.** A call is drawn in
+  every window that has the app open and only ONE of them carries its audio — the one that
+  placed or answered it. Mute pressed on the phone used to publish a mute while the laptop went
+  on sending the user's voice. So the backend counts every accepted press (`mute_seq`, moved by
+  `CallingPlane::record_mute` in the same lock as `muted`, on a repeat of the state too, and
+  named in the press's own answer), and the window holding the microphone applies each frame
+  under three rules (`microphoneShouldBeOpen` / `followMuteFrame` in `web/src/lib/call.ts`): a
+  frame from before this window's own press says nothing about it; a newer frame saying muted
+  closes the track; and otherwise a frame leaves the track as it is. A frame never OPENS a
+  microphone — only this window's own press does, at the press, and the backend's ANSWER to
+  that press when nothing newer has been decided (`followMuteAnswer`), which is what settles
+  Mute then Unmute pressed inside one round trip. Eight more rules, each pinned by a test:
+  - **The window holding the call draws Mute from its TRACK** (`callMicrophone`, stated as
+    `data-microphone` on the stage); every other window draws it from the backend, with
+    nothing written ahead of the answer — a failure there would leave "muted" drawn over a
+    microphone that is live.
+  - **A window that does not carry the audio may mute and may NOT unmute.** Its Unmute is
+    disabled at its size, and the reason is said IN FLOW — on a line of its own under the
+    stage's header that wraps (`call-unmute-refusal`, because a phone's header row has no width
+    left for a sentence), in the folded window's status line, and in the control's accessible
+    name — in words that name no other window: this window cannot tell another window holding
+    the call from a reload that lost it (incoming-and-conversation M8 tells them apart).
+  - **The window still OPENING its microphone for the call it started is that window**
+    (`callStarting`, from the click until the microphone is adopted): it is not refused, and a
+    press there is kept and applied the moment the microphone is adopted.
+  - **A press is forgotten at the FIRST newer frame, agreeing or not** (`pendingMuteAfterFrame`).
+    Kept until a frame confirmed it, a lost Unmute would let a later frame be read against it.
+  - **A Mute that did not arrive stays applied; an Unmute that did not arrive TAKES ITSELF
+    BACK** (`muteDidNotArrive` in the store). A microphone left live under a backend, a meeting
+    and every other window that still say "muted" is the one state no other window could do
+    anything about.
+  - **Only a failed MUTE is sent again, ONCE, on reconnect** (`muteToResend`), off the FRESH
+    `call_status` read and only while its `mute_seq` has not moved past the press — and the
+    backend checks that again (`call_mute`'s `if_seq`, refused when another press was recorded
+    since), because the read is a round trip old by the time the press arrives. A failed
+    Unmute is never sent again: opening the microphone at a reconnect would open it on a press
+    the user watched fail.
+  - **A window without the microphone says a Mute did not arrive only when it KNOWS** it did
+    not (`MUTE_DID_NOT_ARRIVE`, never on `requestOutcomeUnknown`): a lost answer may have been
+    recorded, and its frame may already have closed the microphone.
+  - **A frame older than one already applied is ignored for the microphone**, because frames are
+    built under the backend's lock and sent after it, by whichever task changed the call.
+
+  A backend too old to count presses sends no `mute_seq`, and then a frame never touches the
+  track, which is what every frame did before. `web/e2e/call-windows.spec.ts` drives two
+  windows in one browser (`openSecondWindow`, which carries the fixture's mock-only socket
+  guard) and records every value `data-microphone` takes, since a microphone opened for one
+  frame passes a final-state assertion; the mock records presses one at a time, and its
+  `{kind:"call_mute", fail|hold_ms|lose_answer}`, `{kind:"call_mute", offline}` and
+  `{kind:"call_state"}` hooks reach the failed, the travelling, the half-answered and the unheard
+  press. **Unverified against the tenant**: the live check is the user's own — Mute on the phone
+  while the laptop holds a call with a colleague, who must hear silence at once.
 - **A start the user STOPS is not a failure, and the call it half-made is taken back.** A
   start is three awaits long — reserve, open the microphone, post the offer — and the
   microphone alone takes up to `GATHER_TIMEOUT_MS`, so a call stopped a second after it was

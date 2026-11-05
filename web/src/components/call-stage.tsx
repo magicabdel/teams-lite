@@ -18,7 +18,15 @@ import {
   Video01Icon,
   VideoOffIcon,
 } from "@hugeicons/core-free-icons";
-import { callDurationLabel, callNamesAConversation, isMeeting, type ActiveCall } from "~/lib/call";
+import {
+  callDurationLabel,
+  callNamesAConversation,
+  callShowsMuted,
+  isMeeting,
+  unmuteRefusal,
+  UNMUTE_REFUSED_HERE_SHORT,
+  type ActiveCall,
+} from "~/lib/call";
 import {
   RECORDING_HINT,
   RECORD_HINT,
@@ -107,6 +115,7 @@ const MINI_RADIUS = 20;
 function Stage(props: { call: ActiveCall }) {
   const { call } = props;
   const mediaFor = useAppState((s) => s.callMediaFor);
+  const microphone = useAppState((s) => s.callMicrophone);
   const { mode, panel, position, setMode, togglePanel, setPosition } = useCallStage();
   const reduce = useReducedMotion();
   const viewport = useViewport();
@@ -174,6 +183,13 @@ function Stage(props: { call: ActiveCall }) {
       // Whether THIS page holds a microphone for the call — the one fact about a live call a
       // spec cannot read off a button, and the half a reconnect reconciles.
       data-media={mediaFor === call.id ? "held" : "none"}
+      // What the microphone THIS page holds is doing, read off its track — absent where this
+      // page holds none. A press in another window is proved here, on the window it silenced.
+      data-microphone={microphone ?? undefined}
+      // Which mute press the newest frame this page read reflects (the backend's `mute_seq`):
+      // the order a frame from before a press is told apart by, stated so a spec can wait for
+      // the frame it is about rather than sleep for it.
+      data-mute-seq={call.mute_seq}
       // What the BACKEND says this endpoint sends, beside the phase and for the same reason:
       // it is the one fact about a live call that a driver has to read out of the app's own
       // state rather than out of a button, because a pressed button says what was ASKED for
@@ -286,6 +302,9 @@ function FullStage(props: {
   const controller = useController();
   const navigate = useNavigate();
   const conversations = useAppState((s) => s.conversations);
+  const microphone = useAppState((s) => s.callMicrophone);
+  const starting = useAppState((s) => s.callStarting);
+  const unmuteRefused = unmuteRefusal(call, microphone, starting);
   const sending = useMemo(
     () => ({ camera: call.sending.includes("camera"), sharing: call.sending.includes("screen") }),
     [call.sending],
@@ -357,14 +376,7 @@ function FullStage(props: {
               />
             </>
           )}
-          <StageControl
-            testId="call-mute"
-            pressed={call.muted}
-            tone="warning"
-            label={call.muted ? "Unmute" : "Mute"}
-            icon={call.muted ? MicOff01Icon : Mic01Icon}
-            onClick={() => void controller.setCallMuted(!call.muted)}
-          />
+          <MuteControl call={call} />
           <RecordControl call={call} />
 
           <span aria-hidden className="mx-0.5 h-6 w-px bg-border-subtle" />
@@ -397,6 +409,19 @@ function FullStage(props: {
           <LeaveButton call={call} labelled />
         </div>
       </header>
+
+      {/* Why Unmute is disabled here, IN FLOW and on a line of its own that WRAPS: the
+          button's title is a sentence a phone never shows, a phone is where this happens —
+          Mute pressed on it while the laptop carries the call — and a phone's header row has
+          no width left for a sentence once its controls are drawn. */}
+      {unmuteRefused && (
+        <p
+          data-testid="call-unmute-refusal"
+          className="shrink-0 border-b border-border-subtle bg-warning/10 px-3 py-1.5 text-xs leading-snug text-warning sm:px-4"
+        >
+          {unmuteRefused}
+        </p>
+      )}
 
       <div className="relative flex min-h-0 flex-1">
         <StageContent call={call} layout={layout} />
@@ -582,6 +607,9 @@ function CallMark(props: { call: ActiveCall; className?: string }) {
 
 function StagePeople(props: { call: ActiveCall; participants: StageParticipant[] }) {
   const lobby = callStageLobbyLabel(props.call);
+  // The same answer the Mute button gives, so the row and the button never disagree.
+  const microphone = useAppState((s) => s.callMicrophone);
+  const youAreMuted = callShowsMuted(props.call, microphone);
   return (
     <div data-testid="call-stage-people-panel" className="flex min-h-0 flex-1 flex-col">
       <h2 className="shrink-0 px-4 pb-2 pt-3 text-xs font-semibold uppercase tracking-wide text-text-faint">
@@ -618,7 +646,7 @@ function StagePeople(props: { call: ActiveCall; participants: StageParticipant[]
               <PersonSignal icon={ComputerScreenShareIcon} label="Sharing a screen" />
             )}
             {person.camera && <PersonSignal icon={Video01Icon} label="Camera on" />}
-            {person.you && props.call.muted && <PersonSignal icon={MicOff01Icon} label="Muted" />}
+            {person.you && youAreMuted && <PersonSignal icon={MicOff01Icon} label="Muted" />}
           </li>
         ))}
       </ul>
@@ -651,7 +679,6 @@ function PersonSignal(props: { icon: IconSvgElement; label: string }) {
  */
 function MiniWindow(props: { call: ActiveCall; layout: StageLayout; onExpand: () => void }) {
   const { call, layout } = props;
-  const controller = useController();
   const names = useAppState((s) => s.callVideoNames);
   const picture = useMemo(() => callMiniPicture(layout), [layout]);
 
@@ -684,15 +711,7 @@ function MiniWindow(props: { call: ActiveCall; layout: StageLayout; onExpand: ()
             <MiniStatus call={call} />
           </p>
         </div>
-        <StageControl
-          testId="call-mute"
-          pressed={call.muted}
-          tone="warning"
-          size="sm"
-          label={call.muted ? "Unmute" : "Mute"}
-          icon={call.muted ? MicOff01Icon : Mic01Icon}
-          onClick={() => void controller.setCallMuted(!call.muted)}
-        />
+        <MuteControl call={call} size="sm" />
         {/* Only while a recording is running — see RecordControl. */}
         <RecordControl call={call} mini />
         <StageControl
@@ -708,9 +727,16 @@ function MiniWindow(props: { call: ActiveCall; layout: StageLayout; onExpand: ()
   );
 }
 
-/** The duration once there is one, and what the call is doing until then. */
+/** The duration once there is one, and what the call is doing until then — except while this
+ *  window may not unmute, which it says FIRST: the folded window's Mute is disabled then, and
+ *  this line is the only place in it with room to say why. */
 function MiniStatus(props: { call: ActiveCall }) {
   const now = useNow(!!props.call.connected_at_ms);
+  const microphone = useAppState((s) => s.callMicrophone);
+  const starting = useAppState((s) => s.callStarting);
+  if (unmuteRefusal(props.call, microphone, starting)) {
+    return <span data-testid="call-mini-unmute-refusal">{UNMUTE_REFUSED_HERE_SHORT}</span>;
+  }
   const duration = callDurationLabel(props.call, now);
   return <>{duration || callStageSubtitle(props.call)}</>;
 }
@@ -725,7 +751,9 @@ function MiniStatus(props: { call: ActiveCall }) {
  * They share a component because they are one kind of promise: a click carries out one
  * thing the user just asked for, and what a control READS is the backend's own state
  * (`call.muted`, `call.sending`) rather than this page's memory — which is what makes a
- * second open page, and a phone that reconnects mid-call, draw the same row.
+ * second open page, and a phone that reconnects mid-call, draw the same row. The one
+ * exception is Mute in the window that carries the call's audio, which reads its own TRACK
+ * (see {@link MuteControl}).
  *
  * `pressed` is absent on the controls that are not switches (fold, open), because
  * `aria-pressed="false"` on a plain button tells a screen reader there is a state to turn
@@ -777,6 +805,38 @@ function StageControl(props: {
         strokeWidth={1.8}
       />
     </button>
+  );
+}
+
+/**
+ * Mute, from whichever window this is.
+ *
+ * Where this page holds the call's microphone the button follows the TRACK, which is what the
+ * far side hears — a button that followed the backend there would say "live" over a press that
+ * failed to arrive. Everywhere else it follows the backend, whose state any window's press
+ * moves. A window that does not carry the audio may mute it and may not unmute it, because a
+ * frame never opens a microphone: its Unmute is drawn at the same size, disabled, and the
+ * reason is said in flow — on a line of its own under the page's header, and in the folded
+ * window's status line — as well as in the title and the accessible name here.
+ */
+function MuteControl(props: { call: ActiveCall; size?: "sm" }) {
+  const controller = useController();
+  const microphone = useAppState((s) => s.callMicrophone);
+  const starting = useAppState((s) => s.callStarting);
+  const muted = callShowsMuted(props.call, microphone);
+  const refusal = unmuteRefusal(props.call, microphone, starting);
+  return (
+    <StageControl
+      testId="call-mute"
+      pressed={muted}
+      tone="warning"
+      size={props.size}
+      label={refusal ? `Unmute. ${refusal}` : muted ? "Unmute" : "Mute"}
+      title={refusal ?? undefined}
+      disabled={refusal !== null}
+      icon={muted ? MicOff01Icon : Mic01Icon}
+      onClick={() => void controller.setCallMuted(!muted)}
+    />
   );
 }
 

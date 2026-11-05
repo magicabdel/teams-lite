@@ -1180,10 +1180,18 @@ export class Backend {
   }
   /** Publish whether the user can be heard. The page has already stopped sending audio;
    *  this is the half the other side sees, which is why it is outward. */
-  callMute(callId: string, muted: boolean): Promise<{ call_id: string; muted: boolean }> {
-    return this.writeRequest<{ call_id: string; muted: boolean }>("call_mute", {
+  /** Publish a mute press. `ifSeq` makes it conditional — the press a page sends AGAIN after a
+   *  reconnect, refused by the backend when another press was recorded since. The answer names
+   *  the sequence the press was recorded at (absent from a backend too old to count presses). */
+  callMute(
+    callId: string,
+    muted: boolean,
+    ifSeq?: number,
+  ): Promise<{ call_id: string; muted: boolean; mute_seq?: number }> {
+    return this.writeRequest<{ call_id: string; muted: boolean; mute_seq?: number }>("call_mute", {
       call_id: callId,
       muted,
+      ...(ifSeq === undefined ? {} : { if_seq: ifSeq }),
     });
   }
 

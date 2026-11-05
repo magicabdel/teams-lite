@@ -33,20 +33,41 @@ export const test = base.extend<Fixtures>({
   // immediately, which fails the spec on its very next action — before it can type.
   mockBackendOnly: [
     async ({ page }, use) => {
-      page.on("websocket", (ws) => {
-        if (ws.url().includes(`:${MOCK_PORT}`)) return;
-        console.error(
-          `[e2e] REFUSING: the app opened a WebSocket to ${ws.url()}, not the mock on ` +
-            `port ${MOCK_PORT}. Closing the page before this spec can write anything. ` +
-            `The app's target is baked at build time — see VITE_TEAMS_WS_URL in playwright.config.ts.`,
-        );
-        void page.close();
-      });
+      refuseEverySocketButTheMock(page);
       await use();
     },
     { auto: true },
   ],
 });
+
+/** Close `page` the moment it opens a WebSocket to anything but the mock — the guard every
+ *  page a spec drives must carry, the fixture's own page and every second window alike. */
+function refuseEverySocketButTheMock(page: Page): void {
+  page.on("websocket", (ws) => {
+    if (ws.url().includes(`:${MOCK_PORT}`)) return;
+    console.error(
+      `[e2e] REFUSING: the app opened a WebSocket to ${ws.url()}, not the mock on ` +
+        `port ${MOCK_PORT}. Closing the page before this spec can write anything. ` +
+        `The app's target is baked at build time — see VITE_TEAMS_WS_URL in playwright.config.ts.`,
+    );
+    void page.close();
+  });
+}
+
+/**
+ * Open the app in a SECOND window of the same browser, beside `page` — the shape a call drawn
+ * in two windows takes (the laptop holding it, the phone looking at it).
+ *
+ * It carries the same refusal the fixture's page does, installed BEFORE it navigates: the guard
+ * lives on a page, so a window this helper did not guard would be the one page in the suite
+ * that could reach a real backend. Close it in the spec's own `finally`.
+ */
+export async function openSecondWindow(page: Page): Promise<Page> {
+  const second = await page.context().newPage();
+  refuseEverySocketButTheMock(second);
+  await gotoApp(second);
+  return second;
+}
 
 export { expect };
 
@@ -537,6 +558,8 @@ export async function refuseNextMicrophone(page: Page): Promise<void> {
  *  many it answered — which is what a spec waits on instead of sleeping for a reconnect. */
 export type CallRecord = {
   hangups: { intent: string | null; declined: boolean }[];
+  /** Every `call_mute` the mock received, in order, and whether the `fail` hook refused it. */
+  mutes: { muted: boolean; refused: boolean }[];
   status_refusals: number;
   status_reads: number;
 };
@@ -556,6 +579,44 @@ export async function loseBackend(page: Page): Promise<void> {
     data: { kind: "calling", lose: true },
   });
   expect(res.ok()).toBeTruthy();
+}
+
+/** What the NEXT `call_mute` does: `fail` refuses it before anything moves (a press that never
+ *  reached the backend), `hold_ms` holds it — and every press behind it — that long before it is
+ *  recorded (the window in which a frame from before the press can still arrive), and
+ *  `lose_answer` records it and tells every page, then drops every socket before it answers.
+ *  Always finish with `resetCall`. */
+export async function armNextCallMute(
+  page: Page,
+  next: { fail?: boolean; hold_ms?: number; lose_answer?: boolean },
+): Promise<void> {
+  const res = await page.request.post(`http://127.0.0.1:${MOCK_PORT}/__test/emit`, {
+    data: { kind: "call_mute", ...next },
+  });
+  expect(res.ok()).toBeTruthy();
+}
+
+/** A press another window makes while every page here is disconnected: the mock records it,
+ *  tells nobody, and drops every socket — so the status read a page makes when it reconnects is
+ *  the one way it learns. Always finish with `resetCall`. */
+export async function muteWhileDisconnected(page: Page, muted: boolean): Promise<void> {
+  const res = await page.request.post(`http://127.0.0.1:${MOCK_PORT}/__test/emit`, {
+    data: { kind: "call_mute", offline: true, muted },
+  });
+  expect(res.ok()).toBeTruthy();
+}
+
+/** One more frame of the call's state, changed in nothing — a roster update, as far as the
+ *  microphone is concerned. Returns what it carried. */
+export async function emitUnchangedCallState(
+  page: Page,
+): Promise<{ muted: boolean; mute_seq: number }> {
+  const res = await page.request.post(`http://127.0.0.1:${MOCK_PORT}/__test/emit`, {
+    data: { kind: "call_state" },
+  });
+  expect(res.ok()).toBeTruthy();
+  const { muted, mute_seq } = (await res.json()) as { muted: boolean; mute_seq: number };
+  return { muted, mute_seq };
 }
 
 /** Drop every socket and keep the call — a network blip as a page sees it. */

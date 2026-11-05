@@ -553,7 +553,7 @@ away. A read-only backend is the only one that never registers.
 | `call_join` | `OUTWARD_METHODS` | The same POST for a MEETING: no `to`, plus `meetingInfo`. Rings nobody. |
 | `call_accept` | `OUTWARD_METHODS` | Answers with our SDP. Opens the microphone to them. |
 | `call_hangup` | `OUTWARD_METHODS` | Ends the call. `intent: "decline"` — the ringing card's Decline, and nothing else — declines a call still ringing; `intent: "end"` on one lets it go here and tells nobody, so it rings on the user's other devices. No intent is an older page and declines, as it always did. Any other word is refused. |
-| `call_mute` | `OUTWARD_METHODS` | Publishes whether the user can be heard. |
+| `call_mute` | `OUTWARD_METHODS` | Publishes whether the user can be heard. Every accepted press moves the call's `mute_seq` with `muted`, tells every page and names the sequence in its answer, so a press in one window closes the microphone another window holds (AGENTS.md § Audio calls, "MUTE FOLLOWS THE CALL"). An optional `if_seq` makes it conditional: refused when another press was recorded since — what a press sent again after a reconnect carries. |
 
 Two events carry the rest: `call_state` (the whole state, every time, so ONE frame releases
 the microphone) and `call_media` (the far side's SDP, the only frame whose body a client is

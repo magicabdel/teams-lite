@@ -14,9 +14,18 @@ import {
   canPlaceCall,
   conversationCallAction,
   conversationIsCallable,
+  callShowsMuted,
   callStillHoldsMedia,
   isLive,
   lostCallMessage,
+  UNMUTE_REFUSED_HERE,
+  followMuteAnswer,
+  followMuteFrame,
+  microphoneShouldBeOpen,
+  muteToResend,
+  pendingMuteAfterFrame,
+  unmuteRefusal,
+  type PendingMute,
   isMeeting,
   isMeetingJoinLink,
   meetingAddressOf,
@@ -542,5 +551,208 @@ describe("joining a meeting", () => {
     expect(callEndLabel(meeting({ end_reason: "CallEndReasonJoinFailed" }))).toMatch(
       /could not be joined/,
     );
+  });
+});
+
+// The microphone follows the call (incoming-and-conversation M1). The direction a mistake may
+// go in is the whole of these rules: a frame may close a microphone, and only the window's own
+// press opens one — at the press, or on the backend's answer to it.
+const press = (muted: boolean, afterSeq: number, failed = false): PendingMute => ({
+  callId: "call-1",
+  muted,
+  afterSeq,
+  failed,
+  resent: false,
+});
+
+describe("the microphone this window holds", () => {
+  const open = (
+    trackOpen: boolean,
+    backendMuted: boolean,
+    backendSeq: number,
+    pending: PendingMute | null = null,
+  ) => microphoneShouldBeOpen({ trackOpen, backendMuted, backendSeq, pending });
+
+  it("closes on a mute pressed in another window", () => {
+    expect(open(true, true, 1)).toBe(false);
+  });
+
+  it("never opens because a frame says unmuted — not with no press, not with this window's own", () => {
+    expect(open(false, false, 2)).toBe(false);
+    // A newer frame, even one that answers this window's own Unmute: opening is the press's job
+    // (and the answer's), never a frame's.
+    expect(open(false, false, 5, press(false, 4))).toBe(false);
+    // …and an open microphone stays open: a frame only ever narrows.
+    expect(open(true, false, 2)).toBe(true);
+  });
+
+  it("keeps an Unmute just pressed open on a frame from before the press", () => {
+    // Rule 1's only work: without it the roster that predates the press re-mutes the user.
+    expect(open(true, true, 4, press(false, 4))).toBe(true);
+    expect(open(true, true, 3, press(false, 4))).toBe(true);
+  });
+
+  it("keeps a Mute just pressed closed on a frame from before the press", () => {
+    expect(open(false, false, 4, press(true, 4))).toBe(false);
+  });
+
+  it("closes on a NEWER mute even while this window's own Unmute waits", () => {
+    expect(open(true, true, 5, press(false, 4))).toBe(false);
+  });
+});
+
+describe("a press this window waits on", () => {
+  const pending = press(false, 4);
+
+  it("is kept while frames are from before it", () => {
+    expect(pendingMuteAfterFrame(pending, 3)).toBe(pending);
+    expect(pendingMuteAfterFrame(pending, 4)).toBe(pending);
+  });
+
+  it("is forgotten at the first newer frame, whether or not that frame agrees", () => {
+    expect(pendingMuteAfterFrame(pending, 5)).toBeNull();
+  });
+
+  it("is nothing when there was none", () => {
+    expect(pendingMuteAfterFrame(null, 9)).toBeNull();
+  });
+});
+
+describe("one frame applied to the microphone this window holds", () => {
+  const live = (overrides: Partial<ActiveCall> = {}) =>
+    call({ phase: "connected", mute_seq: 3, muted: false, ...overrides });
+  const follow = (
+    frame: ActiveCall,
+    trackOpen: boolean,
+    pending: PendingMute | null = null,
+    applied: { callId: string; seq: number } | null = null,
+  ) => followMuteFrame({ call: frame, callId: "call-1", trackOpen, pending, applied });
+
+  it("closes the track on a newer mute and records what it applied", () => {
+    expect(follow(live({ muted: true, mute_seq: 4 }), true, null, { callId: "call-1", seq: 3 })).toEqual({
+      open: false,
+      pending: null,
+      applied: { callId: "call-1", seq: 4 },
+    });
+  });
+
+  it("ignores a frame OLDER than one already applied — two frames can reach the socket in the other order", () => {
+    expect(follow(live({ muted: true, mute_seq: 2 }), true, null, { callId: "call-1", seq: 3 })).toBeNull();
+    // The same sequence is not older: it is the same press, and applying it again changes nothing.
+    expect(follow(live({ muted: true, mute_seq: 3 }), false, null, { callId: "call-1", seq: 3 })).not.toBeNull();
+  });
+
+  it("says nothing on a backend that does not count presses, or about another call", () => {
+    expect(follow(live({ mute_seq: undefined, muted: true }), true)).toBeNull();
+    expect(follow(live({ id: "call-2", muted: true }), true)).toBeNull();
+  });
+
+  it("reads only this call's press, and forgets it at the first newer frame", () => {
+    const mine = press(false, 3);
+    expect(follow(live({ muted: true, mute_seq: 3 }), true, mine)).toEqual({
+      open: true,
+      pending: mine,
+      applied: { callId: "call-1", seq: 3 },
+    });
+    expect(follow(live({ muted: true, mute_seq: 3 }), true, { ...mine, callId: "call-0" })?.open).toBe(false);
+    expect(follow(live({ mute_seq: 4 }), true, mine)?.pending).toBeNull();
+  });
+
+  it("never lets a failed Unmute kept past another window's Mute open the microphone again", () => {
+    // Forgotten at the newer Mute, it cannot be read against the old build's Unmute after it.
+    const first = follow(live({ muted: true, mute_seq: 4 }), true, press(false, 3));
+    expect(first).toMatchObject({ open: false, pending: null });
+    const second = follow(live({ muted: false, mute_seq: 5 }), false, first!.pending, first!.applied);
+    expect(second?.open).toBe(false);
+  });
+});
+
+describe("the backend's answer to this window's newest press", () => {
+  const answer = (muted: boolean, answerSeq: number | undefined, appliedSeq: number | null) =>
+    followMuteAnswer({
+      muted,
+      answerSeq,
+      applied: appliedSeq === null ? null : { callId: "call-1", seq: appliedSeq },
+      callId: "call-1",
+    });
+
+  it("is the decision when nothing newer has been applied", () => {
+    // Mute then Unmute inside one round trip: the Mute's frame (4) closed the track and the
+    // Unmute's frame (5) cannot open it — the Unmute's answer does.
+    expect(answer(false, 5, 5)).toBe(true);
+    expect(answer(false, 5, 4)).toBe(true);
+    expect(answer(true, 5, 5)).toBe(false);
+  });
+
+  it("is nothing once a newer press — from any window — has been decided", () => {
+    expect(answer(false, 5, 6)).toBeNull();
+  });
+
+  it("is nothing from a backend that does not say where it recorded the press", () => {
+    expect(answer(false, undefined, 4)).toBeNull();
+  });
+
+  it("ignores what was applied to ANOTHER call", () => {
+    expect(
+      followMuteAnswer({ muted: false, answerSeq: 1, applied: { callId: "call-0", seq: 9 }, callId: "call-1" }),
+    ).toBe(true);
+  });
+});
+
+describe("sending a lost press again after a reconnect", () => {
+  const failedMute = press(true, 2, true);
+  const live = (overrides: Partial<ActiveCall> = {}) =>
+    call({ phase: "connected", mute_seq: 2, ...overrides });
+
+  it("sends a failed Mute when the backend has decided no press since", () => {
+    expect(muteToResend(failedMute, live())).toBe(true);
+  });
+
+  it("never sends a press that did not fail — one made just after the socket came back is in flight, not lost", () => {
+    expect(muteToResend(press(true, 2), live())).toBe(false);
+  });
+
+  it("never sends an Unmute: it took itself back, and opening the microphone later would open it on a press the user saw fail", () => {
+    expect(muteToResend(press(false, 2, true), live())).toBe(false);
+  });
+
+  it("never sends it over a press made since, in any window", () => {
+    expect(muteToResend(failedMute, live({ mute_seq: 3, muted: false }))).toBe(false);
+  });
+
+  it("sends it once", () => {
+    expect(muteToResend({ ...failedMute, resent: true }, live())).toBe(false);
+  });
+
+  it("sends nothing for another call, an ended one, or a backend that does not count presses", () => {
+    expect(muteToResend(failedMute, live({ id: "call-2" }))).toBe(false);
+    expect(muteToResend(failedMute, live({ phase: "ended" }))).toBe(false);
+    expect(muteToResend(failedMute, live({ mute_seq: undefined }))).toBe(false);
+    expect(muteToResend(failedMute, null)).toBe(false);
+    expect(muteToResend(null, live())).toBe(false);
+  });
+});
+
+describe("what a window draws for Mute", () => {
+  const live = (muted: boolean) => call({ phase: "connected", muted });
+
+  it("follows the track where the window holds the microphone", () => {
+    // The backend says live, the track is closed (a press that never arrived): the track wins.
+    expect(callShowsMuted(live(false), "muted")).toBe(true);
+    expect(callShowsMuted(live(true), "live")).toBe(false);
+  });
+
+  it("follows the backend everywhere else", () => {
+    expect(callShowsMuted(live(true), null)).toBe(true);
+    expect(callShowsMuted(live(false), null)).toBe(false);
+  });
+
+  it("refuses an Unmute only where the window holds no microphone and is not opening one", () => {
+    expect(unmuteRefusal(live(true), null, false)).toBe(UNMUTE_REFUSED_HERE);
+    expect(unmuteRefusal(live(false), null, false)).toBeNull();
+    expect(unmuteRefusal(live(true), "muted", false)).toBeNull();
+    // The window still opening its microphone for the call it started is the one that will
+    // carry the audio, so its Unmute is its own.
+    expect(unmuteRefusal(live(true), null, true)).toBeNull();
   });
 });

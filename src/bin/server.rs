@@ -2244,6 +2244,46 @@ impl CallingPlane {
         }
     }
 
+    /// Record one mute press on call `call_id`: the state every page reads, and the sequence
+    /// that says which press it reflects. Returns what the press is published with — our own
+    /// participant, the door for this direction (when the call has one), and the new sequence.
+    ///
+    /// The state moves whatever the service then answers: the window holding the microphone
+    /// has already closed it for a mute, and the UI must never claim the user is live when they
+    /// are not. The sequence moves on EVERY accepted press, a repeat of the current state
+    /// included, because it orders presses rather than changes: a window waiting on its own
+    /// press reads "a newer frame" as "my press, or one that came after it, has been decided",
+    /// which only holds if every press is counted. A press for a call that is not the live one
+    /// is refused and moves nothing.
+    ///
+    /// `if_seq` makes it conditional: a press a page sends AGAIN after a reconnect names the
+    /// sequence it was made at, and is refused — moving nothing — when another press has been
+    /// recorded since. The page decides to re-send off a status read that is a round trip old by
+    /// the time the press arrives, so this is the half that makes "never over a press made
+    /// since" exact rather than likely.
+    fn record_mute(
+        &mut self,
+        call_id: &str,
+        muted: bool,
+        if_seq: Option<u64>,
+    ) -> Result<(calling::LocalParticipant, Option<String>, u64)> {
+        let call = self
+            .call
+            .as_mut()
+            .filter(|c| c.id == call_id)
+            .context("call_mute: no such call")?;
+        if let Some(seq) = if_seq.filter(|&seq| call.mute_seq > seq) {
+            anyhow::bail!(
+                "call_mute: another press was recorded since this one (mute_seq {} > {seq})",
+                call.mute_seq
+            );
+        }
+        call.muted = muted;
+        call.mute_seq += 1;
+        let url = if muted { call.links.mute() } else { call.links.unmute() };
+        Ok((call.local.clone(), url.map(str::to_string), call.mute_seq))
+    }
+
     /// The channel a call may be built on RIGHT NOW: registered, and the socket up.
     ///
     /// The ONE predicate behind `ready` and behind both `call_prepare` refusals. The placing
@@ -2507,10 +2547,19 @@ struct CallSession {
     callbacks: calling::CallbackBase,
     /// The offer the caller sent, held until the page asks for it (`call_prepare`).
     offer: Option<calling::MediaContent>,
-    /// Whether we told the service we are muted. The microphone is muted in the page
-    /// as well — this half is what draws the crossed-out microphone for everybody
-    /// else in the call.
+    /// Whether the user asked to be muted — the newest press, from whichever window made it.
+    /// This half is what draws the crossed-out microphone for everybody else in the call, and
+    /// it is what every page READS: the window that carries the call's audio closes its track
+    /// when this says muted, and never opens one because it says unmuted
+    /// (`microphoneShouldBeOpen` in web/src/lib/call.ts). It moves on the press whatever the
+    /// service then answers, in BOTH directions — so when the publish fails, or the call has no
+    /// door for it, this can disagree with what the meeting was told either way.
     muted: bool,
+    /// How many mute presses this call has accepted, so a page can tell a frame that already
+    /// carries its own press from one that went out before it (see [`CallingPlane::record_mute`]).
+    /// It moves on EVERY accepted press, including one that repeats the current state: it
+    /// orders presses, not changes.
+    mute_seq: u64,
     /// When audio started, so the UI can count the duration from one clock.
     connected_at_ms: Option<i64>,
     /// When this call entered the plane, which is what expires one nobody ever answered.
@@ -2592,6 +2641,10 @@ impl CallSession {
             "peer": self.peer_name,
             "peer_mri": self.peer_mri,
             "muted": self.muted,
+            // Which press `muted` reflects. A page that holds the microphone compares it with
+            // the press it is waiting on, so a frame that went out before that press — a
+            // roster, a renegotiation — is never read as an answer to it.
+            "mute_seq": self.mute_seq,
             "connected_at_ms": self.connected_at_ms,
             "end_reason": self.end_reason,
             "in_lobby": self.in_lobby,
@@ -7727,6 +7780,7 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
                     },
                     offer: None,
                     muted: false,
+                    mute_seq: 0,
                     connected_at_ms: None,
                     started_at_ms: now_ms(),
                     end_reason: None,
@@ -7879,6 +7933,7 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
                         roster: Vec::new(),
                         in_lobby: false,
                         muted: false,
+                        mute_seq: 0,
                         connected_at_ms: None,
                         started_at_ms: now_ms(),
                         end_reason: None,
@@ -8690,34 +8745,26 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
 
         // Publish whether the user can be heard.
         //
-        // The page has already stopped sending audio; this is the half everybody else
-        // in the call sees. It is outward for that reason: it states something about
-        // the user to the person they are talking to.
+        // The window carrying the call's audio has already stopped sending it — or stops the
+        // moment this state reaches it, when the press came from another window. This is the
+        // half everybody else in the call sees. It is outward for that reason: it states
+        // something about the user to the person they are talking to.
         "call_mute" => {
             let call_id = param_str(params, "call_id")?;
             let muted = params
                 .get("muted")
                 .and_then(Value::as_bool)
                 .context("`muted` must be true or false")?;
-            let (local, url) = {
-                let plane = ctx.calling.lock().unwrap();
-                let call = plane
-                    .call
-                    .as_ref()
-                    .filter(|c| c.id == call_id)
-                    .context("call_mute: no such call")?;
-                let url = if muted { call.links.mute() } else { call.links.unmute() };
-                (call.local.clone(), url.map(str::to_string))
+            // Present only on a press sent AGAIN after a reconnect: the sequence it was made at.
+            let if_seq = match params.get("if_seq") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(value.as_u64().context("`if_seq` must be a whole number")?),
             };
-            // The local state moves whatever the service says: the microphone is
-            // already off, and the UI must never claim the user is live when they are
-            // not.
-            {
-                let mut plane = ctx.calling.lock().unwrap();
-                if let Some(call) = plane.call.as_mut().filter(|c| c.id == call_id) {
-                    call.muted = muted;
-                }
-            }
+            // The state and its sequence move in ONE lock, before the service is asked, and
+            // every page is told at once: a mute pressed in one window is what closes the
+            // microphone another window holds (see `CallingPlane::record_mute`).
+            let (local, url, mute_seq) =
+                ctx.calling.lock().unwrap().record_mute(&call_id, muted, if_seq)?;
             ctx.emit_call_state();
             let told = match url {
                 Some(url) => ctx
@@ -8727,7 +8774,7 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
                     .is_ok(),
                 None => false,
             };
-            Ok(json!({ "call_id": call_id, "muted": muted, "told_service": told }))
+            Ok(json!({ "call_id": call_id, "muted": muted, "mute_seq": mute_seq, "told_service": told }))
         }
 
         // Enrich a tracker link with metadata (title, state, assignee, …) so the
@@ -15491,6 +15538,7 @@ impl Ctx {
             roster: Vec::new(),
             in_lobby: false,
             muted: false,
+            mute_seq: 0,
             connected_at_ms: None,
             started_at_ms: now_ms(),
             end_reason: None,
@@ -17854,6 +17902,7 @@ mod tests {
             roster: Vec::new(),
             in_lobby: false,
             muted: false,
+            mute_seq: 0,
             connected_at_ms: None,
             started_at_ms: now_ms(),
             end_reason: None,
@@ -17908,6 +17957,7 @@ mod tests {
             roster: Vec::new(),
             in_lobby: false,
             muted: false,
+            mute_seq: 0,
             connected_at_ms: None,
             started_at_ms: now_ms(),
             end_reason: None,
@@ -17955,6 +18005,7 @@ mod tests {
             roster: Vec::new(),
             in_lobby: false,
             muted: false,
+            mute_seq: 0,
             connected_at_ms: Some(now_ms()),
             started_at_ms: now_ms(),
             end_reason: None,
@@ -17969,6 +18020,85 @@ mod tests {
                 leave: Some("https://cc/live/sharing/leave".into()),
             }),
         }
+    }
+
+    /// A mute press moves the state every page reads AND the sequence that says which press it
+    /// reflects (incoming-and-conversation M1). The window holding the microphone keeps its own
+    /// press until a frame NEWER than it arrives, so the sequence has to move on every accepted
+    /// press — a repeat of the state included — and on nothing else: a press for another call is
+    /// refused and moves nothing, or a page waiting on its own press would read it as decided.
+    #[test]
+    fn every_accepted_mute_press_moves_the_sequence_the_pages_read() {
+        let mut plane = CallingPlane::default();
+        let mut call = call_on_session("live");
+        call.links = calling::Links::collect(&json!({
+            "links": { "mute": "https://cc/live/mute", "unmute": "https://cc/live/unmute" }
+        }));
+        plane.call = Some(call);
+        assert_eq!(plane.call.as_ref().unwrap().json()["mute_seq"], 0);
+
+        let (local, url, seq) = plane.record_mute("call-1", true, None).unwrap();
+        assert_eq!((url.as_deref(), seq), (Some("https://cc/live/mute"), 1));
+        assert_eq!(local.id, "8:orgid:me");
+        // The same state pressed again is still a press: it orders presses, not changes.
+        assert_eq!(plane.record_mute("call-1", true, None).unwrap().2, 2);
+        let (_, url, seq) = plane.record_mute("call-1", false, None).unwrap();
+        assert_eq!((url.as_deref(), seq), (Some("https://cc/live/unmute"), 3));
+
+        let refused = plane.record_mute("another-call", true, None).unwrap_err();
+        assert!(format!("{refused:#}").contains("no such call"), "{refused:#}");
+        let json = plane.call.as_ref().unwrap().json();
+        assert_eq!(json["mute_seq"], 3, "a refused press moved the sequence");
+        assert_eq!(json["muted"], false, "a refused press moved the state");
+
+        // No door is not a refusal: the state still moves, the service is simply not told.
+        plane.call.as_mut().unwrap().links = calling::Links::default();
+        let (_, url, seq) = plane.record_mute("call-1", true, None).unwrap();
+        assert_eq!((url, seq), (None, 4));
+        assert_eq!(plane.call.as_ref().unwrap().json()["muted"], true);
+    }
+
+    /// A press a page sends AGAIN after a reconnect names the sequence it was made at, and is
+    /// refused when another press was recorded since — the half that makes "never over a press
+    /// made since" exact: the page decides off a read that is a round trip old by the time the
+    /// press arrives. A refusal moves nothing; at the sequence, or with none named, it records.
+    #[test]
+    fn a_press_sent_again_is_refused_once_another_was_recorded_since() {
+        let mut plane = CallingPlane::default();
+        plane.call = Some(call_on_session("live"));
+        plane.record_mute("call-1", true, None).unwrap();
+        plane.record_mute("call-1", false, None).unwrap();
+
+        let refused = plane.record_mute("call-1", true, Some(1)).unwrap_err();
+        assert!(format!("{refused:#}").contains("another press was recorded since"), "{refused:#}");
+        let json = plane.call.as_ref().unwrap().json();
+        assert_eq!((json["mute_seq"].as_u64(), json["muted"].as_bool()), (Some(2), Some(false)));
+
+        assert_eq!(plane.record_mute("call-1", true, Some(2)).unwrap().2, 3);
+        assert_eq!(plane.call.as_ref().unwrap().json()["muted"], true);
+    }
+
+    /// The `call_mute` arm takes the state, the sequence and the door from ONE call to
+    /// `record_mute` and tells every page before it posts anything — the order that lets a press
+    /// in one window close the microphone another window holds while the service is still
+    /// being asked. A copy of the bookkeeping in the arm would be a second answer to "which press
+    /// is this" that the test above cannot see.
+    #[test]
+    fn the_mute_arm_records_the_press_before_it_publishes_it() {
+        let source = include_str!("server.rs");
+        let start = source.find("        \"call_mute\" => {").expect("the call_mute arm");
+        let arm = &source[start..];
+        let arm = &arm[..arm.find("\n        }\n").expect("the end of the call_mute arm")];
+        let recorded =
+            arm.find(".record_mute(&call_id, muted, if_seq)?").expect("the arm records the press");
+        let told = arm.find("ctx.emit_call_state();").expect("the arm tells the pages");
+        let posted = arm.find("post_call_signal(").expect("the arm publishes the press");
+        assert!(recorded < told && told < posted, "record, then tell the pages, then publish");
+        // No second copy of the bookkeeping, in any spelling: the arm names no field of the call.
+        for mutation in [".muted =", ".muted=", "mute_seq +=", "mute_seq=", ".mute_seq ="] {
+            assert!(!arm.contains(mutation), "the arm moves `{mutation}` itself instead of record_mute");
+        }
+        assert!(arm.contains("\"mute_seq\": mute_seq"), "the answer names the press it recorded");
     }
 
     /// A frame posted to `{surl}callAgent/{session}/c{path}`, the shape of every callback this

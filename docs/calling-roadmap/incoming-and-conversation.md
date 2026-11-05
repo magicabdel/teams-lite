@@ -807,6 +807,15 @@ code), **inferred** (neither).
   4. A newer frame saying unmuted → open ONLY if `pending.muted === false`, which is this
      window's own press.
   5. With no pending press, a frame never opens a microphone.
+
+  **As implemented (M1, IC1):** `microphoneShouldBeOpen({trackOpen, backendMuted, backendSeq,
+  pending})` holds rules 2, 3 and 5. Rule 4 is gone (§ 13 note 19): a frame never opens a
+  microphone at all, and this window's own Unmute is confirmed by the backend's ANSWER to it
+  instead (`followMuteAnswer`). `serverMuted` is not an input yet, because nothing feeds it until
+  meeting-awareness M6 adds `call.server_muted`, which then adds rule 1 above the rest. Beside it:
+  `followMuteFrame` (one frame applied, including the stale-frame and older-backend cases),
+  `pendingMuteAfterFrame` (when a press is forgotten, § 13 note 18), `muteToResend` (only a failed
+  Mute, once) and `callShowsMuted` / `unmuteRefusal` (what a window draws).
 - **New `callMediaPlacement(call, pageId, holdsMediaHere, duplicateChecked) -> 'here' |
   'elsewhere' | 'lost' | 'unknown'`.**
 - Fix the stale header (`:11-13`): "Calling is off until the user turns it on".
@@ -822,10 +831,26 @@ code), **inferred** (neither).
   - record `pendingMute = {muted, afterSeq: call.mute_seq}`;
   - apply it to the track at once (unchanged), call the RPC, and keep `pendingMute` on failure;
   - on reconnect, re-send that one press once, if the call is still live and this page holds it.
+    **As implemented:** only a failed MUTE, and only while the FRESH `call_status` read's
+    `mute_seq` is still at or below `afterSeq` — never from the page's copy from before the drop
+    — and the press carries `if_seq`, so the backend refuses it if another was recorded since
+    (§ 13 notes 18 and 19). A failed Unmute takes itself back instead: the track closes again and
+    it is never re-sent.
 - **`onCallState` (`:2623`):** applies `microphoneShouldBeOpen` when this page holds media, and
   clears `pendingMute` once `backendSeq > afterSeq && backendMuted === pending.muted`.
+  **As implemented:** it clears `pendingMute` at the FIRST frame with `backendSeq > afterSeq`,
+  agreeing or not (§ 13 note 18). A `call_status` read is applied the same way, and a frame
+  older than one already applied is ignored for the microphone (frames are built under the
+  backend's lock and sent after it, by whichever task changed the call). The answer to this
+  page's newest press is applied too (`followMuteAnswer`, § 13 note 19).
 - New reactive `callMicrophone: 'live' | 'muted' | null`, from the TRACK.
-- Non-owner pages: `setCallMuted(false)` is never offered (§ 7).
+- Non-owner pages: `setCallMuted(false)` is never offered (§ 7). **As implemented in M1:** it is
+  drawn disabled at its size, and the reason is said in flow on a line of its own under the
+  stage's header that wraps ("This window does not carry the call's audio, so it cannot unmute
+  you.", `call-unmute-refusal`), in the folded window's status line, and in the control's
+  accessible name. The sentence names no other window, because M1 cannot tell a window that holds
+  the call from a reload that lost it; M8 refines it. A page still OPENING its microphone for the
+  call it started (`callStarting`) is not a non-owner: its press is kept and applied at adoption.
 
 ### Other web files
 
@@ -953,6 +978,8 @@ declined.
 - every window's Mute silences the microphone that is live;
 - the owner window's button follows its TRACK;
 - a failed mute stays muted;
+- a window that does not carry the audio may mute and may not unmute: its Unmute is disabled and
+  the stage's subtitle says why (§ 5, `store.ts`);
 - server-muted presentation is `meeting-awareness` § 4.6.
 
 **Several windows** (M8):
@@ -1057,6 +1084,17 @@ ends with the reset):
 
 The existing "answers a ringing call, mutes, and hangs up" and "declines…" specs in
 `calling.spec.ts` stay green unchanged.
+
+**As implemented (M1):** specs 3 and 4 live in `web/e2e/call-windows.spec.ts` — the file for the
+several-windows specs (3–7) — beside the ones that pin § 13 notes 18 and 19: a refused and a
+half-answered Mute in a second window, Mute then Unmute inside one round trip, a failed Unmute
+taking itself back, a Mute pressed while the holder could not hear, a lost Mute sent again once
+and never twice and never over a press made since, and the window still opening its microphone.
+Every spec about something that must NOT move the microphone records each value `data-microphone`
+takes, because a microphone opened for one frame and closed again passes a final-state assertion.
+The mock records presses one at a time; its hooks are `{kind:"call_mute", fail|hold_ms|lose_answer}`,
+`{kind:"call_mute", offline}`, `{kind:"call_state"}` (a frame changed in nothing) and `mutes` on
+`{kind:"call_record"}`.
 
 **Captures:**
 - `cd web && bun run preview -- --out /tmp/call --call` gains `-ring-group`, `-ring-meeting`,
@@ -1266,6 +1304,34 @@ Each milestone ships alone.
     - the envelope and read-only scans;
     - the AGENTS.md bullets that become false;
     - step 0 for 19442, and the colleague's per-session agreement.
+
+18. **Implementing M1 found two holes in the pending-mute rule, both in the direction the design
+    calls its top risk.** Clearing `pendingMute` only on the frame that AGREES with it kept a
+    failed Unmute alive past a later Mute from another window: the next Unmute from anywhere was
+    then read against it by rule 4 and opened this window's microphone. And re-sending on reconnect
+    "if the call is still live and this page holds it" would have sent that lost Unmute over a
+    Mute pressed on the phone during the outage. So a press is forgotten at the first NEWER frame,
+    agreeing or not, and the re-send is conditioned on the fresh read's `mute_seq` not having moved
+    past it. The cost is the safe direction only: this window's own press, racing another window's,
+    can be lost and leave the microphone closed. Pinned by `call.test.ts` and
+    `call-windows.spec.ts`.
+19. **An independent review of the M1 implementation (four reviewers, a skeptic per dimension)
+    confirmed sixteen findings, none of them a microphone opened; all are fixed.** The ones that
+    changed the design: Mute then Unmute inside one round trip landed muted, because the frame
+    for this window's own earlier press forgot the newer one — settled by applying the backend's
+    answer to the newest press when nothing newer has been decided (`followMuteAnswer`); a failed
+    Unmute left the holder's microphone live under every other window's "muted", with nothing
+    there able to close it — so a failed Unmute takes itself back and only a failed Mute is ever
+    re-sent; the re-send was decided off a read a round trip old — so it carries `if_seq` and the
+    backend refuses it when another press was recorded since; rule 4 was never decisive, since
+    the press itself opens the track — so it is gone, and a frame never opens a microphone at
+    all. The rest: a second window's "nothing was muted" after a LOST answer (now said only on a
+    known refusal), the refusal clipped to nothing in a phone's header (now its own wrapping
+    line, plus the folded window and the accessible name), the window still opening its own
+    microphone told it "does not carry the call's audio" (`callStarting`), the doc comment on
+    `CallSession.muted`, a source scan matching one spelling, and four test or doc claims that
+    nothing pinned (a press made while the holder could not hear, the once-only re-send, the
+    stale-frame guard, the truth table's own comments) — each now pinned or corrected.
 
 **What was rejected or changed, and why:**
 - **Hard-coding a target in every calling example.** Rejected: the sanctioned

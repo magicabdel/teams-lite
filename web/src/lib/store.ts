@@ -138,18 +138,25 @@ import {
   type AgentTranscript,
 } from "./agent-run";
 import {
+  MUTE_DID_NOT_ARRIVE,
   UNKNOWN_CALL_STATUS,
   callEndLabel,
   callIsStillRinging,
   callStillHoldsMedia,
   isLive,
+  followMuteAnswer,
+  followMuteFrame,
   lostCallMessage,
   modalityFor,
+  muteToResend,
   type ActiveCall,
+  type AppliedMuteSeq,
   type CallHangupIntent,
   type CallMediaSignal,
+  type CallMicrophone,
   type CallStatus,
   type MeetingAddress,
+  type PendingMute,
 } from "./call";
 import { callStageTitle } from "./call-stage";
 import { uploadKey, type UploadRef } from "./gitlab-upload";
@@ -747,6 +754,24 @@ export type AppState = {
    */
   callMediaFor: string | null;
   /**
+   * What the microphone this page holds is doing, read off its TRACK — or null where this page
+   * holds none.
+   *
+   * It is what the window carrying the call draws its own Mute from (`callShowsMuted`), and it
+   * is stated on the stage (`data-microphone`). Not the backend's `muted`: that moves on a
+   * press from any window and can be a round trip — or a lost request — away from what the
+   * track is doing, and the track is what the far side hears.
+   */
+  callMicrophone: CallMicrophone | null;
+  /**
+   * True while THIS page has a call start in flight — from the click until its microphone is
+   * adopted or the start gives up. The stage is already up then (a call that is dialling, a
+   * meeting that is joining) while the microphone, and its permission prompt, is still opening,
+   * and this page is the window about to carry the audio: so its Unmute is not refused
+   * (`unmuteRefusal`), and a press there is kept for the microphone it will hold.
+   */
+  callStarting: boolean;
+  /**
    * Whose picture is on each section, keyed by mid.
    *
    * A section says what it carries (a screen, a camera) and never WHOSE it is: the person is
@@ -1295,6 +1320,8 @@ function initialState(): AppState {
     callVideo: [],
     callLocalVideo: [],
     callMediaFor: null,
+    callMicrophone: null,
+    callStarting: false,
     callVideoNames: {},
     callRecording: null,
     recordings: [],
@@ -2424,8 +2451,11 @@ export class TeamsController {
       // frame that ended a call may have gone out while this socket was down — a backend that
       // restarted drops its call without a frame at all. Without this a page kept its stage,
       // and its microphone, for a call that exists nowhere; the read reconciles both
-      // (`refreshCallStatus`), and says why the call went.
-      void this.refreshCallStatus();
+      // (`refreshCallStatus`), and says why the call went. A mute this page pressed while
+      // the socket was down is sent again from that same fresh read, and only from it.
+      void this.refreshCallStatus().then((status) => {
+        if (status) void this.resendPendingMute(status);
+      });
       if (this.connectionDropped) {
         this.connectionDropped = false;
         void this.handleLiveRecovery();
@@ -2603,6 +2633,25 @@ export class TeamsController {
    *  it. Its observable half is `callStatus`. */
   private callMedia: CallMedia | null = null;
 
+  /** A mute press this page made on the microphone it holds — or is opening — until a newer
+   *  frame has decided it. See `PendingMute` and `followMuteFrame` in lib/call.ts. */
+  private pendingMute: PendingMute | null = null;
+
+  /** The newest `mute_seq` this page has applied to the microphone it holds, per call, so a
+   *  frame older than one already applied is not read as news (`followMuteFrame` says why that
+   *  can happen). */
+  private appliedMuteSeq: AppliedMuteSeq | null = null;
+
+  /** Counts this page's mute presses, so only the answer to the NEWEST one is read
+   *  (`followMuteAnswer` in lib/call.ts): an answer to an older press says nothing about what
+   *  the user asked for last. */
+  private mutePress = 0;
+
+  /** The start this page has in flight, from the click until its microphone is adopted or the
+   *  start gives up. While it holds, this page is the window ABOUT to carry the call's audio,
+   *  so a Mute pressed on its stage is its own (see `callStarting` and `setCallMuted`). */
+  private startingAttempt: number | null = null;
+
   /** Which start the page is on. A hang-up moves it, so a start still in flight learns
    *  that the user changed their mind.
    *
@@ -2621,6 +2670,19 @@ export class TeamsController {
     return attempt === this.callAttempt;
   }
 
+  /** Mark start `attempt` as in flight on this page (`startingAttempt`). */
+  private beginCallStart(attempt: number): void {
+    this.startingAttempt = attempt;
+    if (!this.get().callStarting) this.set({ callStarting: true });
+  }
+
+  /** The start `attempt` adopted its microphone, or gave up. A newer start is left alone. */
+  private endCallStart(attempt: number): void {
+    if (this.startingAttempt !== attempt) return;
+    this.startingAttempt = null;
+    if (this.get().callStarting) this.set({ callStarting: false });
+  }
+
   /** Which backend process the held media was opened against (its `backend_started_ms`), so
    *  a page that reconnects to find the call gone can say whether a restart took it. */
   private callMediaBackendStartedMs: number | null = null;
@@ -2634,6 +2696,7 @@ export class TeamsController {
    *  same reason a capture somehow still held is released before a new one is taken — one
    *  call, one microphone. */
   private adoptCallMedia(media: CallMedia, attempt: number, callId: string): boolean {
+    this.endCallStart(attempt);
     if (!this.callAttemptStands(attempt)) {
       media.stop();
       return false;
@@ -2641,8 +2704,118 @@ export class TeamsController {
     if (this.callMedia && this.callMedia !== media) this.stopCallMedia();
     this.callMedia = media;
     this.callMediaBackendStartedMs = this.get().callStatus.backend_started_ms ?? null;
-    this.set({ callMediaFor: callId });
+    // A press made on this page's stage while the microphone was still opening is this page's
+    // own, and is kept; anything else belongs to another call.
+    if (this.pendingMute?.callId !== callId) this.pendingMute = null;
+    this.appliedMuteSeq = null;
+    this.set({ callMediaFor: callId, callMicrophone: media.muted ? "muted" : "live" });
+    // The capture opens live, and a Mute pressed while it was opening — here or in another
+    // window — is already in the state, so it is applied now rather than on whichever frame
+    // happens to come next.
+    this.applyMuteFrame(this.get().callStatus.call);
     return true;
+  }
+
+  /** Mute or unmute the TRACK this page holds, and say so in the state the button reads. */
+  private setTrackMuted(muted: boolean): void {
+    const media = this.callMedia;
+    if (!media) return;
+    media.setMuted(muted);
+    this.set({ callMicrophone: media.muted ? "muted" : "live" });
+  }
+
+  /**
+   * Apply one frame of call state to the microphone this page holds (`followMuteFrame` in
+   * lib/call.ts — a frame may close it, and never opens it), and forget this page's own press
+   * once a newer frame has decided it.
+   *
+   * Nothing happens in a page that holds no microphone: its button reads the backend's state
+   * directly. A page still OPENING one applies the state the moment it is adopted.
+   */
+  private applyMuteFrame(call: ActiveCall | null): void {
+    const media = this.callMedia;
+    const callId = this.get().callMediaFor;
+    if (!media || !call || callId === null) return;
+    const next = followMuteFrame({
+      call,
+      callId,
+      trackOpen: !media.muted,
+      pending: this.pendingMute,
+      applied: this.appliedMuteSeq,
+    });
+    if (!next) return;
+    this.appliedMuteSeq = next.applied;
+    this.pendingMute = next.pending;
+    if (next.open === media.muted) this.setTrackMuted(!next.open);
+  }
+
+  /**
+   * Apply the backend's ANSWER to press `press` (`followMuteAnswer` in lib/call.ts): when it is
+   * this page's newest press and nothing newer has been decided, it is the decision, so the
+   * track follows it — which is what settles Mute then Unmute pressed inside one round trip.
+   */
+  private applyMuteAnswer(
+    press: number,
+    callId: string,
+    muted: boolean,
+    answerSeq: number | undefined,
+  ): void {
+    const media = this.callMedia;
+    if (press !== this.mutePress || !media || this.get().callMediaFor !== callId) return;
+    const open = followMuteAnswer({ muted, answerSeq, applied: this.appliedMuteSeq, callId });
+    if (open === null || typeof answerSeq !== "number") return;
+    // Decided: the press is no longer waiting, and nothing older than it is news any more.
+    if (this.pendingMute?.callId === callId) this.pendingMute = null;
+    this.appliedMuteSeq = { callId, seq: answerSeq };
+    if (open === media.muted) this.setTrackMuted(!open);
+  }
+
+  /**
+   * Press `press`, which this page made on the microphone it holds (or is opening), did not
+   * arrive — refused, or its answer lost.
+   *
+   * A MUTE stays applied: the track is closed, which is the safe direction whatever happened,
+   * and it is marked so the next reconnect sends it once. An UNMUTE takes itself back — the
+   * track closes again and is never re-sent — because the backend, the meeting and every other
+   * window still say "muted", and a microphone left live under that is the one state no other
+   * window could do anything about. Opening it later, on a reconnect, would open it on a press
+   * the user watched fail. Nothing is taken back when a newer frame or a newer press has
+   * already decided it.
+   */
+  private muteDidNotArrive(press: number, callId: string, muted: boolean): void {
+    const pending = this.pendingMute;
+    if (press !== this.mutePress || !pending || pending.callId !== callId) return;
+    if (muted) {
+      this.pendingMute = { ...pending, failed: true };
+      return;
+    }
+    this.pendingMute = null;
+    if (this.get().callMediaFor === callId) this.setTrackMuted(true);
+  }
+
+  /**
+   * Send again, ONCE, a Mute this page made on the microphone it holds that did not reach the
+   * backend — now that a fresh `call_status` read says where the call stands.
+   *
+   * `status` must be that fresh read and never the page's last copy: the copy is from before
+   * the socket dropped, and a press made on another device during the outage is exactly what it
+   * cannot show. `muteToResend` (lib/call.ts) says when a re-send is not a decision, and the
+   * press names the sequence it was made at (`if_seq`) so the backend refuses it if another
+   * press was recorded while it travelled.
+   */
+  private async resendPendingMute(status: CallStatus): Promise<void> {
+    const pending = this.pendingMute;
+    const call = status.call;
+    if (!pending || !this.callMedia || !call || this.get().callMediaFor !== call.id) return;
+    if (!muteToResend(pending, call)) return;
+    this.pendingMute = { ...pending, resent: true };
+    const press = ++this.mutePress;
+    try {
+      const answer = await this.backend.callMute(pending.callId, pending.muted, pending.afterSeq);
+      this.applyMuteAnswer(press, pending.callId, pending.muted, answer.mute_seq);
+    } catch (error) {
+      console.error("[call] the mute did not reach the service when sent again either", error);
+    }
   }
 
   /** Fold one `call_state` frame in, and stop the microphone when the call is over.
@@ -2658,10 +2831,15 @@ export class TeamsController {
     this.set({ callStatus: status });
     const call = status.call;
     if (!callStillHoldsMedia(call, this.get().callMediaFor)) this.stopCallMedia();
-    // Otherwise: a roster frame is how somebody arriving becomes a name, so a running
-    // recording collects them here — the people named in the file are everybody who was in
-    // the call while it ran, not everybody who was in it when it started.
-    else this.syncRecorder();
+    else {
+      // A Mute pressed in another window reaches the microphone HERE: every frame carries
+      // the newest press, and this page holds the track it has to close.
+      this.applyMuteFrame(call);
+      // A roster frame is how somebody arriving becomes a name, so a running recording
+      // collects them here — the people named in the file are everybody who was in the call
+      // while it ran, not everybody who was in it when it started.
+      this.syncRecorder();
+    }
     // A live call says nothing, and — importantly — takes nothing back. Clearing the
     // notice here looked right and was wrong: these frames arrive throughout a call (a
     // roster, a renegotiation, a camera going on), so the first one after a refused
@@ -2847,7 +3025,11 @@ export class TeamsController {
     this.callMedia?.stop();
     this.callMedia = null;
     this.callMediaBackendStartedMs = null;
-    if (this.get().callMediaFor !== null) this.set({ callMediaFor: null });
+    this.pendingMute = null;
+    this.appliedMuteSeq = null;
+    if (this.get().callMediaFor !== null || this.get().callMicrophone !== null) {
+      this.set({ callMediaFor: null, callMicrophone: null });
+    }
     // The tiles go with the connection that fed them. A `<video>` left holding a stopped
     // stream shows its last frame for good, which reads as a call that is still up.
     if (this.get().callVideo.length > 0 || this.get().callLocalVideo.length > 0) {
@@ -3072,16 +3254,16 @@ export class TeamsController {
    *  call began can never take that call's microphone away. A read that FAILS decides
    *  nothing: it says nothing about the call, and a page holding a call's microphone keeps
    *  the status that call is drawn from — its Hang up included. */
-  async refreshCallStatus(): Promise<void> {
+  async refreshCallStatus(): Promise<CallStatus | null> {
     const heldWhenAsked = this.callMedia;
     let status: CallStatus;
     try {
       status = await this.backend.callStatus();
     } catch {
-      if (this.callMedia) return;
+      if (this.callMedia) return null;
       // An older backend has no `call_status`; the unknown state is the safe reading.
       this.set({ callStatus: UNKNOWN_CALL_STATUS });
-      return;
+      return null;
     }
     const heldFor = this.get().callMediaFor;
     const startedWith = this.callMediaBackendStartedMs;
@@ -3094,6 +3276,10 @@ export class TeamsController {
     if (lost) this.stopCallMedia();
     this.set({ callStatus: status });
     if (lost) this.reportCall(lostCallMessage(startedWith, status.backend_started_ms), "report");
+    // A read is a frame like any other for the microphone: a Mute pressed in another window
+    // while this one could not hear is applied here.
+    else this.applyMuteFrame(status.call);
+    return status;
   }
 
   /** Place a call in a one-to-one chat: reserve it, open the microphone, send the
@@ -3106,6 +3292,9 @@ export class TeamsController {
     // Set the moment the creating request is about to leave: before it, nothing reached
     // anybody; after it, only a REFUSAL may be acted on.
     let posted = false;
+    // From here until the microphone is adopted the stage is up and this page is the one about
+    // to carry the call's audio (see `callStarting`).
+    this.beginCallStart(attempt);
     try {
       const prepared = await this.backend.callPrepare({ conversation: conversationId });
       callId = prepared.call_id;
@@ -3138,6 +3327,8 @@ export class TeamsController {
       // thinks it is dialling refuses the next call.
       if (callId) await this.hangUpCall();
       await this.refreshCallStatus();
+    } finally {
+      this.endCallStart(attempt);
     }
   }
 
@@ -3156,6 +3347,7 @@ export class TeamsController {
     const attempt = ++this.callAttempt;
     let callId: string | null = null;
     let posted = false;
+    this.beginCallStart(attempt);
     try {
       const prepared = await this.backend.callPrepare({ meeting, subject });
       callId = prepared.call_id;
@@ -3175,6 +3367,8 @@ export class TeamsController {
       this.stopCallMedia();
       if (callId) await this.hangUpCall();
       await this.refreshCallStatus();
+    } finally {
+      this.endCallStart(attempt);
     }
   }
 
@@ -3476,18 +3670,62 @@ export class TeamsController {
     this.set({ recordings: this.get().recordings.filter((recording) => recording.id !== id) });
   }
 
-  /** Mute or unmute. The microphone stops first and the service is told second, so the
-   *  user is never live for the round trip. */
+  /**
+   * Mute or unmute, from whichever window the press is made in.
+   *
+   * In the window that carries the call's audio the TRACK moves first and the backend is told
+   * second, so the user is never live for the round trip — and the press is kept
+   * (`pendingMute`) until a newer frame or the backend's answer has decided it, so a frame that
+   * went out before it cannot undo it. A press that did not arrive is handled by
+   * `muteDidNotArrive`. A window still opening its microphone for the call it is starting is
+   * that window too: its press is kept and applied the moment the microphone is adopted.
+   *
+   * A window that does NOT carry the audio only tells the backend, and the window that does
+   * closes its microphone on the frame that follows. It may mute and may not unmute: a frame
+   * never opens a microphone (lib/call.ts), so its Unmute would change what the meeting is told
+   * and nothing anybody could hear. Its button reads the backend's state, so nothing is written
+   * here ahead of the answer — a failure there would leave a button saying "muted" over a
+   * microphone that is live, which is the one lie this control must never tell.
+   */
   async setCallMuted(muted: boolean): Promise<void> {
     const call = this.get().callStatus.call;
     if (!call) return;
-    this.callMedia?.setMuted(muted);
-    // Reflect it now: the button must follow the microphone, not the network.
-    this.set({ callStatus: { ...this.get().callStatus, call: { ...call, muted } } });
+    const holdsMicrophone = this.callMedia !== null && this.get().callMediaFor === call.id;
+    const opening = this.callMedia === null && this.get().callStarting;
+    const ownPress = holdsMicrophone || opening;
+    if (!ownPress && !muted) return;
+    const press = ++this.mutePress;
+    if (ownPress) {
+      const applied = this.appliedMuteSeq?.callId === call.id ? this.appliedMuteSeq.seq : -1;
+      this.pendingMute =
+        typeof call.mute_seq === "number"
+          ? {
+              callId: call.id,
+              muted,
+              afterSeq: Math.max(call.mute_seq, applied),
+              failed: false,
+              resent: false,
+            }
+          : null;
+      if (holdsMicrophone) this.setTrackMuted(muted);
+    }
     try {
-      await this.backend.callMute(call.id, muted);
+      const answer = await this.backend.callMute(call.id, muted);
+      this.applyMuteAnswer(press, call.id, muted, answer.mute_seq);
     } catch (error) {
       console.error("[call] the mute did not reach the service", error);
+      if (ownPress) {
+        this.muteDidNotArrive(press, call.id, muted);
+        return;
+      }
+      // Said only where nothing closed at the press, only for a press KNOWN not to have been
+      // recorded — a lost answer may have been, and its frame already closed the microphone —
+      // and only while that call is still up: a sentence about a mute that did not arrive must
+      // not replace the one saying why the call ended.
+      const now = this.get().callStatus.call;
+      if (!requestOutcomeUnknown(error) && isLive(now) && now?.id === call.id) {
+        this.reportCall(MUTE_DID_NOT_ARRIVE, "error");
+      }
     }
   }
 

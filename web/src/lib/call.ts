@@ -58,7 +58,16 @@ export type ActiveCall = {
   /** How many of `others` are themselves still in the lobby — people who cannot hear
    *  the user yet. */
   waiting_in_lobby: number;
+  /** Whether the user asked to be muted — the newest press, from whichever window made it.
+   *  The window that carries the call's audio closes its microphone on it and never opens one
+   *  because of it ({@link microphoneShouldBeOpen}); every other window draws its button from
+   *  it. */
   muted: boolean;
+  /** How many mute presses the backend has accepted for this call, so a window waiting on its
+   *  own press can tell a frame that already reflects it from one that went out before it.
+   *  ABSENT from a backend too old to count them — which reads as today's behaviour: a frame
+   *  then never touches the microphone at all. */
+  mute_seq?: number;
   /** When audio started (epoch ms), so a duration counts from the backend's clock. */
   connected_at_ms: number | null;
   /** Why it ended, on the one frame that says it did. */
@@ -241,6 +250,209 @@ export function callStillHoldsMedia(call: ActiveCall | null, heldFor: string | n
 export function callIsStillRinging(call: ActiveCall | null, callId: string): boolean {
   return !!call && call.id === callId && call.phase === "ringing" && call.can_accept;
 }
+
+// ---------------------------------------------------------------------------
+// The microphone follows the call (incoming-and-conversation M1)
+// ---------------------------------------------------------------------------
+//
+// A call is drawn in every window that has the app open, and only ONE of them carries its
+// audio: the window that placed or answered it. Mute pressed anywhere has to silence THAT
+// microphone — before this, Mute on the phone published a mute while the laptop went on
+// sending the user's voice. So every window reads the backend's `muted`, and the window that
+// holds the microphone applies each frame to its track. The whole of the rules below is the
+// direction a mistake may go in: a frame may CLOSE a microphone, and only this window's own
+// press OPENS one — at the press, or when the backend answers that press.
+
+/** What the microphone this window holds is doing, read off the track itself. */
+export type CallMicrophone = "live" | "muted";
+
+/**
+ * A mute press this window made on the microphone it holds (or is opening), until the backend
+ * has decided it.
+ *
+ * The track moves at the press, and the backend is told after it, so for a round trip — or
+ * for good, when the request never arrives — the backend's state is from BEFORE the press.
+ * Every frame in that window (a roster, a renegotiation) still carries that older state, and
+ * read as an answer it would undo the press. `afterSeq` is the backend's `mute_seq` when the
+ * press was made, which is what tells a frame from before the press apart from one after it.
+ */
+export type PendingMute = {
+  callId: string;
+  muted: boolean;
+  /** The backend's `mute_seq` at the press: a frame at or below it went out before the press. */
+  afterSeq: number;
+  /** Whether the request was REFUSED or lost on the way. Only a failed Mute is ever kept with
+   *  this set — a failed Unmute takes itself back (see the store's `setCallMuted`) — and only a
+   *  failed press is sent again after a reconnect. */
+  failed: boolean;
+  /** Whether it has already been sent again after a reconnect. It is sent again at most once. */
+  resent: boolean;
+};
+
+/**
+ * Whether the microphone this window holds should be open once a frame of call state arrives.
+ *
+ * 1. A frame that went out before this window's own press says nothing about it: the press
+ *    stands, whatever the frame says. That is what keeps an Unmute just pressed open when a
+ *    roster that predates it still says muted.
+ * 2. A newer frame saying muted closes the microphone, whoever pressed — Mute in any window
+ *    silences the one microphone that is live.
+ * 3. Otherwise a frame leaves the microphone as it is. A frame never OPENS one: a window that
+ *    does not carry the audio may mute it and may not unmute it, and this window's own Unmute
+ *    is opened at the press and confirmed by the backend's answer ({@link followMuteAnswer}).
+ *
+ * `pending` is this window's press on THIS call, already filtered by the caller. A server mute
+ * is not an input yet: meeting-awareness M6 adds it as the rule above all three.
+ */
+export function microphoneShouldBeOpen(input: {
+  trackOpen: boolean;
+  backendMuted: boolean;
+  backendSeq: number;
+  pending: PendingMute | null;
+}): boolean {
+  const { trackOpen, backendMuted, backendSeq, pending } = input;
+  if (pending && backendSeq <= pending.afterSeq) return !pending.muted;
+  if (backendMuted) return false;
+  return trackOpen;
+}
+
+/**
+ * The press still waiting once a frame at `backendSeq` has been applied.
+ *
+ * It is forgotten at the FIRST frame newer than it, whether or not that frame agrees with it —
+ * stricter than waiting for the frame that confirms it, and the strictness is the point. A
+ * newer frame means the backend has decided this press or another made after it was recorded;
+ * a press kept past that would let a LATER frame be read against a stale intention, and be
+ * sent again over a press made since. What it costs is the safe direction only: a frame that
+ * answers one of this window's OWN earlier presses forgets the newer one too, and closes the
+ * microphone if it said muted — which the backend's answer to the newer press then puts right
+ * ({@link followMuteAnswer}).
+ */
+export function pendingMuteAfterFrame(
+  pending: PendingMute | null,
+  backendSeq: number,
+): PendingMute | null {
+  return pending && backendSeq > pending.afterSeq ? null : pending;
+}
+
+/** The newest `mute_seq` this window has applied to the microphone it holds, for one call. */
+export type AppliedMuteSeq = { callId: string; seq: number };
+
+/**
+ * What one frame of call state does to the microphone this window holds: whether the track
+ * should be open, the press still waiting, and the newest sequence applied — or `null` when the
+ * frame says nothing about the track.
+ *
+ * It says nothing in three cases. A backend too old to count presses sends no `mute_seq`, and
+ * there a frame never touched the track, so it still does not. A frame about another call is
+ * not this call's. And a frame OLDER than one already applied is stale: frames are built under
+ * the backend's lock and sent after it, by whichever task changed the call, so two of them can
+ * reach the socket in the other order.
+ */
+export function followMuteFrame(input: {
+  call: ActiveCall;
+  callId: string;
+  trackOpen: boolean;
+  pending: PendingMute | null;
+  applied: AppliedMuteSeq | null;
+}): { open: boolean; pending: PendingMute | null; applied: AppliedMuteSeq } | null {
+  const { call, callId, trackOpen, applied } = input;
+  if (call.id !== callId || typeof call.mute_seq !== "number") return null;
+  const seq = call.mute_seq;
+  if (applied && applied.callId === callId && seq < applied.seq) return null;
+  const pending = input.pending?.callId === callId ? input.pending : null;
+  return {
+    open: microphoneShouldBeOpen({ trackOpen, backendMuted: call.muted, backendSeq: seq, pending }),
+    pending: pendingMuteAfterFrame(pending, seq),
+    applied: { callId, seq },
+  };
+}
+
+/**
+ * What the backend's ANSWER to this window's newest press does to the microphone it holds:
+ * the state to put the track in, or `null` to leave it.
+ *
+ * The answer names the sequence the press was recorded at. When nothing newer than it has been
+ * applied here, that press IS the backend's newest decision, so the track follows it — open for
+ * an Unmute, closed for a Mute. It exists for the press a frame cannot settle: Mute then Unmute
+ * inside one round trip, where the frame for the Mute is newer than the Unmute's `afterSeq`,
+ * closes the microphone and forgets the Unmute, and the frame for the Unmute then finds nothing
+ * to open it with. It opens a microphone only for this window's own press, and only while no
+ * other press has been decided since — so a Mute from another window recorded after it still
+ * wins, on its own frame.
+ */
+export function followMuteAnswer(input: {
+  muted: boolean;
+  answerSeq: number | undefined;
+  applied: AppliedMuteSeq | null;
+  callId: string;
+}): boolean | null {
+  const { muted, answerSeq, applied, callId } = input;
+  if (typeof answerSeq !== "number") return null;
+  if (applied && applied.callId === callId && applied.seq > answerSeq) return null;
+  return !muted;
+}
+
+/**
+ * Whether a press that did not arrive is sent again, now that the page has reconnected.
+ *
+ * Only a failed MUTE, once, for the same call, and only while the backend has decided NO press
+ * since it (`mute_seq` has not moved past it). That last condition is what keeps this from
+ * being a decision: it delivers the user's own press that was lost on the way, never one a
+ * later press has already overtaken — and the backend checks it again (`if_seq`), because the
+ * read this is decided on is a round trip old by the time the press arrives. A failed Unmute is
+ * never sent again: it took itself back, and the button has said "muted" since — opening the
+ * microphone at the next reconnect would open it on a press the user saw fail. Whether this
+ * window still holds the call's microphone is the caller's to check.
+ */
+export function muteToResend(pending: PendingMute | null, call: ActiveCall | null): boolean {
+  return (
+    !!pending &&
+    pending.failed &&
+    pending.muted &&
+    !pending.resent &&
+    !!call &&
+    isLive(call) &&
+    call.id === pending.callId &&
+    typeof call.mute_seq === "number" &&
+    call.mute_seq <= pending.afterSeq
+  );
+}
+
+/** Whether a window draws the user as muted: its own TRACK where it holds the microphone,
+ *  and the backend's state everywhere else. The track is the truth that can be heard — a
+ *  button that followed the backend there would say "live" over a press that failed to
+ *  arrive. */
+export function callShowsMuted(call: ActiveCall, microphone: CallMicrophone | null): boolean {
+  return microphone ? microphone === "muted" : call.muted;
+}
+
+/** Why this window may not unmute, or `null` where it may. Only the window that carries the
+ *  call's audio unmutes it — a frame never opens a microphone, so an Unmute anywhere else would
+ *  change what the meeting is told and nothing anybody can hear. A window still OPENING its
+ *  microphone for the call it is starting is that window, so it may. Said without claiming
+ *  WHERE the audio is: this window cannot tell another window holding it from a reload that
+ *  lost it (that is incoming-and-conversation M8). */
+export function unmuteRefusal(
+  call: ActiveCall,
+  microphone: CallMicrophone | null,
+  starting: boolean,
+): string | null {
+  return microphone === null && !starting && call.muted ? UNMUTE_REFUSED_HERE : null;
+}
+
+/** The sentence a window that does not carry the call's audio says beside its disabled Unmute. */
+export const UNMUTE_REFUSED_HERE = "This window does not carry the call's audio, so it cannot unmute you.";
+
+/** The same fact in the folded window's one short line, which has room for a few words. */
+export const UNMUTE_REFUSED_HERE_SHORT = "Muted · no audio in this window";
+
+/** What a window that does not carry the call's audio says when its Mute was REFUSED — and only
+ *  then: an answer that was merely lost may have been recorded, and saying "nothing was muted"
+ *  over a microphone the frame already closed would be false. Silence would be worse than in the
+ *  window that holds the microphone: there the track closed at the press, while here nothing
+ *  closed at all. */
+export const MUTE_DID_NOT_ARRIVE = "The mute did not reach the call, so nothing was muted. Try again.";
 
 /**
  * What a page says when it reconnects holding a microphone for a call the backend no longer has.
