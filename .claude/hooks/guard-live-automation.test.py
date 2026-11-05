@@ -871,6 +871,44 @@ EXAMPLE_FIXTURES = {
         "    println!(\"{}\", backend::probe(&Default::default(), \"true\"));\n"
         "}\n"
     ),
+    # The CALLING PLANE, which has no sandbox: an example reaches Teams' calling service with a
+    # broker token past every gate the app has. A signal posted by hand, a body built through a
+    # grouped import, and a body builder that does not exist yet — the `*_payload` shape is what
+    # is matched, so the next one is covered with no change to the hook.
+    "guard-test-call-signal.rs": (
+        "// Hangs up whatever call it is told about.\n"
+        "use teams_lite::calling;\n"
+        "fn main() { let url = std::env::args().nth(1).unwrap();\n"
+        "  calling::post_signal(&http, &ic3, &url, &body); }\n"
+    ),
+    "guard-test-call-grouped-import.rs": (
+        "use teams_lite::calling::{endpoints, hangup_payload};\n"
+        "fn main() { let body = hangup_payload(&local); }\n"
+    ),
+    "guard-test-call-future-body.rs": (
+        "fn main() { let body = teams_lite::calling::decline_payload(); }\n"
+    ),
+    # RINGING somebody is refused whatever the file pins — a meeting rings nobody, and the one
+    # person this machine may ring for a test is rung through the app, by call-live.
+    "guard-test-call-ring.rs": (
+        "const MEETING_SUBJECT: &str = \"Onboard\";\n"
+        "fn main() { teams_lite::calling::place_call(&http, &ic3, &endpoints, &body); }\n"
+    ),
+    # The sanctioned probe's own shape under another name: the allowlist is a PATH, so a copy is
+    # not the probe.
+    "guard-test-call-probe-copy.rs": (
+        "const MEETING_SUBJECT: &str = \"Onboard\";\n"
+        "use teams_lite::calling;\n"
+        "fn main() { calling::join_meeting(&http, &ic3, &endpoints, &join, &cb, None);\n"
+        "  calling::post_signal(&http, &ic3, &leave, &calling::hangup_payload(&local)); }\n"
+    ),
+    # READING what the service says is open: the parsers, the directory, a join link's parse.
+    "guard-test-call-read.rs": (
+        "use teams_lite::calling;\n"
+        "fn main() { let e = calling::endpoints(&session);\n"
+        "  let j = calling::MeetingJoin::from_join_url(&url);\n"
+        "  let a = calling::media_answer_from_frame(&frame); }\n"
+    ),
 }
 
 
@@ -1220,6 +1258,15 @@ def cases(tmp: Path):
         ),
         # A cargo example reaches the whole lifecycle through the crate, in each of the three ways
         # Rust reaches a function that the scan follows, and the repair through teams-lite's own module.
+        # The calling plane from a cargo example: a signal, a body by grouped import, a body
+        # builder by its shape, a ring that pins a meeting (refused whatever it pins), and the
+        # sanctioned probe's shape under another name.
+        ("BLOCK", PROJECT, "cargo run --example guard-test-call-signal"),
+        ("BLOCK", PROJECT, "cargo run --example guard-test-call-grouped-import"),
+        ("BLOCK", PROJECT, "cargo run --example guard-test-call-future-body"),
+        ("BLOCK", PROJECT, "cargo run --example guard-test-call-ring"),
+        ("BLOCK", PROJECT, "cargo run --example guard-test-call-probe-copy"),
+        ("BLOCK", PROJECT, "timeout 60 cargo run --example guard-test-call-signal"),
         ("BLOCK", PROJECT, "cargo run --example guard-test-crate-stop"),
         ("BLOCK", PROJECT, "cargo run --example guard-test-crate-restart"),
         ("BLOCK", PROJECT, "cargo run --example guard-test-crate-grouped-import"),
@@ -1897,6 +1944,13 @@ def cases(tmp: Path):
         ("ALLOW", PROJECT, f"bun run {tmp}/emoji-reader.ts"),
         ("ALLOW", PROJECT, "cargo run --example guard-test-signin-read"),
         ("ALLOW", PROJECT, "cargo run --example signin_window_recon"),
+        # The sanctioned probe (its meeting is a constant), the recon, a reader of the plane, and
+        # every search that merely NAMES a sender.
+        ("ALLOW", PROJECT, "cargo run --example meeting_join_probe"),
+        ("ALLOW", PROJECT, "cargo run --example meeting_join_recon"),
+        ("ALLOW", PROJECT, "cargo run --example guard-test-call-read"),
+        ("ALLOW", PROJECT, "grep -rn 'calling::post_signal' examples/ src/"),
+        ("ALLOW", PROJECT, "cargo test --lib calling::"),
         ("ALLOW", PROJECT, f"bun run {tmp}/signin-asker.ts"),
         ("ALLOW", PROJECT, f"bun run {tmp}/persona-reader.ts"),
         ("ALLOW", PROJECT, f"bun run {tmp}/update-checker.ts"),
@@ -2502,6 +2556,47 @@ def flattened(text: str) -> str:
     return re.sub(r"\s+", " ", text.replace("\\\n", " "))
 
 
+# THE SANCTIONED PROBE'S OWN PATH. Every example fixture above is written as
+# examples/<stem>-run<pid>.rs, which can never be the allowlisted examples/meeting_join_probe.rs —
+# so the two rules that apply to THAT file alone (ringing is refused even there, and the file must
+# still carry its exact pin) would pass any mutation. These run the hook against a temporary
+# project holding its own copy of that path, and touch nothing in the shared checkout.
+SANCTIONED_PROBE_CASES = [
+    ("ALLOW", 'const MEETING_SUBJECT: &str = "Onboard";\n'
+              "fn main() { calling::join_meeting(a); calling::post_signal(b, &calling::hangup_payload(c)); }\n"),
+    # The pin moved to a commoner word: the probe would join whatever meeting that word matches.
+    ("BLOCK", 'const MEETING_SUBJECT: &str = "Weekly";\nfn main() { calling::join_meeting(a); }\n'),
+    # The pin dropped altogether.
+    ("BLOCK", "fn main() { calling::join_meeting(a); }\n"),
+    # Ringing somebody, from the sanctioned file itself, with its pin intact.
+    ("BLOCK", 'const MEETING_SUBJECT: &str = "Onboard";\nfn main() { calling::place_call(a); }\n'),
+    ("BLOCK", 'const MEETING_SUBJECT: &str = "Onboard";\nfn main() { let b = calling::invitation_payload(a); }\n'),
+]
+
+
+def check_sanctioned_probe() -> int:
+    failures = 0
+    with tempfile.TemporaryDirectory() as raw:
+        project = Path(raw)
+        (project / "examples").mkdir()
+        probe = project / "examples" / "meeting_join_probe.rs"
+        for expected, body in SANCTIONED_PROBE_CASES:
+            probe.write_text(body)
+            proc = subprocess.run(
+                [str(HOOK)],
+                input=json.dumps({"tool_input": {"command": "cargo run --example meeting_join_probe"}}),
+                capture_output=True,
+                text=True,
+                cwd=project,
+                env={"CLAUDE_PROJECT_DIR": str(project), "HOME": str(Path.home()), "PATH": "/usr/bin:/bin"},
+            )
+            got = "ALLOW" if proc.returncode == 0 else "BLOCK"
+            failures += 0 if got == expected else 1
+            first = body.splitlines()[0]
+            print(f"{'ok  ' if got == expected else 'FAIL'} {got:5} (want {expected}) <- sanctioned probe: {first}")
+    return failures
+
+
 def check_advice() -> int:
     failures = 0
     for trigger, recommended, retired in advice_cases():
@@ -2543,11 +2638,14 @@ def main() -> int:
                 path.unlink(missing_ok=True)
 
     advice_failures = check_advice()
+    probe_failures = check_sanctioned_probe()
     total = len(cases(Path("/tmp")))
     print(f"\n{total - failures}/{total} as expected")
     advice_total = len(advice_cases())
     print(f"{advice_total - advice_failures}/{advice_total} refusals recommend what works")
-    return 1 if failures or advice_failures else 0
+    probe_total = len(SANCTIONED_PROBE_CASES)
+    print(f"{probe_total - probe_failures}/{probe_total} sanctioned-probe shapes as expected")
+    return 1 if failures or advice_failures or probe_failures else 0
 
 
 if __name__ == "__main__":

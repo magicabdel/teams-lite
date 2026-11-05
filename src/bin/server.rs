@@ -2179,9 +2179,71 @@ struct CallingPlane {
     /// Where the registration stands — the reason behind `ready` being false. See
     /// [`Registration`].
     registration: Registration,
+    /// Which frames the routing has already said something about (see [`FrameNotes`]).
+    frame_notes: FrameNotes,
+}
+
+/// The kinds of frame the routing in `handle_call_frame` has already journaled, so the journal
+/// carries one line per KIND rather than one per frame — a conversation that keeps posting to a
+/// call this machine let go of would otherwise write a line a second for as long as it lasts.
+///
+/// Bounded, because a backend stays up for weeks and sees many calls: a set that only grew would
+/// be a slow leak paid for a log line. Clearing it whole costs, at worst, one repeated line per
+/// kind.
+#[derive(Default)]
+struct FrameNotes {
+    seen: std::collections::HashSet<String>,
+}
+
+impl FrameNotes {
+    const MAX_KINDS: usize = 256;
+
+    /// Whether `kind` is new here — and remember it either way.
+    fn first(&mut self, kind: String) -> bool {
+        if self.seen.contains(&kind) {
+            return false;
+        }
+        if self.seen.len() >= Self::MAX_KINDS {
+            self.seen.clear();
+        }
+        self.seen.insert(kind)
+    }
 }
 
 impl CallingPlane {
+    /// Route one frame by the call session its address names (see [`calling::frame_route`]):
+    /// whether `handle_call_frame` goes on with it, and the journal line it owes — `Some` only
+    /// the first time this kind of frame is seen.
+    ///
+    /// A frame ADDRESSED to another session stops here and is said once per session and door.
+    /// A frame whose address names NO session goes on, handled as before, and is said once per
+    /// address. Neither line names a session or the surl, which are keys: the door is our own
+    /// path, and an unaddressed address is printed with the surl cut off it.
+    fn route_frame(&mut self, url: &str) -> (bool, Option<String>) {
+        let live = self.call.as_ref().map(|call| call.callbacks.session_id.clone());
+        match calling::frame_route(url, live.as_deref()) {
+            calling::FrameRoute::Ours => (true, None),
+            calling::FrameRoute::Elsewhere { session } => {
+                let door = calling::callback_path(url);
+                let said = self.frame_notes.first(format!("elsewhere\n{session}\n{door}")).then(|| {
+                    format!(
+                        "[calling] ignored a frame on {door}: it is addressed to a call session \
+                         that is not the live one here"
+                    )
+                });
+                (false, said)
+            }
+            calling::FrameRoute::Unaddressed => {
+                let surl = self.channel.as_ref().map(|channel| channel.surl.clone());
+                let shape = calling::unaddressed_frame_shape(url, surl.as_deref());
+                let said = self.frame_notes.first(format!("unaddressed\n{shape}")).then(|| {
+                    format!("[calling] a frame on {shape} names no call session — handled as before")
+                });
+                (true, said)
+            }
+        }
+    }
+
     /// The channel a call may be built on RIGHT NOW: registered, and the socket up.
     ///
     /// The ONE predicate behind `ready` and behind both `call_prepare` refusals. The placing
@@ -14972,6 +15034,34 @@ impl Ctx {
 
     /// One decoded frame from the calling socket. This is the whole receive path.
     async fn handle_call_frame(&self, frame: trouter_events::CallFrame) {
+        // THE ORDER OF THIS HANDLER IS A RULE, written down here and pinned by
+        // `handle_call_frame_runs_its_branches_in_the_documented_order`. Several calling
+        // workstreams add a branch to it, each with a constraint on where it may stand
+        // (docs/calling-roadmap/README.md § 3, collision 4), so a branch joins this list in the
+        // change that adds it — in its place, with the reason it stands there:
+        //
+        //    1. relay — the relay description is about this MACHINE, not a call, so it is cached
+        //       whatever the frame is about and whoever it is addressed to.
+        //    2. invite — a new call has no session of ours yet, so it is read before the
+        //       routing, which could only call it somebody else's.
+        //    3. routing — a frame ADDRESSED to another call session stops here (see
+        //       `calling::frame_route`). A frame whose address names NO session still goes on and
+        //       is handled as the live call's, as before, so no branch below may assume a frame is
+        //       addressed to the live call — only that it is not addressed to another.
+        //    4. sharing end — below the routing, because it forgets the LIVE call's session.
+        //    5. sharing granted — likewise, and it returns before the merge: the session's own
+        //       `leave` must never overwrite the one a hangup posts to.
+        //    6. merge — the frame's links join the live call's; a call that has ended takes none.
+        //    7. invite failed — the cause of an ending, which arrives a beat before it.
+        //    8. end — after the cause it prefers.
+        //    9. roster
+        //   10. lobby
+        //   11. acknowledgement — before the phase and the answer, because its clock is the
+        //       service's.
+        //   12. accepted
+        //   13. renegotiation — before the answer: an offer and an answer share one pointer, and
+        //       read the other way round an offer is handed to the page as an answer.
+        //   14. answer
         record_call_frame(&frame);
         // The raw frame still goes to the UI console: the schema is young, and a
         // capture of what really arrived is what corrects it.
@@ -14992,6 +15082,23 @@ impl Ctx {
 
         if let Some(invite) = calling::incoming_call_from_frame(&frame.body) {
             self.handle_incoming_call(invite).await;
+            return;
+        }
+
+        // THE ROUTING. A frame is addressed to the signaling session whose callbacks it arrived
+        // on, and this app used to read none of that: every frame below this line was merged into
+        // the one live call, so a frame from ANY other conversation — a call that had ended, a
+        // ring let go of whose conversation kept posting — could rewrite its links or end it.
+        //
+        // A frame for another session is said ONCE per session and door, then dropped. A frame
+        // whose address names no session at all keeps the handling it always had, and says so
+        // once per address: nothing has measured that such a frame never acts on a call, and the
+        // journal is what will.
+        let (proceed, said) = self.calling.lock().unwrap().route_frame(&frame.url);
+        if let Some(line) = said {
+            eprintln!("{line}");
+        }
+        if !proceed {
             return;
         }
 
@@ -15050,8 +15157,8 @@ impl Ctx {
             return;
         }
 
-        // Everything below is about the call we are already in. A frame for any other
-        // call is not ours to act on — a second call rings the user's other devices.
+        // Everything below is about the call we are already in — the routing above has dropped
+        // a frame addressed to any other — and a call that has ended takes nothing more.
         let links = calling::Links::collect(&frame.body);
         let mine = {
             let mut plane = self.calling.lock().unwrap();
@@ -17817,6 +17924,274 @@ mod tests {
         call.offer = Some(calling::MediaContent::sdp("v=0"));
         assert_eq!(call.json()["can_accept"], false);
         assert_eq!(call.json()["can_hangup"], false);
+    }
+
+    /// A live one-to-one call whose callbacks were built for `session`, as `call_place` makes one.
+    fn call_on_session(session: &str) -> CallSession {
+        CallSession {
+            id: "call-1".into(),
+            direction: CallDirection::Outgoing,
+            kind: CallKind::Call,
+            phase: CallPhase::Connected,
+            conversation_id: Some("19:thread@thread.v2".into()),
+            peer_mri: "8:orgid:her".into(),
+            peer_name: "Her".into(),
+            ring: Vec::new(),
+            links: calling::Links::collect(&json!({
+                "links": { "hangup": "https://cc/live/hangup" }
+            })),
+            local: calling::LocalParticipant {
+                id: "8:orgid:me".into(),
+                display_name: "Me".into(),
+                endpoint_id: "endpoint".into(),
+                participant_id: "leg".into(),
+            },
+            callbacks: calling::CallbackBase {
+                surl: "https://tr/v4/f/a/".into(),
+                session_id: session.into(),
+                cause_id: "c".into(),
+            },
+            offer: None,
+            roster: Vec::new(),
+            in_lobby: false,
+            muted: false,
+            connected_at_ms: Some(now_ms()),
+            started_at_ms: now_ms(),
+            end_reason: None,
+            unreachable: false,
+            renegotiation_answer_link: None,
+            outgoing_negotiation_at: None,
+            source_request_sequence: 0,
+            sending: Vec::new(),
+            sharing: Some(calling::ContentSharing {
+                correlation_id: "share".into(),
+                session_id: None,
+                leave: Some("https://cc/live/sharing/leave".into()),
+            }),
+        }
+    }
+
+    /// A frame posted to `{surl}callAgent/{session}/c{path}`, the shape of every callback this
+    /// app publishes.
+    fn frame_on(session: &str, path: &str, body: Value) -> trouter_events::CallFrame {
+        trouter_events::CallFrame {
+            url: format!("https://tr/v4/f/a/callAgent/{session}/c{path}"),
+            call_id: String::new(),
+            body,
+        }
+    }
+
+    /// A roster that names a stranger, which a fold would add to the live call.
+    fn stranger_roster() -> Value {
+        json!({
+            "type": "Delta",
+            "participants": { "8:orgid:stranger": {
+                "details": { "displayName": "Stranger" },
+                "state": "active",
+            } },
+        })
+    }
+
+    /// A frame acts only on the call whose callbacks it arrived on (incoming-and-conversation
+    /// M0). Before this, every frame after the invite branch was merged into the one live call
+    /// and any `conversationEnd` ended it, so a frame from another conversation — a call that had
+    /// ended, a ring let go of — could rewrite the live call's links or hang it up under the
+    /// user. Each frame below is addressed to ANOTHER session and carries what would have done
+    /// damage; the last is the live call's own ending, which must still end it.
+    #[tokio::test]
+    async fn a_frame_acts_only_on_the_call_whose_callbacks_it_arrived_on() {
+        let ctx = test_ctx();
+        ctx.calling.lock().unwrap().call = Some(call_on_session("live"));
+
+        ctx.handle_call_frame(frame_on("other", calling::paths::CONVERSATION_ROSTER_UPDATE, stranger_roster()))
+            .await;
+        ctx.handle_call_frame(frame_on(
+            "other",
+            "/call/progress/",
+            json!({ "links": { "hangup": "https://cc/other/hangup" } }),
+        ))
+        .await;
+        ctx.handle_call_frame(frame_on("other", calling::paths::CONVERSATION_CONTENT_SHARING_END, json!({})))
+            .await;
+        ctx.handle_call_frame(frame_on(
+            "other",
+            calling::paths::CONVERSATION_END,
+            json!({ "conversationEnd": { "code": 0, "phrase": "somebody else's call ended" } }),
+        ))
+        .await;
+        {
+            let plane = ctx.calling.lock().unwrap();
+            let call = plane.call.as_ref().expect("another session's ending ended the live call");
+            assert_eq!(call.phase, CallPhase::Connected);
+            assert!(call.roster.is_empty(), "another session's roster folded into the live call");
+            assert_eq!(call.links.hangup(), Some("https://cc/live/hangup"), "its links were rewritten");
+            assert!(call.sharing.is_some(), "another session's sharing end cleared the live call's");
+        }
+
+        // The live call's OWN frames still act: its roster folds, and its ending ends it.
+        ctx.handle_call_frame(frame_on("live", calling::paths::CONVERSATION_ROSTER_UPDATE, stranger_roster()))
+            .await;
+        assert_eq!(ctx.calling.lock().unwrap().call.as_ref().map(|c| c.roster.len()), Some(1));
+        ctx.handle_call_frame(frame_on(
+            "live",
+            calling::paths::CONVERSATION_END,
+            json!({ "conversationEnd": { "code": 0, "phrase": "bye" } }),
+        ))
+        .await;
+        assert!(ctx.calling.lock().unwrap().call.is_none(), "the live call's own ending did not end it");
+    }
+
+    /// A frame whose address names NO session keeps the handling it always had: nothing has
+    /// measured that such a frame never acts on a call, so the routing only says that it saw one
+    /// (once per address) and lets it through.
+    #[tokio::test]
+    async fn a_frame_that_names_no_session_is_handled_as_before() {
+        let ctx = test_ctx();
+        ctx.calling.lock().unwrap().call = Some(call_on_session("live"));
+        ctx.handle_call_frame(trouter_events::CallFrame {
+            url: "https://tr/v4/f/a/".into(),
+            call_id: String::new(),
+            body: json!({ "conversationEnd": { "code": 0, "phrase": "bye" } }),
+        })
+        .await;
+        assert!(ctx.calling.lock().unwrap().call.is_none());
+    }
+
+    /// What the routing SAYS, through the plane's own `route_frame` — the one place the
+    /// handler takes its journal line from. A frame addressed to another session is said once
+    /// per session and door, a frame with no session once per address, the live call's own frames
+    /// not at all, and no line names a session or the surl's allocation id, which are keys.
+    #[test]
+    fn the_routing_says_each_ignored_kind_once_and_never_names_a_key() {
+        let mut plane = CallingPlane::default();
+        plane.channel = Some(trouter::CallingChannel {
+            surl: "https://tr/v4/f/alloc-7f3a/".into(),
+            endpoint_id: "endpoint".into(),
+            registrar_status: 200,
+        });
+        plane.call = Some(call_on_session("sess-91f0"));
+        let on = |session: &str, door: &str| {
+            format!("https://tr/v4/f/alloc-7f3a/callAgent/{session}/c{door}")
+        };
+        let keys = ["sess-", "alloc-7f3a"];
+
+        let other_end = on("sess-2c4d", calling::paths::CONVERSATION_END);
+        let (proceed, said) = plane.route_frame(&other_end);
+        assert!(!proceed, "a frame for another session went on to the handler");
+        let said = said.expect("the first frame of a kind is said");
+        assert!(said.contains("conversation/conversationEnd"), "{said}");
+        for key in keys {
+            assert!(!said.contains(key), "the journal line names a key ({key}): {said}");
+        }
+        // Said ONCE: the same session on the same door is silent from then on.
+        assert_eq!(plane.route_frame(&other_end), (false, None));
+        // A second session on that door, and another door of the first, are kinds of their own.
+        assert!(plane.route_frame(&on("sess-5e6f", calling::paths::CONVERSATION_END)).1.is_some());
+        assert!(
+            plane.route_frame(&on("sess-2c4d", calling::paths::CONVERSATION_ROSTER_UPDATE)).1.is_some()
+        );
+        // The live call's own frames go on, and say nothing.
+        assert_eq!(plane.route_frame(&on("sess-91f0", calling::paths::CONVERSATION_END)), (true, None));
+
+        // A frame with no session goes on, is said once, and never with the surl's id in it.
+        let bare = "https://tr/v4/f/alloc-7f3a/SkypeSpacesWeb/";
+        let (proceed, said) = plane.route_frame(bare);
+        assert!(proceed, "a frame that names no session must keep today's handling");
+        let said = said.expect("the first unaddressed frame of a kind is said");
+        assert!(said.contains("SkypeSpacesWeb"), "{said}");
+        for key in keys {
+            assert!(!said.contains(key), "the journal line names a key ({key}): {said}");
+        }
+        assert_eq!(plane.route_frame(bare), (true, None));
+    }
+
+    /// The routing's memory of what it said is bounded.
+    #[test]
+    fn an_ignored_frame_is_journaled_once_per_kind_and_the_memory_is_bounded() {
+        let mut notes = FrameNotes::default();
+        assert!(notes.first("elsewhere\ns\ncall/end".into()));
+        assert!(!notes.first("elsewhere\ns\ncall/end".into()));
+        assert!(notes.first("elsewhere\ns\nconversation/rosterUpdate".into()));
+        for kind in 0..FrameNotes::MAX_KINDS * 2 {
+            notes.first(format!("k{kind}"));
+        }
+        assert!(notes.seen.len() <= FrameNotes::MAX_KINDS);
+    }
+
+    /// The ORDER of `handle_call_frame` is written down at the top of the handler, and this pins
+    /// the code to it (docs/calling-roadmap/README.md § 3, collision 4). Several workstreams add
+    /// a branch there, each with a constraint on where; a branch moved — the sharing branches
+    /// back above the routing, the answer above the renegotiation that must be read first — or
+    /// a step dropped from the list is a failure here rather than a review finding.
+    ///
+    /// Each step is identified by the one call the branch is made of, which must appear exactly
+    /// once in the handler, and the steps must appear in the documented order. The comment block
+    /// is checked too, so the list a reader is given and the code cannot disagree.
+    #[test]
+    fn handle_call_frame_runs_its_branches_in_the_documented_order() {
+        const STEPS: &[(&str, &str)] = &[
+            ("relay", "calling::relay_config_in_frame("),
+            ("invite", "calling::incoming_call_from_frame("),
+            ("routing", ".route_frame(&frame.url)"),
+            ("sharing end", "calling::paths::CONVERSATION_CONTENT_SHARING_END"),
+            ("sharing granted", "calling::paths::CONVERSATION_ADD_MODALITY_SUCCESS"),
+            ("merge", "call.links.merge("),
+            ("invite failed", "calling::invite_failed("),
+            ("end", "calling::call_ended_from_frame("),
+            ("roster", "calling::roster_in_frame("),
+            ("lobby", "calling::lobby_state_in_frame("),
+            ("acknowledgement", "calling::acceptance_acknowledgement_link("),
+            ("accepted", "calling::call_accepted_in_frame("),
+            ("renegotiation", "calling::media_renegotiation_from_frame("),
+            ("answer", "calling::media_answer_from_frame("),
+        ];
+        let source = include_str!("server.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let start = code
+            .find("async fn handle_call_frame(&self, frame: trouter_events::CallFrame) {")
+            .expect("the handler");
+        let end = code[start..]
+            .find("async fn handle_incoming_call(")
+            .map(|at| start + at)
+            .expect("the handler ends where the incoming call's begins");
+        let handler = &code[start..end];
+
+        let mut previous = 0;
+        for (name, token) in STEPS {
+            assert_eq!(
+                handler.matches(token).count(),
+                1,
+                "step `{name}` must be made of exactly one `{token}` in handle_call_frame"
+            );
+            let at = handler.find(token).unwrap();
+            assert!(at > previous, "step `{name}` stands out of the documented order");
+            previous = at;
+        }
+
+        // The documented list: every step, numbered, in this order, and all of it above the code.
+        let first_code = handler.find(STEPS[0].1).unwrap();
+        let mut previous = 0;
+        for (index, (name, _)) in STEPS.iter().enumerate() {
+            let entry = format!("{}. {name}", index + 1);
+            let at = handler[..first_code]
+                .match_indices(&entry)
+                .map(|(at, _)| at)
+                .find(|&at| {
+                    let after = handler[at + entry.len()..].chars().next();
+                    matches!(after, Some(' ') | Some('\n'))
+                })
+                .unwrap_or_else(|| panic!("the handler's order lists no `{entry}`"));
+            assert!(at > previous, "`{entry}` is listed out of order");
+            previous = at;
+        }
+        let listed = handler[..first_code]
+            .lines()
+            .filter(|line| {
+                let line = line.trim_start().trim_start_matches("//").trim_start();
+                line.split_once(". ").is_some_and(|(n, _)| n.parse::<usize>().is_ok())
+            })
+            .count();
+        assert_eq!(listed, STEPS.len(), "the documented order lists a step this test does not pin");
     }
 
     /// Every POST that puts this machine INTO a call re-reads the reservation when its

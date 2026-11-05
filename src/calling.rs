@@ -816,6 +816,81 @@ pub fn callback_path(url: &str) -> &str {
     }
 }
 
+/// The signaling session a frame is addressed to: the segment after `callAgent/` in the URL it
+/// arrived on, or `None` for a URL with no such segment.
+///
+/// Every callback this app publishes is `{surl}callAgent/{sessionId}/{causeId}{path}`
+/// ([`CallbackBase::link`]), and the service posts to exactly the links it was handed, so the
+/// segment names the call those links were built for. The query goes first, as in
+/// [`callback_path`]: the service appends one to some links (`?i=<ip>`), and nothing in a query
+/// is a session. An EMPTY segment is still a segment — it names our call agent and no session of
+/// ours, so it can match no live call.
+pub fn session_of(url: &str) -> Option<&str> {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let marker = format!("/{CALL_AGENT}/");
+    let (_, after) = path.split_once(marker.as_str())?;
+    Some(after.split('/').next().unwrap_or_default())
+}
+
+/// Where a calling frame belongs, decided from its address alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameRoute<'a> {
+    /// Addressed to the live call's own callbacks: the frame is about the call this machine
+    /// holds, and every branch after the routing may act on it.
+    Ours,
+    /// Addressed to a signaling session that is not the live call's — a call that has ended, a
+    /// ring this machine let go of whose conversation keeps posting, or one it never held. Not
+    /// ours to act on: merged in, its links would overwrite the live call's, and its
+    /// `conversationEnd` would end a call it is not about.
+    Elsewhere { session: &'a str },
+    /// The address carries no session at all. Handled as before, because no measurement says
+    /// such a frame never acts on a call; the journal is what will.
+    Unaddressed,
+}
+
+/// Route a frame by the session its address names, against the live call's session.
+///
+/// The client is safe here for a reason this app was not: it routes each callback to the
+/// signaling session that owns its path, and a session that ended is IDLE —
+/// `handleCallEnd` returns early with `not handling incoming callEnd since fsmstate =
+/// SIGNALING_FSM_STATE.IDLE` (calling-pluginless.js @1389185). This app had one live call and
+/// merged EVERY frame into it, so a frame from any other conversation could rewrite its links
+/// or end it.
+///
+/// `live` is the session of the call this machine holds, ended or not: a frame for the call's
+/// own session after it ended is still that call's, and the handler's own phase checks are what
+/// leave it alone.
+pub fn frame_route<'a>(url: &'a str, live: Option<&str>) -> FrameRoute<'a> {
+    match session_of(url) {
+        None => FrameRoute::Unaddressed,
+        Some(session) if live == Some(session) => FrameRoute::Ours,
+        Some(session) => FrameRoute::Elsewhere { session },
+    }
+}
+
+/// How an UNADDRESSED frame's address is named in a journal line: the part after this
+/// connection's surl, never the surl itself.
+///
+/// The surl's allocation id is what routes a frame to this connection, so it is a key — the
+/// discipline [`surl_shape`] and [`callback_path`] already hold. A frame on the surl itself is
+/// said in words, and one on an address that is not under this connection's surl is not printed
+/// at all, because nothing here can say which of its parts is a key.
+pub fn unaddressed_frame_shape(url: &str, surl: Option<&str>) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    // The surl must end at a SEGMENT boundary: `…/f/abc` is a prefix of `…/f/abcdef/x` as a
+    // string, and stripping it there would print the tail of somebody else's allocation id.
+    let rest = surl
+        .and_then(|s| path.strip_prefix(s.trim_end_matches('/')))
+        .filter(|rest| rest.is_empty() || rest.starts_with('/'));
+    let Some(rest) = rest else {
+        return "an address that is not under this connection's surl".to_string();
+    };
+    match rest.trim_matches('/') {
+        "" => "the connection's own address".to_string(),
+        tail => tail.to_string(),
+    }
+}
+
 /// The content-sharing SESSION a meeting grants, and the links it hands back.
 ///
 /// **A meeting has ONE screen at a time, so sharing one is a session rather than a track.**
@@ -3370,6 +3445,78 @@ mod tests {
         assert_eq!(surl_shape("https://example.test/x"), "https://example.test/x");
     }
 
+    /// Every way this module reaches the calling service is one the automation guard refuses
+    /// from a cargo example (`.claude/hooks/guard-live-automation.sh`, rule 1d-quater). The guard
+    /// names the senders and matches the bodies by their `*_payload` shape, on the other side of a
+    /// process boundary — so a sender added here and forgotten there is an example that can ring
+    /// somebody or hang a call up with nothing to stop it, and only this test can notice.
+    ///
+    /// It pins ONE direction, like `every_gated_method_is_named_in_the_automation_guard`: a name
+    /// the guard keeps for a sender that does not exist yet blocks nothing real.
+    #[test]
+    fn every_calling_sender_is_named_in_the_example_guard() {
+        let hook = include_str!("../.claude/hooks/guard-live-automation.sh");
+        let alternation = |name: &str| -> Vec<String> {
+            let start = format!("{name}='(");
+            let line = hook
+                .lines()
+                .find_map(|line| line.strip_prefix(start.as_str()))
+                .unwrap_or_else(|| panic!("the guard defines no {name}"));
+            let inner = line.strip_suffix(")'").expect("one alternation on one line");
+            inner.split('|').map(str::to_string).collect()
+        };
+        let reach = alternation("CALLING_REACH");
+        let ring = alternation("CALLING_RING");
+        // The bodies by shape, so a builder written tomorrow is covered with no edit to the hook.
+        assert!(reach.iter().any(|alt| alt == "[A-Za-z0-9_]*_payload"), "{reach:?}");
+        // The calls that ring a person are refused whatever an example pins.
+        for name in ["place_call", "invitation_payload"] {
+            assert!(ring.iter().any(|alt| alt == name), "{name} is not in CALLING_RING: {ring:?}");
+        }
+
+        // Every function of this module that SENDS: each `pub async fn` reaches the network, and
+        // each one but the relay credentials reaches the calling service. The relay read fetches
+        // TURN credentials and publishes nothing about the user, so it is named as a read.
+        const READS: &[&str] = &["fetch_relay_credentials"];
+        let source = include_str!("calling.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let senders: Vec<&str> = code
+            .lines()
+            .filter_map(|line| line.strip_prefix("pub async fn "))
+            .map(|rest| rest.split(['(', '<']).next().unwrap_or_default())
+            .collect();
+        assert!(senders.contains(&"post_signal"), "the scan found no senders: {senders:?}");
+        for sender in senders {
+            if READS.contains(&sender) {
+                continue;
+            }
+            assert!(
+                reach.iter().any(|alt| alt == sender),
+                "calling::{sender} reaches the calling service, but the example guard does not \
+                 name it in CALLING_REACH — an example could call it with nothing to stop it"
+            );
+        }
+        // And every body builder really has the shape the guard matches it by: a public function
+        // that answers a bare `Value` is a body, so it ends in `_payload` — or it is a FRAGMENT
+        // that only ever travels inside one, which reaches nobody on its own.
+        const FRAGMENTS: &[&str] = &["media_controller_content"];
+        let mut bodies = 0;
+        for at in code.match_indices("\npub fn ").map(|(at, _)| at + "\npub fn ".len()) {
+            let signature = code[at..].split('{').next().unwrap_or_default();
+            if !signature.trim_end().ends_with(") -> Value") {
+                continue;
+            }
+            let name = signature.split(['(', '<']).next().unwrap_or_default();
+            bodies += 1;
+            assert!(
+                name.ends_with("_payload") || FRAGMENTS.contains(&name),
+                "calling::{name} builds a body but is not named `*_payload`, so the example guard \
+                 does not see it — rename it, or name it as a fragment here if it never travels alone"
+            );
+        }
+        assert!(bodies >= 10, "the scan found {bodies} body builders, which is not this module");
+    }
+
     /// NO body carries a `payload` envelope, and this is the test that keeps it that way.
     ///
     /// The web client's own builders DO produce `{payload: {…}}`, so a reader of that
@@ -3839,6 +3986,72 @@ mod tests {
         // is cut before the path is read rather than printed as part of the door.
         assert_eq!(callback_path("https://x/callAgent/s/c1/call/mediaAnswer/?i=1.2.3.4"), "call/mediaAnswer");
         assert_eq!(callback_path("nothing"), "?");
+    }
+
+    /// The session a frame is addressed to is the segment our own link builder put after
+    /// `callAgent/` — read off a link this crate built, so the two cannot drift apart.
+    #[test]
+    fn a_frame_names_the_signaling_session_its_callback_was_built_for() {
+        let base = CallbackBase {
+            surl: "https://trouter.example/v4/f/abc/".into(),
+            session_id: "8b0f3c2e-session".into(),
+            cause_id: "0a1b2c3d".into(),
+        };
+        assert_eq!(session_of(&base.link(paths::CALL_END)), Some("8b0f3c2e-session"));
+        assert_eq!(session_of(&base.link(paths::CONVERSATION_END)), Some("8b0f3c2e-session"));
+        // A query the service appends is never read as part of the address.
+        assert_eq!(
+            session_of("https://x/v4/f/a/callAgent/s1/c1/call/mediaAnswer/?i=1.2.3.4"),
+            Some("s1")
+        );
+        assert_eq!(session_of("https://x/v4/f/a/?q=/callAgent/s1/c1/"), None);
+        // An address with no session segment — the registration's own, say — names none.
+        assert_eq!(session_of("https://trouter.example/v4/f/abc/"), None);
+        // A segment that is present and empty names our agent and no session of ours.
+        assert_eq!(session_of("https://x/callAgent//c1/call/end/"), Some(""));
+    }
+
+    /// A frame acts on the live call only when it is addressed to that call's own session.
+    #[test]
+    fn a_frame_is_routed_to_the_live_call_only_by_its_own_session() {
+        let live = "https://tr/v4/f/a/callAgent/live/c/conversation/conversationEnd/";
+        let other = "https://tr/v4/f/a/callAgent/other/c/conversation/conversationEnd/";
+        let bare = "https://tr/v4/f/a/";
+        assert_eq!(frame_route(live, Some("live")), FrameRoute::Ours);
+        assert_eq!(frame_route(other, Some("live")), FrameRoute::Elsewhere { session: "other" });
+        // With no call held, every addressed frame belongs elsewhere — a call that ended frees
+        // its slot, and its late frames must not reach the next one.
+        assert_eq!(frame_route(live, None), FrameRoute::Elsewhere { session: "live" });
+        // An address that names no session keeps today's handling, live call or not.
+        assert_eq!(frame_route(bare, Some("live")), FrameRoute::Unaddressed);
+        assert_eq!(frame_route(bare, None), FrameRoute::Unaddressed);
+        // An empty segment can never be the live call's.
+        assert_eq!(
+            frame_route("https://tr/v4/f/a/callAgent//c/call/end/", Some("live")),
+            FrameRoute::Elsewhere { session: "" }
+        );
+    }
+
+    /// An unaddressed frame is journaled by the part after the surl, and the surl — whose
+    /// allocation id routes frames to this connection — never reaches the journal.
+    #[test]
+    fn an_unaddressed_frame_is_named_without_the_surl() {
+        let surl = Some("https://tr/v4/f/secretid/");
+        assert_eq!(unaddressed_frame_shape("https://tr/v4/f/secretid/", surl), "the connection's own address");
+        assert_eq!(
+            unaddressed_frame_shape("https://tr/v4/f/secretid/SkypeSpacesWeb/?i=1.2.3.4", surl),
+            "SkypeSpacesWeb"
+        );
+        // A prefix of the id is not the surl: the boundary is a segment, never a character.
+        let longer = unaddressed_frame_shape("https://tr/v4/f/secretidtail/x", surl);
+        assert!(!longer.contains("tail"), "printed part of another allocation id: {longer}");
+        // Off this connection's surl, or with no surl known, nothing of the address is printed.
+        for shape in [
+            unaddressed_frame_shape("https://elsewhere/v4/f/key/x", surl),
+            unaddressed_frame_shape("https://tr/v4/f/secretid/x", None),
+        ] {
+            assert!(!shape.contains("key") && !shape.contains("secretid"), "{shape}");
+        }
     }
 
     /// Both spellings of a source request. The newer one addresses the section by mid and

@@ -5404,6 +5404,24 @@ user. Two independent mechanisms enforce that split:
   Hard-code the conversation as a const and name no other (see
   `examples/agent_stream_probe.rs`); the hook refuses to run any other shape,
   including a target taken from an argument.
+- **A cargo example may not reach the CALLING plane, and there is no sandbox to pin.** A call
+  rings a phone in somebody's pocket, opens the user's microphone, or tells a caller they were
+  declined, and an example reaches Teams' calling service with a broker token past every gate the
+  app has. So the hook refuses an example that posts a calling signal or builds a call body —
+  `calling::post_signal`, `place_call`, `join_meeting`, and any `*_payload`, matched by that SHAPE
+  so the next builder is covered with no edit to the hook — unless the file is named in the
+  hook's `SANCTIONED_CALL_EXAMPLES` and still carries the EXACT line that pins its target — the
+  value, not the shape of a const, which is the rule a send probe is held to. That list holds one
+  file, `examples/meeting_join_probe.rs`, whose meeting is pinned by its calendar subject: the
+  live-driver precedent, a constant target and then a name in the allowlist. That pin is only as
+  narrow as its word — the probe takes the first event in its date window whose subject CONTAINS
+  `Onboard` — and its window ended in 2026-09, so today it addresses nothing and refuses to run. RINGING somebody
+  (`place_call`, `invitation_payload`) is refused whatever an example pins, that probe included —
+  a meeting rings nobody, and the one person this machine may ring for a test is rung through
+  the app, by `bun run call-live`. Reading the plane stays open (`calling::endpoints`, the frame
+  parsers, `cargo run --example meeting_join_recon`).
+  `every_calling_sender_is_named_in_the_example_guard` (src/calling.rs) holds the hook to this
+  module's own senders and to the `*_payload` naming of every body.
 
 **If a guardrail blocks you, fix the setup — never route around the guardrail.**
 Rewriting a command to slip past the hook, disabling the sentinel, or asserting
@@ -6018,6 +6036,39 @@ call does — this side never handles RTP, and the page never learns a Teams URL
 - **One call at a time.** A second simultaneous call needs a second microphone and a UI
   that can hold two. An invite that arrives while a call is up is left for the user's
   other devices to ring, which is what Teams does with a client that does not answer.
+- **A FRAME ACTS ONLY ON THE CALL IT WAS ADDRESSED TO** (`calling::frame_route`, read in
+  `handle_call_frame` right after the relay and the invite). Every callback this app publishes is
+  `{surl}callAgent/{sessionId}/{causeId}{path}`, with one session per call, and the service posts
+  to exactly the links it was handed — so the session segment of a frame's URL names its call.
+  This app never read it: every frame after the invite was merged into the one live call, and any
+  `conversationEnd` ended it, so a frame from another conversation — a call that had ended, a ring
+  let go of whose conversation kept posting — could rewrite the live call's links or hang it up.
+  The client is safe for the reason this now is: it routes each callback to the session that owns
+  it, and a session that ended is IDLE (`handleCallEnd`: "not handling incoming callEnd since
+  fsmstate = SIGNALING_FSM_STATE.IDLE"). Three rules, each pinned by a test:
+  - **A frame for another session is dropped and said ONCE** per session and door
+    (`[calling] ignored a frame on <door>: …`, deduped by a bounded `FrameNotes`). The line names
+    the door and never the session or the surl, which are keys. `CallingPlane::route_frame` is the
+    one place the handler takes both its decision and its line from, and
+    `the_routing_says_each_ignored_kind_once_and_never_names_a_key` drives it.
+  - **A frame whose address names NO session keeps the handling it always had**, said once per
+    address with the surl cut off it (`calling::unaddressed_frame_shape`). Nothing has measured
+    that such a frame never acts on a call, and the journal is what will; the rule tightens only
+    once it shows they are inert.
+  - **The handler's branch ORDER is written at its top** and pinned by
+    `handle_call_frame_runs_its_branches_in_the_documented_order`, which holds each step to the one
+    call it is made of, in the listed order, and the list to the code. Several calling workstreams
+    add a branch there, each with a constraint on where (docs/calling-roadmap/README.md § 3,
+    collision 4) — a branch joins that list in the change that adds it, in its place, with its
+    reason. The content-sharing branches moved BELOW the routing for exactly this: they act on
+    the live call too, and ran before any check at all. What a branch below the routing may
+    assume is that a frame is NOT addressed to another session — not that it is addressed to the
+    live one, because an unaddressed frame still reaches it.
+  `a_frame_acts_only_on_the_call_whose_callbacks_it_arrived_on` drives the real handler with
+  another session's roster, links, sharing end and `conversationEnd`, and then the live call's
+  own ending. **Unverified against the tenant**: no live run has carried a frame for another
+  session yet. The live regression is a `join-live --from-chat --hold 60`, which must show no
+  `ignored a frame` line while the call is up and end on the service's own end frame as before.
 - **A CHAT is called; a MEETING is joined, and the conversation decides which**
   (`conversationCallAction` in `web/src/lib/call.ts`, drawn by `conversation-menu.tsx`). One
   control per conversation, in its header:

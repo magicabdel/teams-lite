@@ -103,7 +103,8 @@ code), **inferred** (neither).
   `frame.url` (`…/callAgent/<sessionId>/<causeId>/<path>`).
   - **Segment present, matching the live call's `callbacks.session_id`:** today's handling.
   - **Segment present, matching nothing live:** journal it ONCE per `(sessionId, path)`
-    (`[calling] a frame for another call session on <callback_path> — ignored`) and return. That
+    (`[calling] ignored a frame on <callback_path>: it is addressed to a call session that is not
+    the live one here`, as built) and return. That
     covers a call that ended, a declined ring whose conversation keeps posting, and an
     unrelated session.
   - **No segment:** today's handling, plus one journal line naming the path. The rule tightens
@@ -1077,7 +1078,7 @@ re-stages from master by itself.
 
 | # | Step | Driver | Who acts | Success signal |
 | --- | --- | --- | --- | --- |
-| M0 | Regression on the verified paths, after M0 merges. | `cd web && bun run join-live -- --from-chat --hold 60` (the pinned meeting). `bun run call-live` only with the colleague's agreement for that session. | The agent runs them. | Connected, held, hung up cleanly. Not one `a frame for another call session` line names the live call's own session. Both calls end on the service's own end frame, as before. |
+| M0 | Regression on the verified paths, after M0 merges. | `cd web && bun run join-live -- --from-chat --hold 60` (the pinned meeting). `bun run call-live` only with the colleague's agreement for that session. | The agent runs them. | Connected, held, hung up cleanly. No `[calling] ignored a frame on` line is journaled while the call is up (the line names no session, so this is the check that can be run). Both calls end on the service's own end frame, as before. |
 | M1 | During one of the user's own calls, with the laptop (holding the microphone) and the phone on the same backend, press Mute on the PHONE, then Unmute on the laptop. | The user's own click. E2E specs 3–5 are the automated proof. | The user, with the colleague. | The colleague hears silence the moment the phone shows Muted. The laptop's Mute turns on by itself. The phone offers no Unmute. The laptop's Unmute is heard. |
 | M2 | Instrumentation: one `call-live` (outgoing) and one incoming call from the colleague. | `call-live` with agreement; the colleague places the incoming call. Journals are read with `journalctl --user -u teams-lite-backend.service`. | The agent; the colleague. | Shape lines: the invite's `conversationInvitation` keys and `evt`; `callKeepAliveInterval` from `callAcceptance` (outgoing) or the acceptance's inline acknowledgement (incoming legacy); whether `leave`/`updateEndpointState`/`notificationLinks`/`unmute` are in each conversation object. No behaviour changes. |
 | M3 | The user sets Mute = "Publish it the way Teams does" on 19442. Both installs join the pinned meeting; the sender mutes, then unmutes. | `cd web && bun run join-live -- --pair --toggle-mute` (19442 sends, 19440 watches). | The agent, after the USER has started both installs. | The receiver's digest shows the sender endpoint's `isMuted` going false → true → false in step. The sender's journal shows `published the mute on updateEndpointState → 200` twice, and no `mute`-link POST. |

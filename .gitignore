@@ -33,3 +33,6 @@ enrollment-backup*.tar.gz
 # names): the operator's own, never committed. `packaging/helm/environments/<cluster>/` is where
 # one lives on the workstation that deploys it; the chart itself never reads it.
 /packaging/helm/environments/
+
+# Python bytecode, written when a hook test module is imported.
+__pycache__/

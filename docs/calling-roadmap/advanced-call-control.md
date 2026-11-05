@@ -119,7 +119,8 @@ This workstream depends on it for one thing: after End-and-answer (M4), the ENDE
 `handle_call_frame` merges every frame into whatever call is live (`:14676-14720`).
 
 **M4's promotion is switched on only after a proof.** The observation journal must show zero
-"another session" lines touching the live call, and no un-segmented frame acting on it, over:
+`[calling] ignored a frame on` lines while the call is up (IC0's journal line, which names no
+session), and no `[calling] a frame on … names no call session` line acting on it, over:
 
 - one `call-live` run;
 - one `join-live -- --share --pair` run;

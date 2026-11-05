@@ -248,6 +248,15 @@ hands the client to post to: `mediaAnswer`, `mediaRejection`, `mediaAcknowledgem
 So the whole call is a pair of link sets. Neither side needs a fixed API surface after
 setup: each response names the URLs for the next step.
 
+The `sessionId` segment is also what says WHICH call a frame is about: the service posts to
+the links it was handed, and this app makes one session per call. `handle_call_frame` reads it
+right after the relay and the invite (`calling::frame_route`) and drops a frame addressed to any
+other session, said once per session and door in the journal; a frame with no session in its
+address keeps today's handling and is journaled once per address. The client does the same by
+routing each callback to the signaling session that owns its path, and an ended session is idle
+(`handleCallEnd` returns early in `SIGNALING_FSM_STATE.IDLE`). Inferred from our own link builder
+and the measured URL shape; no live run has yet carried a frame for another session.
+
 ### 2.3 Placing a call: one POST
 
 `startOrJoinCall` sends **one POST to `conversationServiceUrl`**, and the body is:

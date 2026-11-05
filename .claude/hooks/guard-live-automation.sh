@@ -677,6 +677,54 @@ cycles_the_container_in_source() {
   grep -qE '(^|[^A-Za-z0-9_])intune::(start_repair_unit|start_repair|start_transient_oneshot|dispatch_reexec|restart_container|boot_headless|repair_main)([^A-Za-z0-9_]|$)|intune::\{([^}]*[[:space:],])?(start_repair_unit|start_repair|dispatch_reexec)([[:space:],}]|$)|(^|[^A-Za-z0-9_])intune_embedded::(spawn_helper|boot|[A-Za-z0-9_]*_main)([^A-Za-z0-9_]|$)|intune_embedded::\{([^}]*[[:space:],])?(spawn_helper|[A-Za-z0-9_]*_main)([[:space:],}]|$)|__teams-lite-repair-broker|__teams-lite-intune-(boot|stop|portal)|__rootless-supervise|__rootless-exec|(REPAIR|SUPERVISE|EXEC|BOOT|STOP|PORTAL)_SUBCOMMAND' "$1"
 }
 
+# Does this source REACH THE CALLING PLANE — post a signal to Teams' calling service, or build
+# a body that rings somebody, answers, declines, hangs up, mutes, joins or shares a screen?
+#
+# The calling plane has no sandbox: there is no pre-authorized call to make. What reaches a person
+# from this machine goes through the app (its OUTWARD_METHODS gate, the write token, a page the
+# user is looking at) or through a sanctioned driver whose target is a constant —
+# `bun run join-live` for the one authorized meeting, `bun run call-live` for the one authorized
+# one-to-one. An example reaches the same service directly with a broker token, past all of it,
+# with a function call. So what an example CALLS is the only thing left to check.
+#
+# The senders are matched by name and the bodies by SHAPE: every body builder in src/calling.rs is
+# a `*_payload`, so one written tomorrow is covered with no change here — and
+# `every_calling_sender_is_named_in_the_example_guard` (src/calling.rs) holds the names to the
+# crate's own `pub async fn`s. Two spellings, as for the container: the path (`calling::x(`, which
+# also covers `teams_lite::calling::x` and a `use` of one function), and a grouped import of the
+# function itself (`use teams_lite::calling::{join_meeting, post_signal};`). A glob import is not
+# followed; it is a tripwire for the shapes code really takes, not a proof. Reading what the
+# service says — `endpoints`, the frame parsers, `MeetingJoin::from_join_url` — names none of these
+# and stays open, which is what examples/meeting_join_recon.rs is built on.
+CALLING_REACH='(post_signal|put_signal|delete_signal|signal_headers|place_call|join_meeting|[A-Za-z0-9_]*_payload)'
+# RINGING a person is the sharpest of them — a phone buzzing in somebody's pocket — and it is
+# refused whatever the example pins, the allowlisted probe included: a meeting rings nobody, and
+# the one person this machine may ring for a test is rung through the app, by call-live.
+CALLING_RING='(place_call|invitation_payload)'
+names_a_calling_function() {
+  grep -qE "(^|[^A-Za-z0-9_])calling::${2}([^A-Za-z0-9_]|\$)" "$1" && return 0
+  grep -qE "calling::\{([^}]*[[:space:],])?${2}([[:space:],}]|\$)" "$1"
+}
+
+# The examples that may reach the calling plane, named one at a time — the live-driver precedent:
+# a target that is a CONSTANT in the file, and then a name here. Never by being tracked, and never
+# by a name that happens to match: each entry is the file's whole path and the EXACT line that pins
+# its target, so the file is let through only while it still pins THAT target — the rule 1c holds
+# for a send, which compares the sandbox thread itself rather than the shape of a const.
+#
+# examples/meeting_join_probe.rs pins its meeting by calendar SUBJECT, and it is only as narrow as
+# that word: it addresses the first event in its date window whose subject CONTAINS the constant.
+# The pin is compared here so an edit to another, commoner word is refused rather than run.
+SANCTIONED_CALL_EXAMPLES='examples/meeting_join_probe.rs|const MEETING_SUBJECT: &str = "Onboard";'
+sanctioned_call_example() {
+  local entry
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    [ "$1" = "${entry%%|*}" ] && grep -qxF -- "${entry#*|}" "$2" && return 0
+  done <<<"$SANCTIONED_CALL_EXAMPLES"
+  return 1
+}
+
 # The Rust sources a `cargo run --example NAME` is about to execute.
 #
 # Rule 1 scans INTERPRETED scripts, which left a hole this feature opened: a cargo
@@ -755,6 +803,8 @@ examples_publishing_presence=""
 examples_writing_to_a_tracker=""
 examples_driving_the_signin_window=""
 examples_cycling_the_container=""
+examples_reaching_a_call=""
+examples_ringing_a_person=""
 while IFS= read -r source; do
   [ -z "$source" ] && continue
   path="$project_dir/$source"
@@ -783,6 +833,14 @@ while IFS= read -r source; do
   # and since the crate is linked an example reaches its lifecycle with a function call.
   if cycles_the_container_in_source "$path"; then
     examples_cycling_the_container="$examples_cycling_the_container $source"
+  fi
+  # The calling plane is a FIFTH shape with no sandbox: a call reaches a person, and an example
+  # reaches the calling service directly with a broker token. Ringing somebody is refused
+  # outright; anything else on the plane only from an example named in SANCTIONED_CALL_EXAMPLES.
+  if names_a_calling_function "$path" "$CALLING_RING"; then
+    examples_ringing_a_person="$examples_ringing_a_person $source"
+  elif names_a_calling_function "$path" "$CALLING_REACH" && ! sanctioned_call_example "$source" "$path"; then
+    examples_reaching_a_call="$examples_reaching_a_call $source"
   fi
   # Does it act outward at all? Through this crate's send path, by naming the
   # chatService messages endpoint itself, by publishing our read position — a
@@ -1246,6 +1304,41 @@ A restart IS the remedy when that keyring re-locked, but it is not yours to run:
 Repair sign-in button asks for it, and the backend asks on its own when it finds the keyring
 locked — at most three automatic repairs an hour across every backend on the machine. Ask the
 user to press the button."
+fi
+
+# --- 1d-quater. an example may not reach the calling plane ------------------------
+# A call reaches a person and has no sandbox, and an example reaches Teams' calling service with
+# a broker token past every gate the app has. See `names_a_calling_function` for what is matched,
+# and SANCTIONED_CALL_EXAMPLES for the one example that may — because its target is a constant.
+if [ -n "$examples_ringing_a_person" ] || [ -n "$examples_reaching_a_call" ]; then
+  [ -n "$examples_ringing_a_person" ] &&
+    printf 'note: a call that RINGS somebody is placed inside%s\n' "$examples_ringing_a_person" >&2
+  [ -n "$examples_reaching_a_call" ] &&
+    printf 'note: the calling plane is reached inside%s\n' "$examples_reaching_a_call" >&2
+  calling_examples="$examples_ringing_a_person$examples_reaching_a_call"
+  block "This command runs a cargo example that reaches Teams' CALLING service directly — it posts
+a calling signal, or builds a body that rings somebody, answers, declines, hangs up, mutes, joins
+or shares a screen:
+   ${calling_examples# }
+
+A call reaches a real person, and there is no sandbox call: a body this app sends rings a phone in
+somebody's pocket, opens the user's microphone to whoever is on the other end, or tells a caller
+they were declined, in the user's name, and none of it can be taken back. An example holds a
+broker token, so no port rule, no RPC gate and no write token stands in its way — what the file
+calls is the only thing that can be checked. Ringing somebody is refused whatever the file pins.
+
+The sanctioned ways onto the calling plane each have a CONSTANT target, proved from the app's own
+state before the outward act:
+
+  cd web && bun run join-live           # the one authorized meeting (NATIVE-CALLING.md § 8)
+  cd web && bun run call-live           # the one authorized one-to-one, with that person's
+                                        # agreement for the session
+  cargo run --example meeting_join_probe
+
+READING what the service says is open — the frame parsers, \`calling::endpoints\`, and
+\`cargo run --example meeting_join_recon\`. A new example that must reach the plane earns its place
+the way the probe did: a constant target, re-checked before the act, then named in
+SANCTIONED_CALL_EXAMPLES in this file."
 fi
 
 # --- 1e. our own presence is published by the gated RPC, or not at all ----------
