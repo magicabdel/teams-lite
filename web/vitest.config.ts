@@ -20,6 +20,12 @@ export default defineConfig({
   test: {
     globals: false,
     environment: "node",
+    // ONE time zone for every run, so a test's answer does not depend on the machine it runs on.
+    // A test that formats an instant in "the local zone" was written on a UTC machine (CI is one),
+    // and on a workstation in Paris the same suite failed three such tests every run — the
+    // recording file name and the stage's clock among them — over code nobody had touched. A test
+    // that is about a zone names it explicitly; this only fixes what "local" means.
+    env: { TZ: "UTC" },
     // Both extensions: a component test is written in JSX (`*.test.tsx`), and an
     // include pattern that only matched `.ts` would skip it in silence.
     //
