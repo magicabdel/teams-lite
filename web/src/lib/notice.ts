@@ -113,8 +113,14 @@ function present(notice: Notice): void {
     // card that floats over everything is exactly where it would show.
     icon: null,
   };
+  // A REPORT is sent with a type of its own (`info`), never as an untyped toast. Sonner
+  // replaces a toast under the same id by MERGING the new one into it, so an untyped report
+  // kept the `type: "error"` of the failure it replaced — and "You answered on another
+  // device." was drawn in the failure's red ink, because a refused camera had been said a
+  // moment before. The ink is keyed off that type (app-toaster.tsx), so the type has to be
+  // stated every time.
   if (notice.kind === "error") toast.error(notice.text, options);
-  else toast(notice.text, options);
+  else toast.info(notice.text, options);
 }
 
 /** Take one back — used when the thing it was about is being tried again, so the old

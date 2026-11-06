@@ -3059,6 +3059,41 @@ if (import.meta.main) {
       await shot(`${out}-notice-card-dark.png`, '[data-testid="call-notice"]');
       await setTheme("light");
       await page.locator('[data-testid="call-hangup"]').first().click();
+      await page.waitForSelector('[data-testid="call-stage"]', { state: "detached" });
+      await page.waitForTimeout(600);
+
+      // 9. A RING that ended somewhere else, and one nobody answered — the one sentence each
+      //    leaves behind once the card goes (docs/calling-roadmap/incoming-and-conversation.md
+      //    § 7). The mock states each the way the service's own frame does, a code and who took
+      //    the call, and reads it as the backend does: on the tenant, an endpoint that never
+      //    attached to the ring is told none of these yet. The page shot is the one that says
+      //    the card went; the crops are the sentence, in both themes.
+      const current = '[data-testid="call-notice"]:not([data-removed="true"])';
+      await emit({ kind: "call_invite", conversation: conversationId });
+      await page.waitForSelector('[data-testid="call-bar"][data-phase="ringing"]');
+      await emit({
+        kind: "call_end",
+        code: 450,
+        // The mock's own account: the user picked up on their phone.
+        accepted_elsewhere_by: { id: "8:orgid:00000000-0000-4000-8000-000000000000", displayName: "You" },
+      });
+      await page.waitForSelector(`${current}:has-text("another device")`);
+      await page.waitForTimeout(500);
+      await shot(`${out}-notice-answered-elsewhere-light.png`);
+      await shot(`${out}-notice-answered-elsewhere-card-light.png`, current);
+      await setTheme("dark");
+      await shot(`${out}-notice-answered-elsewhere-card-dark.png`, current);
+      await setTheme("light");
+      await emit({ kind: "call_invite", conversation: conversationId });
+      await page.waitForSelector('[data-testid="call-bar"][data-phase="ringing"]');
+      await emit({ kind: "call_end", code: 487 });
+      await page.waitForSelector(`${current}:has-text("Missed call")`);
+      await page.waitForTimeout(500);
+      await shot(`${out}-notice-missed-light.png`);
+      await shot(`${out}-notice-missed-card-light.png`, current);
+      await setTheme("dark");
+      await shot(`${out}-notice-missed-card-dark.png`, current);
+      await setTheme("light");
 
       console.log(
         `[preview] wrote ${out}-button-light.png, ${out}-off-light.png, ` +
@@ -3074,7 +3109,8 @@ if (import.meta.main) {
           `${out}-video-{light,page-light,dark}.png and ` +
           `${out}-send-{off-light,on-light}.png and ` +
           `${out}-sending-{light,page-light,dark}.png and ` +
-          `${out}-notice-{light,card-light,card-dark}.png`,
+          `${out}-notice-{light,card-light,card-dark}.png and ` +
+          `${out}-notice-{answered-elsewhere,missed}-{light,card-light,card-dark}.png`,
       );
     });
     process.exit(0);

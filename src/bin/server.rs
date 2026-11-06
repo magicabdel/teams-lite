@@ -2577,6 +2577,16 @@ struct CallSession {
     /// no client signed in. It is set from the frame that names the CAUSE and read by the
     /// ending, which names only the symptom (`calling::invite_failed`).
     unreachable: bool,
+    /// Who took a ring this machine was offered, when the service said it was answered
+    /// somewhere else and named by whom (`calling::END_REASON_ANSWERED_ELSEWHERE`). `None`
+    /// on every other ending, and on an answer elsewhere that named nobody.
+    ended_elsewhere: Option<EndedElsewhere>,
+    /// True once the invite of a call this machine PLACED is out: `call_place` was answered.
+    /// It is what lets the ring bound say "they did not answer" — a reservation whose invite
+    /// never left (the user sat on the browser's microphone prompt) rang nobody, and saying
+    /// the callee did not pick up would be false. Never set for an incoming call or a join,
+    /// neither of which invites anybody.
+    invite_sent: bool,
     /// Where to answer the media offer the service last made us, if it is still open.
     ///
     /// The service renegotiates unprompted and names the link on the frame itself, so this
@@ -2615,6 +2625,15 @@ struct CallSession {
     sharing: Option<calling::ContentSharing>,
 }
 
+/// Who took a ring this machine was offered (see [`CallSession::ended_elsewhere`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EndedElsewhere {
+    /// The user themselves, on another of their devices — "You answered on another device."
+    by_self: bool,
+    /// Who it was, as this app names them; empty when nothing could name them.
+    name: String,
+}
+
 impl CallSession {
     /// Everybody in the meeting but us. Our own mri is dropped here rather than in the
     /// caller, so a count of "who else is here" is one answer in one place.
@@ -2627,6 +2646,23 @@ impl CallSession {
     /// side of that emit it lands on.
     fn ended(&self) -> bool {
         self.phase == CallPhase::Ended
+    }
+
+    /// True while this is a call somebody is OFFERING this machine and nothing here has
+    /// connected: the only kind of call that can be answered elsewhere, forwarded, sent to
+    /// voicemail or given up on by its caller. `Connecting` is in it because a `callAcceptance`
+    /// frame moves a ring there (`call_accepted_in_frame`) without anybody answering HERE.
+    ///
+    /// The DIRECTION is what keeps a call the user placed or is joining out, and it is pinned:
+    /// both sit in `Connecting` with nothing connected. `connected_at_ms` is checked as well
+    /// although no path today leaves a call in these two phases with its audio started — it is
+    /// the rule itself ("nothing here has connected"), kept for the answer-time join to come
+    /// (docs/calling-roadmap/incoming-and-conversation.md M4a), which may move the phase and the
+    /// clock apart. No test can reach it until something does.
+    fn is_being_offered(&self) -> bool {
+        self.direction == CallDirection::Incoming
+            && self.connected_at_ms.is_none()
+            && matches!(self.phase, CallPhase::Ringing | CallPhase::Connecting)
     }
 
     /// The view of this call every client gets. It carries no SDP and no
@@ -2647,6 +2683,12 @@ impl CallSession {
             "mute_seq": self.mute_seq,
             "connected_at_ms": self.connected_at_ms,
             "end_reason": self.end_reason,
+            // Who answered a ring that ended elsewhere: the user themselves on another device,
+            // or somebody else by name. The page turns it into the one sentence it says.
+            "ended_elsewhere": self.ended_elsewhere.as_ref().map(|elsewhere| json!({
+                "by_self": elsewhere.by_self,
+                "name": elsewhere.name,
+            })),
             "in_lobby": self.in_lobby,
             // Who else is in the meeting, by name, and how many of them there are.
             // Ourselves excluded: a count that includes the reader reads as one person
@@ -7785,6 +7827,8 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
                     started_at_ms: now_ms(),
                     end_reason: None,
             unreachable: false,
+            ended_elsewhere: None,
+            invite_sent: false,
                     renegotiation_answer_link: None,
             outgoing_negotiation_at: None,
                     source_request_sequence: 0,
@@ -7938,6 +7982,8 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
                         started_at_ms: now_ms(),
                         end_reason: None,
             unreachable: false,
+            ended_elsewhere: None,
+            invite_sent: false,
                         renegotiation_answer_link: None,
             outgoing_negotiation_at: None,
                         source_request_sequence: 0,
@@ -8012,11 +8058,13 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
             .await;
             match placed {
                 Ok(placed) => {
+                    Ctx::note_answer_shapes("call_place", &placed.raw);
                     let held = {
                         let mut plane = ctx.calling.lock().unwrap();
                         match plane.call.as_mut().filter(|c| c.id == call_id && !c.ended()) {
                             Some(call) => {
                                 call.links.merge(&placed.links);
+                                call.invite_sent = true;
                                 true
                             }
                             None => false,
@@ -8085,6 +8133,7 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
                     return Err(e);
                 }
             };
+            Ctx::note_answer_shapes("call_join", &joined.raw);
             // The meeting is joined. Its links are held before anything else, so an
             // ending always has somewhere to post — and the lobby is a state of its own,
             // because the one thing the user has to know is that nobody has let them in.
@@ -8175,6 +8224,10 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
             };
             match ctx.post_call_signal(&url, &payload).await {
                 Ok(response) => {
+                    Ctx::note_answer_shapes(
+                        if used_attach { "call_accept (attach)" } else { "call_accept" },
+                        &response,
+                    );
                     let links = calling::Links::collect(&response);
                     // What the service handed back, by NAME — the shape and never the
                     // content, which is the discipline `calling::media_sections` already
@@ -8243,6 +8296,14 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
                             };
                             match ctx.post_call_signal(&url, &body).await {
                                 Ok(response) => {
+                                    Ctx::note_answer_shapes(
+                                        if is_acceptance {
+                                            "call_accept (acceptance)"
+                                        } else {
+                                            "call_accept (media answer)"
+                                        },
+                                        &response,
+                                    );
                                     let more = calling::Links::collect(&response);
                                     eprintln!(
                                         "[calling] the call was accepted; the service answered with {:?}",
@@ -15095,20 +15156,24 @@ impl Ctx {
         //       `calling::frame_route`). A frame whose address names NO session still goes on and
         //       is handled as the live call's, as before, so no branch below may assume a frame is
         //       addressed to the live call — only that it is not addressed to another.
-        //    4. sharing end — below the routing, because it forgets the LIVE call's session.
-        //    5. sharing granted — likewise, and it returns before the merge: the session's own
+        //    4. shapes — a JOURNAL of what the frame names (a transfer's keys, a conversation's
+        //       doors, a keep-alive interval), once per shape. It changes nothing and returns
+        //       nothing, so it stands right after the routing: every frame addressed to us is
+        //       said, a frame for a call that has already ended included.
+        //    5. sharing end — below the routing, because it forgets the LIVE call's session.
+        //    6. sharing granted — likewise, and it returns before the merge: the session's own
         //       `leave` must never overwrite the one a hangup posts to.
-        //    6. merge — the frame's links join the live call's; a call that has ended takes none.
-        //    7. invite failed — the cause of an ending, which arrives a beat before it.
-        //    8. end — after the cause it prefers.
-        //    9. roster
-        //   10. lobby
-        //   11. acknowledgement — before the phase and the answer, because its clock is the
+        //    7. merge — the frame's links join the live call's; a call that has ended takes none.
+        //    8. invite failed — the cause of an ending, which arrives a beat before it.
+        //    9. end — after the cause it prefers.
+        //   10. roster
+        //   11. lobby
+        //   12. acknowledgement — before the phase and the answer, because its clock is the
         //       service's.
-        //   12. accepted
-        //   13. renegotiation — before the answer: an offer and an answer share one pointer, and
+        //   13. accepted
+        //   14. renegotiation — before the answer: an offer and an answer share one pointer, and
         //       read the other way round an offer is handed to the page as an answer.
-        //   14. answer
+        //   15. answer
         record_call_frame(&frame);
         // The raw frame still goes to the UI console: the schema is young, and a
         // capture of what really arrived is what corrects it.
@@ -15148,6 +15213,9 @@ impl Ctx {
         if !proceed {
             return;
         }
+
+        // What the frame NAMES, said once per shape and acted on nowhere (see the method).
+        self.note_frame_shapes(&frame);
 
         // THE SESSION ENDED — the service taking the screen back, which is what happens when
         // somebody else presses Share (§ 10.4: the session changes hands). It is forgotten
@@ -15239,11 +15307,51 @@ impl Ctx {
             return;
         }
 
-        if let Some(ended) = calling::call_ended_from_frame(&frame.body) {
-            let reason = if ended.phrase.is_empty() {
-                format!("code {}", ended.code)
-            } else {
-                ended.phrase
+        // THE CALL IS OVER. A RING that ended somewhere else is NAMED — answered on another
+        // device, forwarded, sent to voicemail, or given up by the caller — because each is one
+        // sentence the user can act on, where the service's own phrase is a machine word
+        // (`calling::end_reason_for`). Only a call still being OFFERED here can end that way.
+        //
+        // Who answered it is named from the STORE, the one answer this app gives about a name
+        // (`display_name_for_mri`, which carries the user's own nickname for them), and from the
+        // frame's own words only where the store knows nobody. It is resolved before the plane
+        // is locked: a store read under that lock would hold every other call request on it.
+        if let Some(ended) = calling::call_ended_from_frame(&frame.url, &frame.body) {
+            let resolved = ended.accepted_elsewhere_by.as_ref().and_then(|(mri, _)| {
+                self.store()
+                    .ok()?
+                    .display_name_for_mri(mri)
+                    .ok()
+                    .flatten()
+                    .filter(|name| !name.trim().is_empty())
+            });
+            let named = {
+                let mut plane = self.calling.lock().unwrap();
+                plane.call.as_mut().and_then(|call| {
+                    let named = calling::end_reason_for(&ended, call.is_being_offered())?;
+                    if named == calling::END_REASON_ANSWERED_ELSEWHERE {
+                        call.ended_elsewhere =
+                            ended.accepted_elsewhere_by.as_ref().map(|(mri, name)| EndedElsewhere {
+                                by_self: calling::same_person(mri, &call.local.id),
+                                name: resolved.clone().unwrap_or_else(|| name.clone()),
+                            });
+                    }
+                    Some(named)
+                })
+            };
+            // The service's own words, kept beside the name this app gives them: the code and
+            // the sub-code are what tell two endings with one phrase apart.
+            eprintln!(
+                "[calling] the service ended the call: code {} sub-code {} {:?}{}",
+                ended.code,
+                ended.sub_code,
+                ended.phrase,
+                named.map(|name| format!(" — named {name}")).unwrap_or_default()
+            );
+            let reason = match named {
+                Some(name) => name.to_string(),
+                None if ended.phrase.is_empty() => format!("code {}", ended.code),
+                None => ended.phrase,
             };
             self.end_call_locally(&reason).await;
             return;
@@ -15471,6 +15579,12 @@ impl Ctx {
 
     /// Somebody is calling. Ring, unless this machine is busy.
     async fn handle_incoming_call(&self, invite: calling::IncomingCall) {
+        // What the invite says about its CONVERSATION — the event number, the keys, whether it
+        // is a group or a meeting — as a shape and never a value. Nothing reads it yet: it is
+        // what tells a later step what this tenant really sends before a ring is drawn as
+        // anything but a one-to-one call (docs/calling-roadmap/incoming-and-conversation.md
+        // § 4.13). Said for every invite, a busy one and one with no audio included.
+        eprintln!("[calling] an invite: {}", invite.conversation.shape());
         if !invite.has_audio() {
             eprintln!("[calling] ignoring an invite with no audio: {:?}", invite.modalities);
             return;
@@ -15543,6 +15657,8 @@ impl Ctx {
             started_at_ms: now_ms(),
             end_reason: None,
             unreachable: false,
+            ended_elsewhere: None,
+            invite_sent: false,
             renegotiation_answer_link: None,
             outgoing_negotiation_at: None,
             source_request_sequence: 0,
@@ -15594,6 +15710,67 @@ impl Ctx {
             tokio::time::sleep(SHARING_GRANT_POLL).await;
         }
         false
+    }
+
+    /// Journal what a frame NAMES and this app does not act on yet, once per shape — a
+    /// transfer's or a replacement's keys, a conversation's doors, a keep-alive interval.
+    ///
+    /// None of it is measured on this tenant, and each is what a later step is built on
+    /// (docs/calling-roadmap/incoming-and-conversation.md § 4.3, § 4.4), so the first live calls
+    /// write it down before anything relies on it. Shapes only: key names, counts and yes/no,
+    /// never a URL, which carries a key, and never a value somebody typed. One line per distinct
+    /// shape (`FrameNotes`), because a conversation that updates every few seconds must not
+    /// write a line every few seconds. It changes nothing, and nothing it reads decides anything.
+    fn note_frame_shapes(&self, frame: &trouter_events::CallFrame) {
+        let mut lines = Vec::new();
+        let url = frame.url.as_str();
+        if url.contains(calling::paths::CALL_TRANSFER) || url.contains(calling::paths::CALL_REPLACEMENT)
+        {
+            // Accepting either rings somebody with no click behind it, so this app does neither
+            // (docs/calling-roadmap/advanced-call-control.md) — but what arrives is worth knowing.
+            lines.push(format!(
+                "[calling] a frame on {} this app does not act on, with keys {:?}",
+                calling::callback_path(url),
+                calling::body_key_names(&frame.body)
+            ));
+        }
+        if url.contains(calling::paths::CONVERSATION_UPDATE) {
+            lines.push(match calling::conversation_doors(&frame.body) {
+                Some(doors) => format!("[calling] conversation doors — {}", doors.shape()),
+                None => "[calling] a conversationUpdate frame named no links".to_string(),
+            });
+        }
+        if let Some(offer) = calling::keep_alive_offer(&frame.body) {
+            lines.push(format!("[calling] a frame's {}", offer.shape()));
+        }
+        if lines.is_empty() {
+            return;
+        }
+        let fresh: Vec<String> = {
+            let mut plane = self.calling.lock().unwrap();
+            lines
+                .into_iter()
+                .filter(|line| plane.frame_notes.first(format!("shape\n{line}")))
+                .collect()
+        };
+        for line in fresh {
+            eprintln!("{line}");
+        }
+    }
+
+    /// Journal what an ANSWER to one of our own requests names — the doors of the conversation
+    /// it opened, and how the call wants to be kept alive — by name and never by URL.
+    ///
+    /// Said once per request, because each answer belongs to one call: it is the half of
+    /// [`Ctx::note_frame_shapes`] that arrives as a response rather than as a frame.
+    fn note_answer_shapes(method: &str, answer: &Value) {
+        match calling::conversation_doors(answer) {
+            Some(doors) => eprintln!("[calling] {method}: conversation doors — {}", doors.shape()),
+            None => eprintln!("[calling] {method}: the answer named no conversation links"),
+        }
+        if let Some(offer) = calling::keep_alive_offer(answer) {
+            eprintln!("[calling] {method}: the {}", offer.shape());
+        }
     }
 
     /// Mark the call over locally and tell every client. Sends nothing: this is what
@@ -15693,16 +15870,37 @@ impl Ctx {
     /// It reaches nobody: an unanswered ring holds no media and no leg of ours, and the
     /// reject link belongs to the user's own Reject button — declining on their behalf is a
     /// thing the caller would be SHOWN, which a timer must not decide.
+    ///
+    /// **Which ending it is depends on whether anybody was RUNG.** A ring the user never took,
+    /// and a call they placed whose invite is out, are both `END_REASON_UNANSWERED` — the page
+    /// says "Missed call" or "they did not answer" by the call's direction. A reservation whose
+    /// invite never left rang nobody: the bound counts from `call_prepare`, and a user sitting
+    /// on the browser's microphone prompt for a minute never reached `call_place`. That one is
+    /// a call that was not placed, said as such, because "Ava did not answer" about a call Ava
+    /// was never offered is false.
     async fn expire_unanswered_call(&self) {
         let stale = {
             let plane = self.calling.lock().unwrap();
-            plane.call.as_ref().is_some_and(|call| {
-                matches!(call.phase, CallPhase::Ringing | CallPhase::Dialing)
-                    && now_ms().saturating_sub(call.started_at_ms)
-                        >= CALL_RING_TIMEOUT.as_millis() as i64
-            })
+            plane
+                .call
+                .as_ref()
+                .filter(|call| {
+                    matches!(call.phase, CallPhase::Ringing | CallPhase::Dialing)
+                        && now_ms().saturating_sub(call.started_at_ms)
+                            >= CALL_RING_TIMEOUT.as_millis() as i64
+                })
+                .map(|call| call.phase == CallPhase::Dialing && !call.invite_sent)
         };
-        if !stale {
+        let Some(never_placed) = stale else {
+            return;
+        };
+        if never_placed {
+            eprintln!(
+                "[calling] the call was never placed within {}s — freeing the call slot so the \
+                 next invite can ring",
+                CALL_RING_TIMEOUT.as_secs()
+            );
+            self.end_call_locally("CallEndReasonPlaceFailed").await;
             return;
         }
         eprintln!(
@@ -15710,7 +15908,7 @@ impl Ctx {
              invite can ring",
             CALL_RING_TIMEOUT.as_secs()
         );
-        self.end_call_locally("CallEndReasonUnanswered").await;
+        self.end_call_locally(calling::END_REASON_UNANSWERED).await;
     }
 
     /// Tell the service the live call is still here, if it gave us a link to say it on.
@@ -17907,6 +18105,8 @@ mod tests {
             started_at_ms: now_ms(),
             end_reason: None,
             unreachable: false,
+            ended_elsewhere: None,
+            invite_sent: false,
             renegotiation_answer_link: None,
             outgoing_negotiation_at: None,
             source_request_sequence: 0,
@@ -17962,6 +18162,8 @@ mod tests {
             started_at_ms: now_ms(),
             end_reason: None,
             unreachable: false,
+            ended_elsewhere: None,
+            invite_sent: false,
             renegotiation_answer_link: None,
             outgoing_negotiation_at: None,
             source_request_sequence: 0,
@@ -18010,6 +18212,8 @@ mod tests {
             started_at_ms: now_ms(),
             end_reason: None,
             unreachable: false,
+            ended_elsewhere: None,
+            invite_sent: false,
             renegotiation_answer_link: None,
             outgoing_negotiation_at: None,
             source_request_sequence: 0,
@@ -18171,6 +18375,225 @@ mod tests {
         assert!(ctx.calling.lock().unwrap().call.is_none(), "the live call's own ending did not end it");
     }
 
+    /// The `call_state` frame that announced the END of a call, read off the event bus a test
+    /// subscribed to before driving the handler — the slot is freed right after it, so this is
+    /// the one place the ending can be read.
+    fn ending_announced(events: &mut broadcast::Receiver<Value>) -> Value {
+        while let Ok(event) = events.try_recv() {
+            if event["event"] == "call_state" && event["data"]["call"]["phase"] == "ended" {
+                return event["data"]["call"].clone();
+            }
+        }
+        panic!("no call_state announced an ending");
+    }
+
+    /// A store this test may write a nickname into, at a path of its own.
+    fn ctx_with_store(name: &str) -> (Ctx, std::path::PathBuf) {
+        let dir = std::env::temp_dir()
+            .join(format!("teams-lite-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("store.db").to_string_lossy().into_owned();
+        prepare_store(&db, true).unwrap();
+        let mut ctx = test_ctx();
+        ctx.db_path = Arc::new(db);
+        (ctx, dir)
+    }
+
+    /// A RING that ended somewhere else is named, and says who took it
+    /// (docs/calling-roadmap/incoming-and-conversation.md § 4.12). The user's own other device
+    /// is "you", however the frame spells their mri; anybody else is named from the STORE first
+    /// — the user's own nickname for them — and from the frame's words only where the store
+    /// knows nobody. The ending arrives as a BARE body on our end callback, which this app used
+    /// to miss entirely.
+    #[tokio::test]
+    async fn a_ring_that_ended_elsewhere_is_named_and_says_who() {
+        let (ctx, dir) = ctx_with_store("ended-elsewhere");
+        ctx.store().unwrap().set_person_name("8:orgid:delegate", Some("Dee"), 1_000).unwrap();
+        let ringing = |ctx: &Ctx| {
+            let mut call = call_on_session("ring");
+            call.direction = CallDirection::Incoming;
+            call.phase = CallPhase::Ringing;
+            call.connected_at_ms = None;
+            ctx.calling.lock().unwrap().call = Some(call);
+        };
+        let mut events = ctx.events.subscribe();
+
+        for (by, by_self, name) in [
+            (json!({ "id": "8:ORGID:ME", "displayName": "Me on my phone" }), true, "Me on my phone"),
+            (json!({ "id": "8:orgid:delegate", "displayName": "D. Legate" }), false, "Dee"),
+            (json!({ "id": "8:orgid:stranger", "displayName": "A Stranger" }), false, "A Stranger"),
+        ] {
+            ringing(&ctx);
+            ctx.handle_call_frame(frame_on(
+                "ring",
+                calling::paths::CALL_END,
+                json!({ "code": 450, "phrase": "CallEndReasonAnsweredElsewhere", "acceptedElsewhereBy": by }),
+            ))
+            .await;
+            let call = ending_announced(&mut events);
+            assert_eq!(call["end_reason"], calling::END_REASON_ANSWERED_ELSEWHERE);
+            assert_eq!(call["ended_elsewhere"]["by_self"], by_self, "{name}");
+            assert_eq!(call["ended_elsewhere"]["name"], name);
+            assert!(ctx.calling.lock().unwrap().call.is_none(), "the slot is freed");
+        }
+
+        // The other three a ring can end with, wrapped this time, and none names a person.
+        for (code, named) in [
+            (451, calling::END_REASON_FORWARDED),
+            (452, calling::END_REASON_VOICEMAIL),
+            (487, calling::END_REASON_CALLER_CANCELLED),
+        ] {
+            ringing(&ctx);
+            ctx.handle_call_frame(frame_on(
+                "ring",
+                calling::paths::CONVERSATION_END,
+                json!({ "_decoded": { "conversationEnd": { "code": code } } }),
+            ))
+            .await;
+            let call = ending_announced(&mut events);
+            assert_eq!(call["end_reason"], named, "{code}");
+            assert!(call["ended_elsewhere"].is_null(), "{code}");
+        }
+
+        // A 450 that names nobody is still an answer elsewhere, with nobody to name.
+        ringing(&ctx);
+        ctx.handle_call_frame(frame_on("ring", calling::paths::CALL_END, json!({ "code": 450 })))
+            .await;
+        let call = ending_announced(&mut events);
+        assert_eq!(call["end_reason"], calling::END_REASON_ANSWERED_ELSEWHERE);
+        assert!(call["ended_elsewhere"].is_null());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same codes said about a call the user is IN are the service's own words, never "you
+    /// answered on another device": they describe a ring, and this is not one.
+    #[tokio::test]
+    async fn a_call_in_progress_is_never_said_to_have_ended_elsewhere() {
+        let ctx = test_ctx();
+        let mut events = ctx.events.subscribe();
+        for direction in [CallDirection::Incoming, CallDirection::Outgoing] {
+            let mut call = call_on_session("live");
+            call.direction = direction;
+            ctx.calling.lock().unwrap().call = Some(call);
+            ctx.handle_call_frame(frame_on(
+                "live",
+                calling::paths::CALL_END,
+                json!({ "callEnd": {
+                    "code": 450, "phrase": "CallEndReasonHangup",
+                    "acceptedElsewhereBy": { "id": "8:orgid:me" }
+                } }),
+            ))
+            .await;
+            let ended = ending_announced(&mut events);
+            assert_eq!(ended["end_reason"], "CallEndReasonHangup");
+            assert!(ended["ended_elsewhere"].is_null());
+        }
+        // An OUTGOING call nothing has connected yet is not a ring this machine was offered —
+        // in the one unanswered phase a ring of ours ALSO has, `Connecting`, which a placed call
+        // reaches on its callee's `callAcceptance` and a meeting join sits in through the whole
+        // lobby wait. So it is the DIRECTION that decides here, not the phase: with the incoming
+        // check gone, a join the service ended with a 487 would read "Missed call".
+        for (kind, phase) in [
+            (CallKind::Call, CallPhase::Dialing),
+            (CallKind::Call, CallPhase::Connecting),
+            (CallKind::Meeting, CallPhase::Connecting),
+        ] {
+            for (body, said) in [
+                (json!({ "code": 487, "phrase": "Request terminated" }), "Request terminated"),
+                (
+                    json!({ "code": 450, "acceptedElsewhereBy": { "id": "8:orgid:me" } }),
+                    "code 450",
+                ),
+            ] {
+                let mut placed = call_on_session("live");
+                placed.kind = kind;
+                placed.phase = phase;
+                placed.connected_at_ms = None;
+                ctx.calling.lock().unwrap().call = Some(placed);
+                ctx.handle_call_frame(frame_on("live", calling::paths::CALL_END, body)).await;
+                let ended = ending_announced(&mut events);
+                assert_eq!(ended["end_reason"], said, "{kind:?} {phase:?}");
+                assert!(ended["ended_elsewhere"].is_null(), "{kind:?} {phase:?}");
+            }
+        }
+    }
+
+    /// The ring bound says WHICH ending it is: a ring the user never took and a placed call
+    /// whose invite is out are both "nobody answered", read by direction on the page; a
+    /// reservation whose invite never left — the user sat on the microphone prompt — rang
+    /// nobody, and is a call that was not placed. A call that was answered is never touched.
+    #[tokio::test]
+    async fn the_ring_bound_says_nobody_answered_only_where_somebody_was_rung() {
+        let ctx = test_ctx();
+        let mut events = ctx.events.subscribe();
+        let long_ago = now_ms() - CALL_RING_TIMEOUT.as_millis() as i64 - 1_000;
+        for (direction, phase, invite_sent, expected) in [
+            (CallDirection::Incoming, CallPhase::Ringing, false, calling::END_REASON_UNANSWERED),
+            (CallDirection::Outgoing, CallPhase::Dialing, true, calling::END_REASON_UNANSWERED),
+            (CallDirection::Outgoing, CallPhase::Dialing, false, "CallEndReasonPlaceFailed"),
+        ] {
+            let mut call = call_on_session("live");
+            call.direction = direction;
+            call.phase = phase;
+            call.connected_at_ms = None;
+            call.started_at_ms = long_ago;
+            call.invite_sent = invite_sent;
+            ctx.calling.lock().unwrap().call = Some(call);
+            ctx.expire_unanswered_call().await;
+            assert_eq!(ending_announced(&mut events)["end_reason"], expected, "{direction:?} {invite_sent}");
+            assert!(ctx.calling.lock().unwrap().call.is_none(), "the slot is freed");
+        }
+        // Inside the bound, and once answered, nothing moves.
+        let mut fresh = call_on_session("live");
+        fresh.phase = CallPhase::Dialing;
+        fresh.connected_at_ms = None;
+        ctx.calling.lock().unwrap().call = Some(fresh);
+        ctx.expire_unanswered_call().await;
+        let mut answered = call_on_session("live");
+        answered.started_at_ms = long_ago;
+        assert!(ctx.calling.lock().unwrap().call.is_some(), "a ring inside its bound was ended");
+        ctx.calling.lock().unwrap().call = Some(answered);
+        ctx.expire_unanswered_call().await;
+        assert!(ctx.calling.lock().unwrap().call.is_some(), "an answered call was ended on a timer");
+    }
+
+    /// The flag the bound reads is set where the invite really left, and nowhere else.
+    #[test]
+    fn only_an_answered_call_place_marks_the_invite_as_sent() {
+        let source = include_str!("server.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap_or(source);
+        assert_eq!(code.matches("invite_sent = true").count(), 1, "one place sets it");
+        let place = code
+            .split("\"call_place\" => {")
+            .nth(1)
+            .and_then(|rest| rest.split("\"call_join\" => {").next())
+            .expect("the call_place arm");
+        let merged = place.find("call.links.merge(&placed.links);").expect("the answer is merged");
+        let set = place.find("call.invite_sent = true;").expect("call_place sets invite_sent");
+        assert!(set > merged, "invite_sent is set once the answer is held, not before the POST");
+    }
+
+    /// A frame this app does not act on is said once per shape, and the shape names no URL —
+    /// the links a transfer or a conversation carries hold keys.
+    #[test]
+    fn a_frames_shape_is_said_once_and_names_no_url() {
+        let ctx = test_ctx();
+        let transfer = frame_on(
+            "live",
+            calling::paths::CALL_TRANSFER,
+            json!({ "transfer": { "links": { "transferAcceptance": "https://cc/secret" } } }),
+        );
+        // Nothing to observe but the dedup itself: a second identical frame is a repeat.
+        ctx.note_frame_shapes(&transfer);
+        let line = format!(
+            "shape\n[calling] a frame on {} this app does not act on, with keys {:?}",
+            calling::callback_path(&transfer.url),
+            vec!["transfer"]
+        );
+        assert!(!ctx.calling.lock().unwrap().frame_notes.first(line), "the shape was not noted");
+        assert!(!format!("{:?}", calling::body_key_names(&transfer.body)).contains("https"));
+    }
+
     /// A frame whose address names NO session keeps the handling it always had: nothing has
     /// measured that such a frame never acts on a call, so the routing only says that it saw one
     /// (once per address) and lets it through.
@@ -18263,6 +18686,7 @@ mod tests {
             ("relay", "calling::relay_config_in_frame("),
             ("invite", "calling::incoming_call_from_frame("),
             ("routing", ".route_frame(&frame.url)"),
+            ("shapes", "self.note_frame_shapes(&frame)"),
             ("sharing end", "calling::paths::CONVERSATION_CONTENT_SHARING_END"),
             ("sharing granted", "calling::paths::CONVERSATION_ADD_MODALITY_SUCCESS"),
             ("merge", "call.links.merge("),

@@ -726,7 +726,21 @@ and no cancel, no `callEnd` and no frame of any kind followed — an endpoint th
 is simply not told. One call at a time is the rule, so the ring sat in the plane and the NEXT
 invite was refused as `busy`: one missed call and this machine stopped ringing until it was
 restarted. `CALL_RING_TIMEOUT` (60 s) frees the slot, on the ticker that already keeps a live
-call alive, and only for the two UNANSWERED phases.
+call alive, and only for the two UNANSWERED phases. It sends nothing, and the page says which
+side nobody was on: "Missed call from {Name}." for a ring, "{Name} did not answer." for a call
+placed (`calling::END_REASON_UNANSWERED`, read by the call's direction) — the second only once
+that call's invite was answered, because the bound counts from the reservation and a call whose
+invite never left rang nobody (it ends as `CallEndReasonPlaceFailed`).
+
+**WHAT A RING THAT ENDED ELSEWHERE WOULD SAY is read, and unmeasured in the positive.** The
+client's `handleCallEnd` reads `e.body.callEnd || e.body` — so the BARE body of a frame on the
+end callback is an ending too, which this app used to miss — lets `callControllerTransactionEnd`
+override the outer ending, and reads `acceptedElsewhereBy {id, displayName}` beside the code.
+`calling::end_reason_for` names four codes while a call is still being offered here: 450
+answered elsewhere, 451 forwarded, 452 voicemail, 487 the caller gave up. The table is the
+client's, read from its bundle (docs/calling-roadmap/incoming-and-conversation.md § 4.12); none
+of the four has arrived on this tenant, because an endpoint that never attached is told nothing
+(above). They become reachable once the ring is claimed when it starts (that roadmap's M4b).
 
 **Two frames worth telling apart**, both `evt`-tagged: an invite is `evt: 107` with
 `callNotification` at its root, and a MeetingStart notification is `evt: 128` with

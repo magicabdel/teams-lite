@@ -555,6 +555,24 @@ code), **inferred** (neither).
   `expire_unanswered_call` covers `Dialing` too (`server.rs:15175-15177`).
 - **Status:** read-from-bundle. Measured only in the negative today (an unattached endpoint is told
   nothing).
+- **As implemented (M2, IC2):**
+  - `ringing` is `CallSession::is_being_offered`: incoming, `connected_at_ms` unset, and the
+    phase `Ringing` or `Connecting` (a `callAcceptance` frame moves a ring to `Connecting`
+    without anybody answering here).
+  - An `acceptedElsewhereBy` is a 450 whatever the code: naming who took the call is a statement
+    only an answer elsewhere makes. A 450 that names nobody carries `ended_elsewhere: null`, and
+    the page says "The call was answered elsewhere." rather than guessing who.
+  - The override is read FIELD BY FIELD (the override first, the outer object where it is
+    silent), so a field the service put on only one of the two is never lost.
+  - `by_self` compares OIDS (`calling::same_person`: case and the `8:orgid:` prefix), because
+    the two ids come from different services. The name is the store's
+    (`display_name_for_mri`) before the frame's `displayName`.
+  - Outgoing with no one name ("Design crew", or a callee with no name): "Nobody answered."
+  - The local bound says "did not answer" only once the outgoing invite is out
+    (`CallSession::invite_sent`, set when `call_place` is answered). It counts from
+    `call_prepare`, so a reservation that expires before its invite left (the user sat on the
+    microphone prompt) rang nobody, and ends as `CallEndReasonPlaceFailed` (§ 13 note 21).
+  - Every ending writes `[calling] the service ended the call: code … sub-code … "…" — named …`.
 
 ### 4.13 The invite's conversation, kind and subject (parse in M2, used in M7)
 
@@ -578,6 +596,11 @@ code), **inferred** (neither).
 
 - **Status:** `conversationInvitation` being present is measured. The field names are
   read-from-bundle. A 109 invite has never been captured.
+- **As implemented (M2, IC2):** the fields live in ONE struct, `IncomingCall.conversation:
+  InviteConversation` (`evt`, `invitation_keys`, `controller`, `multi_party`, `hostless`,
+  `subject`, `meeting`), and every invite journals its `shape()` — key names and yes/no, never the
+  subject or the controller URL. The kind is unchanged (still `Call`); M7 reads the struct. A
+  meeting is also recognised by a `groupChat.threadId` beside the notification, not only inside it.
 
 ### 4.14 `callProgress` "ringing": deliberately NOT sent
 
@@ -646,6 +669,15 @@ code), **inferred** (neither).
   `END_REASON_UNREACHABLE` (`:614`): `END_REASON_ANSWERED_ELSEWHERE`, `END_REASON_FORWARDED`,
   `END_REASON_VOICEMAIL`, `END_REASON_CALLER_CANCELLED`. New `pub fn end_reason_for(&CallEnded,
   ringing: bool) -> Option<&'static str>`.
+- **As implemented (M2, IC2):** `CallEnded` gained `sub_code` and `accepted_elsewhere_by`;
+  `call_ended_from_frame(url, frame)`; the five `END_REASON_*` constants (the four above plus
+  `END_REASON_UNANSWERED`, which was a literal in server.rs); `end_reason_for`; `same_person`. And
+  three journal readers that decide nothing: `keep_alive_offer` (§ 4.4's interval and `callLeg`,
+  off an acceptance answer or frame), `conversation_doors` (§ 4.3's four doors and any
+  broker-shaped key, off the place, join and accept answers and every `conversationUpdate`), and
+  `body_key_names` (a `transfer` or `replacement` frame). In server.rs the frame half is
+  `note_frame_shapes`, step 4 of the handler's documented order, once per distinct shape through
+  `FrameNotes`; the answer half is `note_answer_shapes`, once per request.
 - **New typed refusal:** `pub struct SignalRefused { pub status: u16 }`, carried in the `anyhow`
   chain so `e.downcast_ref::<SignalRefused>()` tells a definitive 4xx from a lost answer.
 - **The transport is plane-reliability M4's, not a second one** (README § 3, collision 7). This
@@ -1096,6 +1128,16 @@ The mock records presses one at a time; its hooks are `{kind:"call_mute", fail|h
 `{kind:"call_mute", offline}`, `{kind:"call_state"}` (a frame changed in nothing) and `mutes` on
 `{kind:"call_record"}`.
 
+**As implemented (M2):** specs 1 and 2 live in `web/e2e/call-answering.spec.ts`, with a third
+pinning that a call answered HERE is never said to have ended elsewhere, and a fourth that a
+meeting being JOINED (outgoing, `connecting`, held on the wire) is never said to be missed. The
+mock's hooks are
+`{kind:"call_end", code, accepted_elsewhere_by}` (read by `mockServiceEnding`, the backend's
+`end_reason_for` re-spelled for the other install the mock stands for) and `{kind:"call_place",
+nobody_answers:true}`, which ends the next placed call as `CallEndReasonUnanswered` once its
+`call_place` has answered. The `--call` capture gained
+`-notice-{answered-elsewhere,missed}-{light,card-light,card-dark}`; it is what found § 13 note 20.
+
 **Captures:**
 - `cd web && bun run preview -- --out /tmp/call --call` gains `-ring-group`, `-ring-meeting`,
   `-ring-unclaimable`, `-notice-answered-elsewhere`, `-notice-missed`, `-stage-elsewhere-{light,dark}`
@@ -1332,6 +1374,26 @@ Each milestone ships alone.
     `CallSession.muted`, a source scan matching one spelling, and four test or doc claims that
     nothing pinned (a press made while the holder could not hear, the once-only re-send, the
     stale-frame guard, the truth table's own comments) — each now pinned or corrected.
+
+20. **Implementing M2 found a notice drawn in the wrong ink.** The capture of "You answered on
+    another device." came out RED: sonner replaces a toast under the same id by merging into it,
+    and a report was sent untyped, so it kept the `type: "error"` of the refused camera said a
+    moment before. Every call notice shares one id (`CALL_NOTICE`), so any report following a
+    failure inside its nine seconds was drawn as a failure. A report is now sent as `toast.info`
+    (`web/src/lib/notice.ts`), pinned by `notice.test.ts`.
+
+21. **An independent review of the M2 implementation (three reviewers, a skeptic per
+    dimension) confirmed three findings; all are fixed.** No test pinned the DIRECTION half of
+    `is_being_offered`: the only outgoing case was `Dialing`, which the phase already excludes,
+    while a placed call after `callAcceptance` and a meeting join in its lobby are outgoing and
+    `Connecting` with nothing connected — a 487 there would have read "Missed call". It is
+    pinned now in Rust and against the mock (a join held on the wire). "{Name} did not answer."
+    could be said about a call whose invite never left, because the bound counts from the
+    reservation — fixed with `invite_sent`. And one E2E step asserted a "Missed call" notice
+    while the identical one from the step before still stood, so it could not fail; the steps
+    are reordered so a different sentence stands between them. Refused: canonicalising the
+    acceptedElsewhereBy id before the store lookup (the app looks every frame's mri up as
+    spelled, and nothing measured a different spelling).
 
 **What was rejected or changed, and why:**
 - **Hard-coding a target in every calling example.** Rejected: the sanctioned

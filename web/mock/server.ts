@@ -4670,6 +4670,9 @@ type MockCall = {
   mute_seq: number;
   connected_at_ms: number | null;
   end_reason: string | null;
+  /** Who took a ring this machine was offered, when the "service" said it was answered
+   *  elsewhere and by whom — the backend's `ended_elsewhere`. */
+  ended_elsewhere: { by_self: boolean; name: string } | null;
   /** What the others publish, and the source ids a subscription is addressed by — the
    *  half of the roster the real backend reads out of `endpoints[…].call.mediaStreams`. */
   publishing: MockPublishing[];
@@ -4917,6 +4920,15 @@ let mockMutes: { muted: boolean; refused: boolean }[] = [];
  *  screen, because a page that declined and then drew the right card would pass every
  *  assertion about the card. */
 let mockHangups: { intent: string | null; declined: boolean }[] = [];
+/** Whether the next call the page PLACES is one nobody picks up — the callee's devices ring,
+ *  nobody answers, and the backend's own ring bound (`CALL_RING_TIMEOUT`) frees the slot with
+ *  `CallEndReasonUnanswered`. The bound is a minute on the backend and a beat here. The ending
+ *  is scheduled only once `call_place` has answered because the backend says "nobody answered"
+ *  only about a call whose invite is out (`invite_sent`): a reservation that expires before its
+ *  invite left is a call that was not placed (`CallEndReasonPlaceFailed`), which this hook does
+ *  not model. Armed by `{kind:"call_place", nobody_answers:true}`; `call_invite {reset:true}`
+ *  clears it. */
+let mockNextPlaceUnanswered = false;
 /** How many `call_status` reads the `refuse_status` hook has failed, read back by the same
  *  hook: a spec proving that a failed read keeps the call has to know the read really failed,
  *  or it passes on a page that never asked. */
@@ -5044,16 +5056,77 @@ function clearMockCallTimers(): void {
 
 /** End the mock call and hand out one last frame carrying the reason — the same shape
  *  the Rust backend emits, so the page releases its (simulated) microphone. */
-function endMockCall(reason: string): void {
+function endMockCall(
+  reason: string,
+  endedElsewhere: MockCall["ended_elsewhere"] = null,
+): void {
   clearMockCallTimers();
   // The session goes with the call: the meeting's presenter cannot outlive the meeting, and a
   // session left behind would refuse the first share of the NEXT call in a shared mock.
   mockSharingSession = null;
   mockSharingOrder = [];
   if (!mockCall) return;
-  mockCall = { ...mockCall, phase: "ended", end_reason: reason, can_accept: false, can_hangup: false };
+  mockCall = {
+    ...mockCall,
+    phase: "ended",
+    end_reason: reason,
+    ended_elsewhere: endedElsewhere,
+    can_accept: false,
+    can_hangup: false,
+  };
   broadcastMockCall();
   mockCall = null;
+}
+
+/**
+ * Read an ending the "service" sent with a CODE, exactly as the backend does
+ * (`calling::end_reason_for` and the end branch of `handle_call_frame`).
+ *
+ * The four codes a RING can end with are named only while the call is still being OFFERED to
+ * this machine — incoming, nothing connected — because "answered elsewhere" said about a call
+ * the user is in would be false. Naming who took the call (`accepted_elsewhere_by`) is an
+ * answer elsewhere whatever the code. Who it was is named the way the backend names them:
+ * the user's own nickname first, then the directory's name, then the frame's own words — and
+ * "you" when it is this account, however the id is spelled. Any other code is the service's
+ * phrase, or `code N` when it sent none.
+ */
+function mockServiceEnding(
+  call: MockCall,
+  code: number,
+  acceptedElsewhereBy: unknown,
+  phrase: string,
+): { reason: string; endedElsewhere: MockCall["ended_elsewhere"] } {
+  const offered =
+    call.direction === "incoming" &&
+    call.connected_at_ms === null &&
+    (call.phase === "ringing" || call.phase === "connecting");
+  const by =
+    acceptedElsewhereBy && typeof acceptedElsewhereBy === "object"
+      ? (acceptedElsewhereBy as { id?: unknown; displayName?: unknown })
+      : null;
+  const id = typeof by?.id === "string" ? by.id : "";
+  const displayName = typeof by?.displayName === "string" ? by.displayName : "";
+  const namedSomebody = id !== "" || displayName !== "";
+  const fallback = { reason: phrase || `code ${code}`, endedElsewhere: null };
+  if (!offered) return fallback;
+  if (namedSomebody || code === 450) {
+    const oid = (mri: string) => mri.trim().toLowerCase().replace(/^8:orgid:/, "");
+    return {
+      reason: "CallEndReasonAnsweredElsewhere",
+      endedElsewhere: namedSomebody
+        ? {
+            by_self: oid(id) !== "" && oid(id) === oid(SELF_MRI),
+            name: nickname(id) || teamsNameFor(id) || displayName,
+          }
+        : null,
+    };
+  }
+  const named: Record<number, string> = {
+    451: "CallEndReasonForwarded",
+    452: "CallEndReasonForwardedToVoicemail",
+    487: "CallEndReasonCallerCancelled",
+  };
+  return named[code] ? { reason: named[code], endedElsewhere: null } : fallback;
 }
 
 /**
@@ -5142,6 +5215,7 @@ function injectMockCallInvite(conversation: string): MockCall | null {
     mute_seq: 0,
     connected_at_ms: null,
     end_reason: null,
+    ended_elsewhere: null,
     publishing: [],
     sending: [],
     can_accept: true,
@@ -10449,6 +10523,7 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
           mute_seq: 0,
           connected_at_ms: null,
           end_reason: null,
+          ended_elsewhere: null,
           publishing: [],
           sending: [],
           can_accept: false,
@@ -10496,6 +10571,7 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
         mute_seq: 0,
         connected_at_ms: null,
         end_reason: null,
+        ended_elsewhere: null,
         publishing: [],
         sending: [],
         can_accept: false,
@@ -10528,6 +10604,16 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
         // placed call up on the links the answer carried; there is nothing to hang up
         // here, and the page must be told this call is not going to connect.
         return { call_id: callId, cancelled: true };
+      }
+      if (mockNextPlaceUnanswered) {
+        mockNextPlaceUnanswered = false;
+        mockCallTimers.push(
+          setTimeout(() => {
+            if (!mockCall || mockCall.id !== callId || mockCall.phase !== "dialing") return;
+            endMockCall("CallEndReasonUnanswered");
+          }, MOCK_CALL_ANSWER_MS),
+        );
+        return { call_id: callId };
       }
       // The far side picks up, then their SDP arrives — the two frames the real
       // service sends, in the real order.
@@ -13603,6 +13689,17 @@ async function handleTestHook(req: Request, url: URL): Promise<Response | null> 
       endMockCall(body.reason);
       return Response.json({ ok: true, reason: body.reason }, { status: 200 });
     }
+    // End it with a CODE instead, the way the service's own frame states one, and let the mock
+    // read it exactly as the backend does (`mockServiceEnding`): a ring answered on another
+    // device, forwarded, sent to voicemail or given up on by its caller. Reachable nowhere
+    // else — on the tenant, an endpoint that never attached to the ring is told none of these.
+    if (body.kind === "call_end" && typeof body.code === "number") {
+      if (!mockCall) return Response.json({ ok: false, error: "no call" }, { status: 409 });
+      const phrase = typeof body.phrase === "string" ? body.phrase : "";
+      const ended = mockServiceEnding(mockCall, body.code, body.accepted_elsewhere_by, phrase);
+      endMockCall(ended.reason, ended.endedElsewhere);
+      return Response.json({ ok: true, ...ended }, { status: 200 });
+    }
     // Answer an offer of the page's in a way no browser can read — the third way a capture
     // ends without a click, after a refusal and a drop, and the one that used to cost the
     // whole call. Nothing is armed: the answer goes out now, on the live call.
@@ -13713,6 +13810,11 @@ async function handleTestHook(req: Request, url: URL): Promise<Response | null> 
       mockRefusesNextMicrophone = true;
       return Response.json({ ok: true, microphone: "refuse" }, { status: 200 });
     }
+    // Make the next PLACED call one nobody picks up (`mockNextPlaceUnanswered`).
+    if (body.kind === "call_place" && body.nobody_answers === true) {
+      mockNextPlaceUnanswered = true;
+      return Response.json({ ok: true, nobody_answers: true }, { status: 200 });
+    }
     // Every hangup this mock carried out, whether it DECLINED the caller, and how many status
     // reads were failed on purpose.
     if (body.kind === "call_record") {
@@ -13794,6 +13896,7 @@ async function handleTestHook(req: Request, url: URL): Promise<Response | null> 
         mockRefusesNextMicrophone = false;
         mockRefusesNextStatus = false;
         mockHangups = [];
+        mockNextPlaceUnanswered = false;
         mockStatusRefusals = 0;
         mockMuteFailsNext = false;
         mockMuteHoldMs = 0;

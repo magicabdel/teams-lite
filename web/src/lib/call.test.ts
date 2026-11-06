@@ -2,8 +2,13 @@ import { describe, expect, it } from "vitest";
 import {
   UNKNOWN_CALL_STATUS,
   callDurationLabel,
+  CALL_END_ANSWERED_ELSEWHERE,
+  CALL_END_CALLER_CANCELLED,
+  CALL_END_FORWARDED,
   CALL_END_LEFT_RINGING,
+  CALL_END_UNANSWERED,
   CALL_END_UNREACHABLE,
+  CALL_END_VOICEMAIL,
   callEndLabel,
   callIsStillRinging,
   callPhaseLabel,
@@ -463,6 +468,94 @@ describe("what the bar says", () => {
     expect(callEndLabel(call({ end_reason: CALL_END_UNREACHABLE, kind: "group" }))).toMatch(
       /Nobody could be reached/,
     );
+  });
+});
+
+describe("a ring that ended elsewhere, and one nobody answered", () => {
+  const ring = (overrides: Partial<ActiveCall> = {}) =>
+    call({ direction: "incoming", kind: "call", peer: "Ana Lima", phase: "ended", ...overrides });
+
+  /** Answered on another device is the one ending that says WHO, and "you" is the commonest
+   *  answer: the user picked up on their phone. Anybody else is named; a frame that named
+   *  nobody says only what happened. */
+  it("says who answered a ring this machine was offered", () => {
+    expect(
+      callEndLabel(
+        ring({ end_reason: CALL_END_ANSWERED_ELSEWHERE, ended_elsewhere: { by_self: true, name: "Me" } }),
+      ),
+    ).toBe("You answered on another device.");
+    expect(
+      callEndLabel(
+        ring({
+          end_reason: CALL_END_ANSWERED_ELSEWHERE,
+          ended_elsewhere: { by_self: false, name: "Dee Legate" },
+        }),
+      ),
+    ).toBe("Dee Legate answered this call.");
+    expect(
+      callEndLabel(
+        ring({ end_reason: CALL_END_ANSWERED_ELSEWHERE, ended_elsewhere: { by_self: false, name: "" } }),
+      ),
+    ).toBe("Somebody else answered this call.");
+    // A backend too old to say who, or a frame that named nobody.
+    expect(callEndLabel(ring({ end_reason: CALL_END_ANSWERED_ELSEWHERE }))).toBe(
+      "The call was answered elsewhere.",
+    );
+    expect(callEndLabel(ring({ end_reason: CALL_END_ANSWERED_ELSEWHERE, ended_elsewhere: null }))).toBe(
+      "The call was answered elsewhere.",
+    );
+  });
+
+  it("names a forwarded ring, one that went to voicemail, and one the caller gave up on", () => {
+    expect(callEndLabel(ring({ end_reason: CALL_END_FORWARDED }))).toBe("The call was forwarded.");
+    expect(callEndLabel(ring({ end_reason: CALL_END_VOICEMAIL }))).toBe("The call went to voicemail.");
+    expect(callEndLabel(ring({ end_reason: CALL_END_CALLER_CANCELLED }))).toBe(
+      "Missed call from Ana Lima.",
+    );
+    expect(callEndLabel(ring({ end_reason: CALL_END_CALLER_CANCELLED, peer: "" }))).toBe("Missed call.");
+  });
+
+  /** WHICH side nobody was on is the whole sentence: a ring the user never took is a missed
+   *  call, a call they placed that nobody took is "they did not answer". It used to be "The
+   *  call ended." for both. */
+  it("says which side nobody answered on", () => {
+    expect(callEndLabel(ring({ end_reason: CALL_END_UNANSWERED }))).toBe("Missed call from Ana Lima.");
+    expect(callEndLabel(ring({ end_reason: CALL_END_UNANSWERED, peer: "" }))).toBe("Missed call.");
+    const placed = { end_reason: CALL_END_UNANSWERED, direction: "outgoing" as const };
+    expect(callEndLabel(call({ ...placed, peer: "Ana Lima", kind: "call" }))).toBe(
+      "Ana Lima did not answer.",
+    );
+    // A group has no one name to put there, and a person with no name has none either.
+    expect(callEndLabel(call({ ...placed, peer: "Design crew", kind: "group" }))).toBe(
+      "Nobody answered.",
+    );
+    expect(callEndLabel(call({ ...placed, peer: "", kind: "call" }))).toBe("Nobody answered.");
+  });
+
+  it("spells every name the backend states, and never the default sentence for one", () => {
+    expect([
+      CALL_END_ANSWERED_ELSEWHERE,
+      CALL_END_FORWARDED,
+      CALL_END_VOICEMAIL,
+      CALL_END_CALLER_CANCELLED,
+      CALL_END_UNANSWERED,
+    ]).toEqual([
+      "CallEndReasonAnsweredElsewhere",
+      "CallEndReasonForwarded",
+      "CallEndReasonForwardedToVoicemail",
+      "CallEndReasonCallerCancelled",
+      "CallEndReasonUnanswered",
+    ]);
+    for (const end_reason of [
+      CALL_END_ANSWERED_ELSEWHERE,
+      CALL_END_FORWARDED,
+      CALL_END_VOICEMAIL,
+      CALL_END_CALLER_CANCELLED,
+      CALL_END_UNANSWERED,
+    ]) {
+      expect(callEndLabel(ring({ end_reason }))).not.toBe("The call ended.");
+      expect(callEndLabel(ring({ end_reason }))).not.toBe("");
+    }
   });
 });
 

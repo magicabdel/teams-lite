@@ -6069,6 +6069,18 @@ call does — this side never handles RTP, and the page never learns a Teams URL
   own ending. **Unverified against the tenant**: no live run has carried a frame for another
   session yet. The live regression is a `join-live --from-chat --hold 60`, which must show no
   `ignored a frame` line while the call is up and end on the service's own end frame as before.
+- **WHAT THE SERVICE SAYS AND NOTHING HERE ACTS ON YET IS JOURNALED, by shape and never by
+  value.** The next calling steps are built on fields nobody has seen on this tenant, so the
+  backend writes them down first: an invite's conversation (`[calling] an invite: evt …,
+  conversationInvitation [keys], multi-party …`, `calling::InviteConversation`), the doors a
+  conversation names (`leave`, `updateEndpointState`, `notificationLinks`, `unmute`, plus any
+  broker-shaped key — `calling::conversation_doors`, on the place, join and accept answers and
+  every `conversationUpdate` frame), how an acceptance wants to be kept alive
+  (`callKeepAliveInterval` and its `callLeg`, `calling::keep_alive_offer`), and the keys of a
+  `transfer` or `replacement` frame, which this app never accepts. Key names, counts and yes/no
+  only — a URL carries a key and a subject is somebody's words — and a frame's shape once per
+  distinct shape (`note_frame_shapes`, step 4 of the handler's order, deduped through
+  `FrameNotes`). None of it decides anything.
 - **A CHAT is called; a MEETING is joined, and the conversation decides which**
   (`conversationCallAction` in `web/src/lib/call.ts`, drawn by `conversation-menu.tsx`). One
   control per conversation, in its header:
@@ -6127,7 +6139,13 @@ call does — this side never handles RTP, and the page never learns a Teams URL
   - **A ring nobody answers is never closed by the service**, so it used to hold the one call
     slot for ever and every later invite was refused as `busy`: one missed call and this
     machine stopped ringing until it was restarted. `CALL_RING_TIMEOUT` frees it, for the two
-    UNANSWERED phases only.
+    UNANSWERED phases only — and says WHICH side nobody was on (`calling::END_REASON_UNANSWERED`,
+    read by the call's own direction): "Missed call from Ana." on a ring the user never took,
+    "Ana did not answer." on a call they placed. Both used to read "The call ended." The
+    second is said only once the invite is OUT (`CallSession::invite_sent`, set when
+    `call_place` is answered): the bound counts from `call_prepare`, so a user who sat on the
+    browser's microphone prompt for a minute never rang Ava at all, and that reservation ends
+    as a call that was not placed (`CallEndReasonPlaceFailed`).
   - **What is still open is the incoming HANGUP**: no step of the three answers a `hangup`,
     `end`, `leave` or `conversationEnd`, so `callLeg` is tried last and is UNMEASURED. The
     user's own call ends regardless — the local drop runs whether or not the POST does — so
@@ -6342,6 +6360,36 @@ call does — this side never handles RTP, and the page never learns a Teams URL
     Rust test pins the two spellings together. Without it the user pressed call, watched it
     die two seconds later, and was told "The call ended." — five times in a row, which reads
     as this app dropping their calls.
+  - **A RING THAT ENDED ELSEWHERE SAYS HOW, and who took it** (`calling::end_reason_for`, over
+    `call_ended_from_frame`). Four codes are named — 450 "You answered on another device." or
+    "{Name} answered this call.", 451 forwarded, 452 sent to voicemail, 487 "Missed call from
+    {Name}." — and ONLY while the call is still being OFFERED here (incoming, nothing connected,
+    `CallSession::is_being_offered`): "answered elsewhere" said about a conversation the user is
+    in would be false, so the same code on a live call is the service's own phrase. It is the
+    DIRECTION that decides as much as the phase: a placed call after its callee's
+    `callAcceptance` and a meeting join through its whole lobby wait are both in `Connecting`
+    with nothing connected, exactly like a ring. Four rules, each pinned by a test:
+    - **Who answered is named from the STORE first** (`display_name_for_mri`, the user's own
+      nickname included) and from the frame's `acceptedElsewhereBy.displayName` only where the
+      store knows nobody; "you" is the user's own oid however the frame spells it
+      (`calling::same_person`, case and the `8:orgid:` prefix). The name rides on the call as
+      `ended_elsewhere {by_self, name}`.
+    - **The ending is read the client's three ways**: a `callEnd` / `conversationEnd` key,
+      `callControllerTransactionEnd` overriding the outer object field by field, and the BARE
+      BODY of a frame posted to one of our two end callbacks — which this app used to miss,
+      leaving the call drawn as live. The bare body is read on our end paths and nowhere else.
+    - **Nothing is SENT for any of them.** The user did not decline, so nothing may say they did;
+      `call_record`'s hangups stay empty in `web/e2e/call-answering.spec.ts`.
+    - **Today only the MOCK reaches the four codes.** An endpoint that never attached to the ring
+      is told nothing when it ends elsewhere (NATIVE-CALLING.md § 8a), so these become reachable
+      on the tenant once the ring is claimed when it starts
+      (docs/calling-roadmap/incoming-and-conversation.md, M4b). The mock reads a code exactly as
+      the backend does (`{kind:"call_end", code, accepted_elsewhere_by}`), and
+      `{kind:"call_place", nobody_answers:true}` makes the next placed call one nobody picks up.
+  - **A report never inherits a failure's ink** (`present` in `web/src/lib/notice.ts`). Sonner
+    replaces a notice under the same id by MERGING into it, so an untyped report kept the
+    `type: "error"` of the failure it replaced: "You answered on another device." was drawn red
+    because a refused camera had been said a moment before. A report is sent as `toast.info`.
   - **Only a CALL comes through here.** A failed send stays at the composer and an approval
     stays in the menu it was clicked in (§ Sending messages, § The trackers), and the write
     lock, a broken sign-in and a pending update keep their banners and their row: each of

@@ -493,6 +493,94 @@ pub struct IncomingCall {
     pub links: Links,
     /// The participant leg the service assigned us, echoed back in our answers.
     pub participant_id: Option<String>,
+    /// What the invite says about the CONVERSATION the call belongs to, read beside the
+    /// notification (`conversationInvitation`, `meetingInfo`, the frame's own `evt`).
+    ///
+    /// **It is read and journaled, and decides nothing yet.** Every field is read-from-bundle
+    /// rather than measured (docs/calling-roadmap/incoming-and-conversation.md § 4.13), so the
+    /// first live invites say what this tenant really sends before a ring is drawn as a group
+    /// call or a meeting on the strength of it. An invite that carries none of it is the
+    /// one-to-one this app has always answered.
+    pub conversation: InviteConversation,
+}
+
+/// The conversation half of an invite. See [`IncomingCall::conversation`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InviteConversation {
+    /// The invite's own `evt` — 107 for a one-to-one call, 109 for a group one, in the client's
+    /// own table. `None` when the frame named none or named it as something else.
+    pub evt: Option<i64>,
+    /// The keys `conversationInvitation` carried, sorted, for the journal — a shape, never a
+    /// value. Empty when the invite carried no such object.
+    pub invitation_keys: Vec<String>,
+    /// Where the conversation lives, when the invite names it: the door a join at answer time
+    /// would post to.
+    pub controller: Option<String>,
+    /// `isMultiParty` and `isHostless`, as the invite states them.
+    pub multi_party: Option<bool>,
+    pub hostless: Option<bool>,
+    /// The conversation's own subject, when it has one — a meeting's title, a group chat's
+    /// name. User content: it is never written to the journal, only whether there is one.
+    pub subject: Option<String>,
+    /// Whether the invite belongs to a MEETING: it carries `meetingInfo` or `meetingData`, or
+    /// its thread is a meeting's own (`19:meeting_…`).
+    pub meeting: bool,
+}
+
+impl InviteConversation {
+    /// One journal line's worth of shape: the event number, the keys, the two flags, and
+    /// whether there is a subject and a meeting — no URL, no subject, no id.
+    pub fn shape(&self) -> String {
+        let flag = |value: Option<bool>| match value {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "unstated",
+        };
+        format!(
+            "evt {}, conversationInvitation {:?}, multi-party {}, hostless {}, subject {}, \
+             meeting {}, controller {}",
+            self.evt.map(|evt| evt.to_string()).unwrap_or_else(|| "unstated".into()),
+            self.invitation_keys,
+            flag(self.multi_party),
+            flag(self.hostless),
+            if self.subject.is_some() { "yes" } else { "no" },
+            if self.meeting { "yes" } else { "no" },
+            if self.controller.is_some() { "yes" } else { "no" },
+        )
+    }
+}
+
+/// Read the conversation half of an invite. Each field is looked for under `_decoded` first
+/// and at the root after it, because whether a frame arrives wrapped depends on its size.
+fn invite_conversation(frame: &Value, thread_id: Option<&str>) -> InviteConversation {
+    let at = |path: &str| -> Option<&Value> {
+        frame.pointer(&format!("/_decoded{path}")).or_else(|| frame.pointer(path))
+    };
+    let invitation = at("/conversationInvitation").filter(|v| v.is_object());
+    let field = |name: &str| invitation.and_then(|inv| inv.get(name));
+    let evt = frame.get("evt").or_else(|| frame.pointer("/_decoded/evt")).and_then(|evt| {
+        evt.as_i64().or_else(|| evt.as_str().and_then(|s| s.trim().parse().ok()))
+    });
+    InviteConversation {
+        evt,
+        invitation_keys: invitation
+            .and_then(Value::as_object)
+            .map(sorted_keys)
+            .unwrap_or_default(),
+        controller: field("conversationController").and_then(Value::as_str).map(String::from),
+        multi_party: field("isMultiParty").and_then(Value::as_bool),
+        hostless: field("isHostless").and_then(Value::as_bool),
+        subject: field("subject")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        meeting: at("/meetingInfo").is_some()
+            || at("/meetingData").is_some()
+            || thread_id
+                .or_else(|| at("/groupChat/threadId").and_then(Value::as_str))
+                .is_some_and(|t| t.starts_with("19:meeting_")),
+    }
 }
 
 impl IncomingCall {
@@ -553,11 +641,13 @@ pub fn incoming_call_from_frame(frame: &Value) -> Option<IncomingCall> {
         })
         .unwrap_or_else(|| vec![MODALITY_AUDIO.to_string()]);
 
+    let conversation = invite_conversation(frame, thread_id.as_deref());
     Some(IncomingCall {
         call_id,
         caller_mri,
         caller_name,
         thread_id,
+        conversation,
         modalities,
         offer: notification.get("mediaContent").and_then(MediaContent::parse),
         links: Links::collect(notification),
@@ -574,34 +664,128 @@ pub struct CallEnded {
     pub call_id: String,
     /// The service's own code, kept verbatim for the journal.
     pub code: i64,
+    /// The service's own sub-code, kept for the journal: it is what tells two endings with
+    /// one code apart (`5003` "Removing modality controller" against `5013` "no one else has
+    /// joined", both code 0, measured on an unreachable call). 0 when the frame named none.
+    pub sub_code: i64,
     /// The service's own phrase (e.g. `"CallEndReasonHangup"`), or empty.
     pub phrase: String,
+    /// Who took the call instead, when the service says it was answered somewhere else —
+    /// `(mri, the display name the frame carried)`. The name is the frame's and may be empty;
+    /// the backend names the person from its own store before anything is drawn.
+    pub accepted_elsewhere_by: Option<(String, String)>,
 }
 
 /// Read a call-ending frame, or `None` when the frame is something else.
 ///
 /// Both endings are one case on purpose: whichever of the two arrives, the call is
 /// over and the browser must stop holding the microphone.
-pub fn call_ended_from_frame(frame: &Value) -> Option<CallEnded> {
-    let end = ["/_decoded/callEnd", "/callEnd", "/_decoded/conversationEnd", "/conversationEnd"]
+///
+/// **Three shapes, and the third is why `url` is a parameter.** The ending is a `callEnd` or a
+/// `conversationEnd` object, wrapped (`/_decoded/…`) or not; or it is the BARE BODY of a frame
+/// posted to one of our two end callbacks, which carries no such key at all. The client reads
+/// it the same way — `let i = e.body.callEnd || e.body` — and this app missed it, so an ending
+/// sent that way left the call drawn as live until something else ended it. The bare body is
+/// only ever read on our own end paths: anywhere else a body with no ending key is not one.
+///
+/// **`callControllerTransactionEnd` overrides the outer ending**, which is again the client's
+/// own reading (`i.callControllerTransactionEnd && (i = i.callControllerTransactionEnd)`): when
+/// the call controller states how its transaction ended, that is the ending. Each field is read
+/// off the override first and off the outer object where the override is silent, so a field
+/// the service put on only one of the two is never lost.
+pub fn call_ended_from_frame(url: &str, frame: &Value) -> Option<CallEnded> {
+    let named = ["/_decoded/callEnd", "/callEnd", "/_decoded/conversationEnd", "/conversationEnd"]
         .iter()
-        .find_map(|p| frame.pointer(p))?;
-    let code = ["/code", "/transactionEnd/code"]
-        .iter()
-        .find_map(|p| end.pointer(p).and_then(Value::as_i64))
-        .unwrap_or(0);
-    let phrase = ["/phrase", "/transactionEnd/phrase"]
-        .iter()
-        .find_map(|p| end.pointer(p).and_then(Value::as_str))
+        .find_map(|p| frame.pointer(p));
+    let end = match named {
+        Some(end) => end,
+        None if url.contains(paths::CALL_END) || url.contains(paths::CONVERSATION_END) => {
+            frame.get("_decoded").unwrap_or(frame)
+        }
+        None => return None,
+    };
+    let inner = end.get("callControllerTransactionEnd").filter(|v| v.is_object());
+    let levels: Vec<&Value> = inner.into_iter().chain(std::iter::once(end)).collect();
+    let read = |paths: &[&str]| -> Option<&Value> {
+        levels.iter().find_map(|level| paths.iter().find_map(|p| level.pointer(p)))
+    };
+    let code = read(&["/code", "/transactionEnd/code"]).and_then(Value::as_i64).unwrap_or(0);
+    let sub_code =
+        read(&["/subCode", "/transactionEnd/subCode"]).and_then(Value::as_i64).unwrap_or(0);
+    let phrase = read(&["/phrase", "/transactionEnd/phrase"])
+        .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let call_id = ["/callId", "/debugContent/callId"]
-        .iter()
-        .find_map(|p| end.pointer(p).and_then(Value::as_str))
+    let accepted_elsewhere_by = read(&["/acceptedElsewhereBy"]).and_then(|by| {
+        let id = by.get("id").and_then(Value::as_str).unwrap_or_default();
+        let name = by.get("displayName").and_then(Value::as_str).unwrap_or_default();
+        (!id.is_empty() || !name.is_empty()).then(|| (id.to_string(), name.to_string()))
+    });
+    let call_id = read(&["/callId", "/debugContent/callId"])
+        .and_then(Value::as_str)
         .or_else(|| frame.get("callId").and_then(Value::as_str))
         .unwrap_or_default()
         .to_string();
-    Some(CallEnded { call_id, code, phrase })
+    Some(CallEnded { call_id, code, sub_code, phrase, accepted_elsewhere_by })
+}
+
+/// A ring this endpoint was offered was ANSWERED on another device — the user's phone, or a
+/// delegate picking it up. Code 450, the client's own reading of it.
+pub const END_REASON_ANSWERED_ELSEWHERE: &str = "CallEndReasonAnsweredElsewhere";
+/// A ring this endpoint was offered was FORWARDED somewhere else. Code 451.
+pub const END_REASON_FORWARDED: &str = "CallEndReasonForwarded";
+/// A ring this endpoint was offered went to VOICEMAIL. Code 452.
+pub const END_REASON_VOICEMAIL: &str = "CallEndReasonForwardedToVoicemail";
+/// The CALLER gave up before anybody answered. Code 487.
+pub const END_REASON_CALLER_CANCELLED: &str = "CallEndReasonCallerCancelled";
+/// Nobody answered within this app's own ring bound (`CALL_RING_TIMEOUT` in
+/// src/bin/server.rs), in either direction: a ring the user never took, or a call they placed
+/// that nobody picked up. The page tells the two apart by the call's own direction.
+pub const END_REASON_UNANSWERED: &str = "CallEndReasonUnanswered";
+
+/// The name of an ending a RING can have, or `None` when the service's own phrase is all there
+/// is to say.
+///
+/// These four codes mean something only about a call that is still being OFFERED to this
+/// endpoint (`ringing`: an incoming call nothing here has connected): "answered elsewhere" said
+/// about a conversation the user is in would be false. They are the client's own, read out of
+/// its `handleCallEnd` with `acceptedElsewhereBy` beside them — which is also taken as a 450
+/// when it arrives with another code, because naming who took the call is a statement no other
+/// ending makes.
+///
+/// **Unmeasured in the positive.** An endpoint that never attached to the forked leg is told
+/// nothing when a ring ends elsewhere (NATIVE-CALLING.md § 8a), and that is every endpoint of
+/// this app today: the names become reachable on the tenant once the ring is claimed when it
+/// starts (docs/calling-roadmap/incoming-and-conversation.md, M4b). Until then the mock is what
+/// says them.
+pub fn end_reason_for(ended: &CallEnded, ringing: bool) -> Option<&'static str> {
+    if !ringing {
+        return None;
+    }
+    match ended.code {
+        _ if ended.accepted_elsewhere_by.is_some() => Some(END_REASON_ANSWERED_ELSEWHERE),
+        450 => Some(END_REASON_ANSWERED_ELSEWHERE),
+        451 => Some(END_REASON_FORWARDED),
+        452 => Some(END_REASON_VOICEMAIL),
+        487 => Some(END_REASON_CALLER_CANCELLED),
+        _ => None,
+    }
+}
+
+/// Whether two mris name one person.
+///
+/// The ids this app compares come from different services — the session's own identity and a
+/// frame's `acceptedElsewhereBy` — and nothing has measured that both spell an oid with the same
+/// case or the same `8:orgid:` prefix. Read wrong, "you answered on your phone" becomes "<your
+/// own name> answered this call", so the comparison is made on the oid itself. An empty id names
+/// nobody.
+pub fn same_person(a: &str, b: &str) -> bool {
+    fn oid(mri: &str) -> String {
+        let lower = mri.trim().to_ascii_lowercase();
+        lower.strip_prefix("8:orgid:").map(str::to_string).unwrap_or(lower)
+    }
+    let (a, b) = (oid(a), oid(b));
+    !a.is_empty() && a == b
 }
 
 /// The name this app gives an ending the service reported as "no callee endpoints were
@@ -1274,6 +1458,140 @@ pub fn call_accepted_in_frame(frame: &Value) -> bool {
     ["/_decoded/callAcceptance", "/callAcceptance", "/_decoded/callConnected"]
         .iter()
         .any(|p| frame.pointer(p).is_some())
+}
+
+/// What an acceptance says about keeping the call alive: how often the service wants to hear
+/// from this endpoint, and whether it named the door to say it on.
+///
+/// The client reads both off the acceptance's acknowledgement
+/// (`this.links[KEEPALIVE] = e.callAcceptanceAcknowledgement.links.callLeg`,
+/// `scheduleKeepAlives(e.callAcceptanceAcknowledgement.callKeepAliveInterval)`), which arrives
+/// INLINE in the answer to our own acceptance of an incoming call, and on the `callAcceptance`
+/// frame of a call we placed. **This app sends no keep-alive the service asked for**, and the
+/// interval has never been seen on this tenant — so it is read here for the journal alone, and
+/// what a later keep-alive is built on is the value the first live calls write down
+/// (docs/calling-roadmap/incoming-and-conversation.md § 4.4 and M6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeepAliveOffer {
+    /// Which object it was read off: `"callAcceptanceAcknowledgement"` or `"callAcceptance"`.
+    pub source: &'static str,
+    /// `callKeepAliveInterval`, in seconds, as the service stated it.
+    pub interval_s: Option<i64>,
+    /// Whether the object carried a `callLeg` link — the keep-alive's door.
+    pub call_leg: bool,
+}
+
+impl KeepAliveOffer {
+    /// One journal line's worth: the source, the interval and whether the door is there.
+    pub fn shape(&self) -> String {
+        format!(
+            "{} names keep-alive interval {} and {} callLeg link",
+            self.source,
+            self.interval_s.map(|s| format!("{s} s")).unwrap_or_else(|| "none".into()),
+            if self.call_leg { "a" } else { "no" },
+        )
+    }
+}
+
+/// Read a [`KeepAliveOffer`] out of an answer or a frame, or `None` when it carries neither
+/// object. The acknowledgement is preferred, because it is the one the client schedules from.
+pub fn keep_alive_offer(body: &Value) -> Option<KeepAliveOffer> {
+    ["callAcceptanceAcknowledgement", "callAcceptance"].iter().find_map(|&source| {
+        let object = body
+            .pointer(&format!("/_decoded/{source}"))
+            .or_else(|| body.get(source))
+            .filter(|v| v.is_object())?;
+        let interval_s = object.get("callKeepAliveInterval").and_then(|v| {
+            v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+        });
+        let call_leg = object.pointer("/links/callLeg").and_then(Value::as_str).is_some();
+        Some(KeepAliveOffer { source, interval_s, call_leg })
+    })
+}
+
+/// The doors a CONVERSATION object names, read for the journal before anything is built on
+/// them.
+///
+/// The client keeps a conversation's own links apart from the call leg's: `leave` is how an
+/// answered incoming call is ended so the caller is told, `updateEndpointState` is where its
+/// mute is published, `notificationLinks` and `unmute` are the others it reads — all from the
+/// TOP-LEVEL `links` of the object (docs/calling-roadmap/incoming-and-conversation.md § 4.3).
+/// None of that is measured on this tenant, so the answers that could carry one say which they
+/// did: the place answer, the join answer, an attach answer's
+/// `/additionalActionResponses/0/output`, and every `conversationUpdate` frame. A key that
+/// names a BROKER is listed too, because one has never been seen and the bundle mentions them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationDoors {
+    /// Which object it was read off.
+    pub source: &'static str,
+    /// The names of its top-level `links`, sorted — never a URL.
+    pub links: Vec<String>,
+}
+
+impl ConversationDoors {
+    /// The four doors this workstream will build on, in that order.
+    pub const WATCHED: [&'static str; 4] =
+        ["leave", "updateEndpointState", "notificationLinks", "unmute"];
+
+    /// One journal line's worth: which of the watched doors are there, then every link name.
+    pub fn shape(&self) -> String {
+        let has = |name: &str| self.links.iter().any(|link| link == name);
+        let watched: Vec<String> = Self::WATCHED
+            .iter()
+            .map(|name| format!("{name} {}", if has(name) { "yes" } else { "no" }))
+            .collect();
+        let broker: Vec<&String> = self
+            .links
+            .iter()
+            .filter(|link| link.eq_ignore_ascii_case("subscribe") || link.to_ascii_lowercase().contains("broker"))
+            .collect();
+        format!(
+            "{}: {}; broker-shaped {:?}; links {:?}",
+            self.source,
+            watched.join(", "),
+            broker,
+            self.links,
+        )
+    }
+}
+
+/// Read the [`ConversationDoors`] of an answer or a frame, or `None` when it holds no
+/// conversation object with links.
+pub fn conversation_doors(body: &Value) -> Option<ConversationDoors> {
+    let decoded = body.get("_decoded").unwrap_or(body);
+    let candidates: [(&'static str, Option<&Value>); 3] = [
+        ("conversationUpdate", decoded.get("conversationUpdate")),
+        ("additionalActionResponses output", decoded.pointer("/additionalActionResponses/0/output")),
+        ("conversation", Some(decoded)),
+    ];
+    candidates.into_iter().find_map(|(source, object)| {
+        let links = object?.get("links")?.as_object()?;
+        Some(ConversationDoors { source, links: sorted_keys(links) })
+    })
+}
+
+/// The top-level key names of a frame's body — what a frame this app does not act on is
+/// journaled as, so the first one that arrives says its shape and nothing it carried.
+///
+/// It is the reading for a `transfer` and a `replacement`: accepting either would ring
+/// somebody with no click behind it, so this app does neither
+/// (docs/calling-roadmap/advanced-call-control.md), and what the service sends there has never
+/// been seen. `_decoded`'s keys are named in place of the wrapper's.
+pub fn body_key_names(body: &Value) -> Vec<String> {
+    body.get("_decoded")
+        .filter(|v| v.is_object())
+        .unwrap_or(body)
+        .as_object()
+        .map(sorted_keys)
+        .unwrap_or_default()
+}
+
+/// An object's keys, SORTED — a journal line that names a shape must read the same for the same
+/// shape whatever order the service wrote it in, or the once-per-shape dedup says it twice.
+fn sorted_keys(map: &serde_json::Map<String, Value>) -> Vec<String> {
+    let mut keys: Vec<String> = map.keys().cloned().collect();
+    keys.sort();
+    keys
 }
 
 /// Build the ONE POST that places a call (NATIVE-CALLING.md § 2.3).
@@ -2758,15 +3076,246 @@ mod tests {
 
     #[test]
     fn an_ending_is_read_from_either_name() {
-        let end = call_ended_from_frame(&json!({
-            "_decoded": { "callEnd": { "code": 410, "phrase": "Gone", "callId": "c1" } }
-        }))
+        let roster = "https://surl/callAgent/s/c/conversation/rosterUpdate/";
+        let end = call_ended_from_frame(
+            roster,
+            &json!({
+                "_decoded": { "callEnd": {
+                    "code": 410, "subCode": 5013, "phrase": "Gone", "callId": "c1"
+                } }
+            }),
+        )
         .expect("an ending");
         assert_eq!(end.code, 410);
+        assert_eq!(end.sub_code, 5013);
         assert_eq!(end.phrase, "Gone");
         assert_eq!(end.call_id, "c1");
-        assert!(call_ended_from_frame(&json!({ "conversationEnd": {} })).is_some());
-        assert!(call_ended_from_frame(&json!({ "callNotification": {} })).is_none());
+        assert_eq!(end.accepted_elsewhere_by, None);
+        assert!(call_ended_from_frame(roster, &json!({ "conversationEnd": {} })).is_some());
+        assert!(call_ended_from_frame(roster, &json!({ "callNotification": {} })).is_none());
+    }
+
+    /// The client reads `e.body.callEnd || e.body`, so an ending posted to one of our end
+    /// callbacks may carry no `callEnd` key at all. Missed, it left the call drawn as live.
+    /// Anywhere else a body with no ending key is not an ending.
+    #[test]
+    fn a_bare_body_on_our_end_paths_is_an_ending_and_nowhere_else() {
+        let base = CallbackBase {
+            surl: "https://surl/".into(),
+            session_id: "s".into(),
+            cause_id: "c".into(),
+        };
+        let bare = json!({ "code": 487, "subCode": 10003, "phrase": "Request terminated" });
+        for path in [paths::CALL_END, paths::CONVERSATION_END] {
+            let url = base.link(path);
+            // Unwrapped: the root IS the body.
+            let end = call_ended_from_frame(&url, &bare).unwrap_or_else(|| panic!("a bare ending on {path}"));
+            assert_eq!((end.code, end.sub_code), (487, 10003), "{path}");
+            assert_eq!(end.phrase, "Request terminated");
+            // Wrapped: the body is what `_decoded` holds, never the envelope around it.
+            let wrapped = json!({ "evt": 1, "cp": "…", "_decoded": bare.clone() });
+            let end = call_ended_from_frame(&url, &wrapped).expect("a wrapped bare ending");
+            assert_eq!(end.code, 487, "{path}");
+        }
+        for path in [paths::CONVERSATION_UPDATE, paths::CALL_ACCEPTANCE, paths::CALL_TRANSFER] {
+            assert_eq!(call_ended_from_frame(&base.link(path), &bare), None, "{path}");
+        }
+    }
+
+    /// `callControllerTransactionEnd` is the ending when it is there — the client replaces its
+    /// reading with it — and a field it does not state is still read off the outer object.
+    /// `acceptedElsewhereBy` is read at either level.
+    #[test]
+    fn the_call_controllers_own_ending_overrides_the_outer_one() {
+        let url = "https://surl/callAgent/s/c/call/end/";
+        let end = call_ended_from_frame(
+            url,
+            &json!({ "callEnd": {
+                "code": 0, "phrase": "Outer", "callId": "outer-id",
+                "callControllerTransactionEnd": {
+                    "code": 450, "subCode": 10500,
+                    "acceptedElsewhereBy": { "id": "8:orgid:me", "displayName": "Me" }
+                }
+            } }),
+        )
+        .expect("an ending");
+        assert_eq!((end.code, end.sub_code), (450, 10500));
+        // The override names no phrase, so the outer one stands.
+        assert_eq!(end.phrase, "Outer");
+        assert_eq!(end.call_id, "outer-id");
+        assert_eq!(end.accepted_elsewhere_by, Some(("8:orgid:me".into(), "Me".into())));
+
+        let outer = call_ended_from_frame(
+            url,
+            &json!({ "_decoded": { "callEnd": {
+                "code": 450,
+                "acceptedElsewhereBy": { "id": "8:orgid:other", "displayName": "" }
+            } } }),
+        )
+        .expect("an ending");
+        assert_eq!(outer.accepted_elsewhere_by, Some(("8:orgid:other".into(), String::new())));
+        // An `acceptedElsewhereBy` naming nobody names nobody.
+        let empty = call_ended_from_frame(
+            url,
+            &json!({ "callEnd": { "code": 450, "acceptedElsewhereBy": {} } }),
+        )
+        .expect("an ending");
+        assert_eq!(empty.accepted_elsewhere_by, None);
+    }
+
+    /// The four names a RING can end with, and only while it is still being offered here.
+    #[test]
+    fn a_ring_that_ended_elsewhere_is_named_and_a_live_call_is_not() {
+        let ended = |code: i64, by: Option<(&str, &str)>| CallEnded {
+            call_id: "c".into(),
+            code,
+            sub_code: 0,
+            phrase: "CallEndReasonHangup".into(),
+            accepted_elsewhere_by: by.map(|(id, name)| (id.to_string(), name.to_string())),
+        };
+        assert_eq!(end_reason_for(&ended(450, None), true), Some(END_REASON_ANSWERED_ELSEWHERE));
+        assert_eq!(end_reason_for(&ended(451, None), true), Some(END_REASON_FORWARDED));
+        assert_eq!(end_reason_for(&ended(452, None), true), Some(END_REASON_VOICEMAIL));
+        assert_eq!(end_reason_for(&ended(487, None), true), Some(END_REASON_CALLER_CANCELLED));
+        // Naming who took the call is a statement only an answer elsewhere makes.
+        assert_eq!(
+            end_reason_for(&ended(0, Some(("8:orgid:x", "X"))), true),
+            Some(END_REASON_ANSWERED_ELSEWHERE)
+        );
+        // Any other code is the service's own phrase.
+        assert_eq!(end_reason_for(&ended(0, None), true), None);
+        assert_eq!(end_reason_for(&ended(603, None), true), None);
+        // And a call that is not being offered here is never "answered elsewhere".
+        for code in [450, 451, 452, 487] {
+            assert_eq!(end_reason_for(&ended(code, None), false), None, "{code}");
+        }
+        assert_eq!(end_reason_for(&ended(450, Some(("8:orgid:x", "X"))), false), None);
+    }
+
+    #[test]
+    fn one_person_is_one_person_however_the_mri_is_spelled() {
+        assert!(same_person("8:orgid:ABC-1", "8:orgid:abc-1"));
+        assert!(same_person("8:orgid:abc-1", "abc-1"));
+        assert!(same_person(" abc-1 ", "8:ORGID:abc-1"));
+        assert!(!same_person("8:orgid:abc-1", "8:orgid:abc-2"));
+        assert!(!same_person("", ""));
+        assert!(!same_person("8:orgid:", "8:orgid:"));
+    }
+
+    /// The conversation half of an invite, read wrapped and unwrapped, and stated as a shape
+    /// that names no value — the subject and the controller URL above all.
+    #[test]
+    fn an_invites_conversation_is_read_and_journaled_as_a_shape() {
+        let invite = json!({
+            "evt": 109,
+            "_decoded": {
+                "callNotification": { "from": { "id": "8:orgid:caller", "displayName": "C" } },
+                "conversationInvitation": {
+                    "conversationController": "https://cc.example/conv/secret",
+                    "isMultiParty": true,
+                    "isHostless": false,
+                    "subject": "  Quarterly planning ",
+                },
+                "meetingInfo": { "organizerId": "x" },
+            }
+        });
+        let call = incoming_call_from_frame(&invite).expect("an invite");
+        let c = &call.conversation;
+        assert_eq!(c.evt, Some(109));
+        assert_eq!(c.controller.as_deref(), Some("https://cc.example/conv/secret"));
+        assert_eq!((c.multi_party, c.hostless), (Some(true), Some(false)));
+        assert_eq!(c.subject.as_deref(), Some("Quarterly planning"));
+        assert!(c.meeting);
+        let shape = c.shape();
+        assert!(shape.contains("evt 109"), "{shape}");
+        assert!(shape.contains("\"isMultiParty\""), "{shape}");
+        assert!(!shape.contains("Quarterly"), "the subject is user content: {shape}");
+        assert!(!shape.contains("cc.example"), "the controller is a URL: {shape}");
+
+        // Unwrapped, with the meeting named by its thread and `evt` sent as text.
+        let plain = json!({
+            "evt": "107",
+            "callNotification": {
+                "from": { "id": "8:orgid:caller" },
+                "groupChat": { "threadId": "19:meeting_abc@thread.v2" },
+            }
+        });
+        let c = incoming_call_from_frame(&plain).expect("an invite").conversation;
+        assert_eq!(c.evt, Some(107));
+        assert!(c.meeting);
+        assert!(c.invitation_keys.is_empty());
+        assert_eq!(c.multi_party, None);
+
+        // An invite that says nothing about its conversation is the one-to-one it always was.
+        let bare = json!({ "callNotification": { "from": { "id": "8:orgid:caller" } } });
+        assert_eq!(
+            incoming_call_from_frame(&bare).expect("an invite").conversation,
+            InviteConversation::default()
+        );
+    }
+
+    #[test]
+    fn an_acceptance_says_how_it_wants_to_be_kept_alive() {
+        let ack = json!({ "callAcceptanceAcknowledgement": {
+            "callKeepAliveInterval": 45,
+            "links": { "callLeg": "https://cc/leg" }
+        } });
+        let offer = keep_alive_offer(&ack).expect("an offer");
+        assert_eq!(offer.source, "callAcceptanceAcknowledgement");
+        assert_eq!(offer.interval_s, Some(45));
+        assert!(offer.call_leg);
+        assert!(!offer.shape().contains("https"), "{}", offer.shape());
+
+        let frame = json!({ "_decoded": { "callAcceptance": {
+            "callKeepAliveInterval": "60", "links": { "acknowledgement": "https://cc/ack" }
+        } } });
+        let offer = keep_alive_offer(&frame).expect("an offer");
+        assert_eq!((offer.source, offer.interval_s, offer.call_leg), ("callAcceptance", Some(60), false));
+
+        let silent = keep_alive_offer(&json!({ "callAcceptance": {} })).expect("an offer");
+        assert_eq!(silent.interval_s, None);
+        assert!(silent.shape().contains("interval none"));
+        assert_eq!(keep_alive_offer(&json!({ "rosterUpdate": {} })), None);
+    }
+
+    #[test]
+    fn a_conversation_says_which_doors_it_names_and_no_url() {
+        let update = json!({ "_decoded": { "conversationUpdate": {
+            "links": {
+                "leave": "https://cc/leave",
+                "updateEndpointState": "https://cc/ues",
+                "subscribeToBroker": "https://cc/b",
+            }
+        } } });
+        let doors = conversation_doors(&update).expect("doors");
+        assert_eq!(doors.source, "conversationUpdate");
+        let shape = doors.shape();
+        assert!(shape.contains("leave yes"), "{shape}");
+        assert!(shape.contains("updateEndpointState yes"), "{shape}");
+        assert!(shape.contains("notificationLinks no"), "{shape}");
+        assert!(shape.contains("unmute no"), "{shape}");
+        assert!(shape.contains("broker-shaped [\"subscribeToBroker\"]"), "{shape}");
+        assert!(!shape.contains("https"), "{shape}");
+
+        let attach = json!({ "callInvitation": { "links": { "acceptance": "a" } },
+            "additionalActionResponses": [ { "output": { "links": { "unmute": "u" } } } ] });
+        let doors = conversation_doors(&attach).expect("doors");
+        assert_eq!(doors.source, "additionalActionResponses output");
+        assert!(doors.shape().contains("unmute yes"));
+
+        let place = json!({ "links": { "leave": "l" }, "state": "x" });
+        assert_eq!(conversation_doors(&place).expect("doors").source, "conversation");
+        assert_eq!(conversation_doors(&json!({ "callInvitation": {} })), None);
+    }
+
+    #[test]
+    fn a_frame_nothing_acts_on_is_named_by_its_keys() {
+        assert_eq!(
+            body_key_names(&json!({ "evt": 1, "_decoded": { "transfer": {}, "links": {} } })),
+            vec!["links".to_string(), "transfer".to_string()]
+        );
+        assert_eq!(body_key_names(&json!({ "replacement": {} })), vec!["replacement".to_string()]);
+        assert!(body_key_names(&json!("text")).is_empty());
     }
 
     /// The frame that names the CAUSE of a call that ends two seconds in, in the shape the
@@ -2829,6 +3378,38 @@ mod tests {
             "web/src/lib/call.ts must name {END_REASON_LEFT_RINGING}, or a ring the user let go \
              is reported as \"The call ended.\""
         );
+    }
+
+    /// The same contract for every ending a RING can have and for one nobody answered: each
+    /// name is a sentence on the page, and a name the page does not know falls to "The call
+    /// ended." — about a call the user missed, or took on their phone.
+    #[test]
+    fn the_page_knows_the_names_of_a_ring_that_ended_elsewhere() {
+        let call_ts = include_str!("../web/src/lib/call.ts");
+        for name in [
+            END_REASON_ANSWERED_ELSEWHERE,
+            END_REASON_FORWARDED,
+            END_REASON_VOICEMAIL,
+            END_REASON_CALLER_CANCELLED,
+            END_REASON_UNANSWERED,
+        ] {
+            assert!(
+                call_ts.contains(&format!("\"{name}\"")),
+                "web/src/lib/call.ts must name {name}, or the ring it names is reported as \
+                 \"The call ended.\""
+            );
+        }
+        // And the mock names them the same way, or the specs review a page the backend never
+        // talks to.
+        let mock = include_str!("../web/mock/server.ts");
+        for name in [
+            END_REASON_ANSWERED_ELSEWHERE,
+            END_REASON_FORWARDED,
+            END_REASON_VOICEMAIL,
+            END_REASON_CALLER_CANCELLED,
+        ] {
+            assert!(mock.contains(&format!("\"{name}\"")), "web/mock/server.ts must name {name}");
+        }
     }
 
     #[test]

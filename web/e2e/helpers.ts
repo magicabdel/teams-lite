@@ -678,6 +678,38 @@ export async function endCallWithReason(page: Page, reason: string): Promise<voi
 }
 
 /**
+ * End the live call with a CODE, the way the service's own `callEnd` states one, and let the
+ * mock read it exactly as the backend does (`calling::end_reason_for`): 450 answered on another
+ * device — by whoever `acceptedElsewhereBy` names — 451 forwarded, 452 sent to voicemail, 487
+ * given up on by the caller. Those four are named only while the call is still RINGING here.
+ *
+ * It exists because nothing else can reach these endings: on the tenant, an endpoint that never
+ * attached to the ring is told none of them (NATIVE-CALLING.md § 8a).
+ */
+export async function endCallWithCode(
+  page: Page,
+  code: number,
+  acceptedElsewhereBy?: { id: string; displayName: string },
+): Promise<void> {
+  const res = await page.request.post(`http://127.0.0.1:${MOCK_PORT}/__test/emit`, {
+    data: { kind: "call_end", code, accepted_elsewhere_by: acceptedElsewhereBy },
+  });
+  expect(res.ok()).toBeTruthy();
+}
+
+/**
+ * Make the next call the page PLACES one nobody picks up: it rings, and the backend's own ring
+ * bound ends it as `CallEndReasonUnanswered` once the invite is out (a beat in the mock, a
+ * minute on the backend). Always finish with `resetCall`.
+ */
+export async function nobodyAnswersNextCall(page: Page): Promise<void> {
+  const res = await page.request.post(`http://127.0.0.1:${MOCK_PORT}/__test/emit`, {
+    data: { kind: "call_place", nobody_answers: true },
+  });
+  expect(res.ok()).toBeTruthy();
+}
+
+/**
  * Have the MEETING drop a capture the page is sending, the way the service does it: one
  * offer that rejects the section.
  *

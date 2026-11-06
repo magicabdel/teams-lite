@@ -72,6 +72,11 @@ export type ActiveCall = {
   connected_at_ms: number | null;
   /** Why it ended, on the one frame that says it did. */
   end_reason: string | null;
+  /** Who took a ring this machine was offered, when the service said it was answered
+   *  somewhere else and named by whom (`CALL_END_ANSWERED_ELSEWHERE`): the user themselves on
+   *  another device, or somebody else by the name this app gives them. Null on every other
+   *  ending and on an answer elsewhere that named nobody; absent from an older backend. */
+  ended_elsewhere?: { by_self: boolean; name: string } | null;
   /** What everybody ELSE in the meeting is publishing, so this page can ask for it. Empty
    *  for a one-to-one call and for a backend too old to say. */
   publishing: PublishingParticipant[];
@@ -651,6 +656,26 @@ export const CALL_END_UNREACHABLE = "CallEndReasonNobodyReachable";
  */
 export const CALL_END_LEFT_RINGING = "CallEndReasonLeftRinging";
 
+/**
+ * The backend's names for a RING that ended somewhere else — answered on another device,
+ * forwarded, sent to voicemail, given up by its caller — and for one nobody answered within
+ * this app's own ring bound (`calling::END_REASON_*`, spelled once here and pinned from the
+ * Rust side by `the_page_knows_the_names_of_a_ring_that_ended_elsewhere`).
+ *
+ * Unnamed, every one of them falls to "The call ended." — about a call the user missed, or
+ * took on their phone, which is the one thing they cannot work out for themselves.
+ */
+export const CALL_END_ANSWERED_ELSEWHERE = "CallEndReasonAnsweredElsewhere";
+export const CALL_END_FORWARDED = "CallEndReasonForwarded";
+export const CALL_END_VOICEMAIL = "CallEndReasonForwardedToVoicemail";
+export const CALL_END_CALLER_CANCELLED = "CallEndReasonCallerCancelled";
+export const CALL_END_UNANSWERED = "CallEndReasonUnanswered";
+
+/** "Missed call from Ana." — a ring the user never took, named after its caller. */
+function missedCall(call: ActiveCall): string {
+  return call.peer ? `Missed call from ${call.peer}.` : "Missed call.";
+}
+
 /** Why the call is over, in one short line — or "" when there is nothing worth saying.
  *
  *  The service's own phrases are machine words ("CallEndReasonHangup"), and the ordinary
@@ -673,6 +698,27 @@ export function callEndLabel(call: ActiveCall | null): string {
       return call.kind === "group" || call.kind === "meeting"
         ? "Nobody could be reached: none of their devices is signed in."
         : `${call.peer || "They"} could not be reached: no device of theirs is signed in.`;
+    // A RING that ended somewhere else (`calling::end_reason_for`). The backend names these
+    // only about a call that was still being offered to this machine, so each says what
+    // happened to the ring rather than to a conversation.
+    case CALL_END_ANSWERED_ELSEWHERE: {
+      const by = call.ended_elsewhere;
+      if (!by) return "The call was answered elsewhere.";
+      if (by.by_self) return "You answered on another device.";
+      return by.name ? `${by.name} answered this call.` : "Somebody else answered this call.";
+    }
+    case CALL_END_FORWARDED:
+      return "The call was forwarded.";
+    case CALL_END_VOICEMAIL:
+      return "The call went to voicemail.";
+    case CALL_END_CALLER_CANCELLED:
+      return missedCall(call);
+    // Nobody answered within this app's own ring bound, and WHICH side nobody was on is the
+    // whole sentence: a ring the user did not take is a missed call, a call they placed that
+    // nobody took is "they did not answer". A group call has no one name to put there.
+    case CALL_END_UNANSWERED:
+      if (call.direction === "incoming") return missedCall(call);
+      return call.kind === "call" && call.peer ? `${call.peer} did not answer.` : "Nobody answered.";
     case "CallEndReasonPlaceFailed":
       return "The call could not be placed.";
     case "CallEndReasonAcceptFailed":
