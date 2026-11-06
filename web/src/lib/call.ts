@@ -697,6 +697,15 @@ export const CALL_END_UNREACHABLE = "CallEndReasonNobodyReachable";
 export const CALL_END_LEFT_RINGING = "CallEndReasonLeftRinging";
 
 /**
+ * The backend's name for a call the user was IN that ended because teams-lite STOPPED — a service
+ * or container stop, Ctrl+C, the idle exit, or a restart. `calling::END_REASON_BACKEND_STOPPING`,
+ * spelled once here and pinned from the Rust side
+ * (`the_page_knows_the_name_of_a_call_left_by_a_stopping_backend`). The backend hung up on its way
+ * out, so the sentence says the user LEFT: the others saw them go, not a participant gone silent.
+ */
+export const CALL_END_BACKEND_STOPPING = "CallEndReasonBackendStopping";
+
+/**
  * The backend's names for a RING that ended somewhere else — answered on another device,
  * forwarded, sent to voicemail, given up by its caller — and for one nobody answered within
  * this app's own ring bound (`calling::END_REASON_*`, spelled once here and pinned from the
@@ -769,6 +778,8 @@ export function callEndLabel(call: ActiveCall | null): string {
       return "This call cannot be answered here.";
     case "CallEndReasonReconnected":
       return "The connection moved, so the call ended.";
+    case CALL_END_BACKEND_STOPPING:
+      return "teams-lite stopped, so you left the call.";
     case "CallEndReasonCallingTurnedOff":
       // No switch says this any more: this machine stopped being a device calls ring on,
       // which is what the app does as it shuts down.

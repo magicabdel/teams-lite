@@ -190,7 +190,7 @@ Three rules hold every phase:
 | RA2 | The ring stops when this machine knows: a shared-store record across both installs (on), Teams' own missed line (switch, dry run first) | ringing M2 | M | Low–medium | RA1, IC0 |
 | RA4–RA6 | Do not disturb rings quietly; outgoing "Ringing…"; measure provisional answers (pranswer only if seen) | ringing M4–M6 | S each | Low (M6b medium) | Soft only: RA4 shares the own-presence helper with MA8; RA6b coordinates the page's answer application with media-robustness and video-send |
 | PR4 | **Landed.** Bound every signaling request; detach the create/accept/hangup POSTs from the page socket. **It owns the one signaling transport API** (collision 7) | plane-reliability M4 | M | Medium (restructures the verified handlers, wire unchanged) | VS1 (golden pins — the golden fixture set landed first, with PR4; the rest of VS1 stays open); coordinate `call_start_sharing` with video-send |
-| PR5 | A stop leaves the call and hands the registration back (signal arm, graceful launcher stop, guard rule 3a-iii) | plane-reliability M5 | M | Medium | PR4 |
+| PR5 | **Landed.** A stop leaves the call and hands the registration back (signal arm, graceful launcher stop, guard rule 3a-iii) | plane-reliability M5 | M | Medium | PR4 |
 | PR6 | Ask before a restart, an update or a re-stage ends a call (re-stage defers, never ends) | plane-reliability M6 | S | Low | PR5 |
 | PR7 | Calling from the image and Kubernetes verified (`--container` driver front) | plane-reliability M7 | M | Low (outcome unknown) | PR1, PR5 |
 | PRg | Gated by PR1's journal: registration extension (M2), refused registration (M9), outgoing ring cancel (M10; a timer-driven hangup, so it needs decision D2) | plane-reliability M2, M9, M10 | S each | Low–medium | PR1; PR10 also consumes RA5's `remote_progress_at_ms` (soft) |
@@ -631,7 +631,7 @@ Steps run in this order.
   true (media-robustness-devices § 6.3 lists the automatic acts that ship today). Then approve, one by
   one:
   - leaving a live call when the backend stops, the idle shutdown included (plane-reliability
-    § 12, item 3);
+    § 12, item 3) — **approved 2026-11-06, landed with PR5**;
   - relink, reconnect, give up and close-window hangup (media-robustness-devices D1);
   - the bounded 409 redirect of a group join (meeting-participation § 6);
   - never declining on an End pressed during an answer that is still travelling (plane-reliability
@@ -650,6 +650,8 @@ Steps run in this order.
 - **D4. Tooling may not stop a backend that holds a live call** (guard rule 3a-iii), and the
   automatic re-stage defers for as long as a call is live (plane-reliability § 12, items 5 and 7).
   - *Recommended:* yes to both.
+  - **Decided 2026-11-06: yes to the first** (rule 3a-iii, landed with PR5). The re-stage deferral
+    is PR6's, and is asked when it is built.
 - **D5. Default for "Join meetings muted".**
   - *Recommended:* on (media-robustness-devices D3).
 

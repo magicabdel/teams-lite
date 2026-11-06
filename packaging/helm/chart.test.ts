@@ -1954,23 +1954,50 @@ describe("what the chart's own words claim", () => {
     expect(readme).not.toContain("The root filesystem stays read-only — measured for the app itself");
   });
 
-  test("a stop's cost to the calling registration is said as the launcher really pays it", () => {
-    // The launcher SIGKILLs its backend on TERM, so the registration is never handed back and
-    // expires on its own. Make the launcher hand it back and this fails, and the words move with it.
+  test("a stop's cost to the call and the registration is said as the launcher really pays it", () => {
+    // The launcher TERMs its backend and waits before it KILLs, and the backend LEAVES its call
+    // and hands its registration back on that TERM. Move either half and this fails, and the words
+    // move with it: a chart that says the call is left over a launcher that SIGKILLs would be false.
     const launcher = read("launcher/src/backend.ts");
-    expect(launcher).toMatch(/const stop = \(\) => \{\s*generation \+= 1;\s*try \{\s*proc\.kill\(9\);/);
-    expect(launcher).toMatch(/process\.on\(signal, \(\) => \{\s*stop\(\);\s*process\.exit\(0\);/);
-    expect(/const CALLING_TTL: u64 = (\d+);/.exec(read("src/trouter.rs"))?.[1]).toBe("3600");
+    expect(launcher).toMatch(/terminate: \(\) => child\.kill\("SIGTERM"\)/);
+    expect(launcher).toMatch(/export const BACKEND_STOP_GRACE_MS = 7_000;/);
+    expect(launcher).toMatch(/const inTime = await Promise\.race\(\[exited, deps\.wait\(grace\)/);
+    expect(launcher).not.toMatch(/const stop = \(\) => \{\s*generation \+= 1;\s*try \{\s*proc\.kill\(9\);/);
+    // And the launcher's own TERM is what reaches that stop: the three signals are wired to the
+    // handler, the handler is handed the graceful stop, and the call site hands it `stop` — not a
+    // KILL. A handler wired to `kill` would pass every assertion above.
+    const from = launcher.indexOf("function stopChildOnExit(");
+    const to = launcher.indexOf("\n}\n", from);
+    expect(from).toBeGreaterThan(-1);
+    expect(to).toBeGreaterThan(from);
+    const wiring = launcher.slice(from, to);
+    expect(wiring).toMatch(
+      /for \(const signal of \["SIGINT", "SIGTERM", "SIGHUP"\] as const\) \{\s*process\.on\(signal, \(\) => onSignal\(signal\)\);/,
+    );
+    expect(wiring).toMatch(/const onSignal = exitSignalHandler\(\{[\s\S]*?\bstop: deps\.stop,/);
+    expect(launcher).toMatch(/stopChildOnExit\(\{\s*leaving: \(\) => \{\s*gone = true;\s*\},\s*stop,\s*kill:/);
+    const server = read("src/bin/server.rs");
+    expect(server).toContain("let mut signals = StopSignals::listen()?;");
+    expect(server).toContain("match leave_and_exit(&ctx, name).await {}");
+    // 7 s of grace inside the chart's own: 30 s in a host mode, 90 s where the pod boots its own
+    // Intune container and powers it off after the launcher (up to ~45 s more).
+    expect(read("packaging/helm/teams-lite/templates/statefulset.yaml")).toContain(
+      "terminationGracePeriodSeconds: {{ ternary 90 30 $boots }}",
+    );
     const values = chartFile("values.yaml");
     const start = values.indexOf("# A CEILING, not a delay");
     const end = values.indexOf("terminationGracePeriodSeconds: null");
     expect(start).toBeGreaterThan(-1);
     expect(end).toBeGreaterThan(start);
-    const grace = values.slice(start, end);
-    expect(grace).toContain("SIGKILLs its backend");
-    expect(grace).toContain("its TTL is an hour");
-    expect(grace).not.toMatch(/hands its calling registration back and/);
-    expect(chartFile("README.md")).toContain("the launcher SIGKILLs its backend");
+    const grace = prose(values.slice(start, end).replace(/^# ?/gm, ""));
+    expect(grace).toContain("waits up to 7 s for it to exit before it KILLs it");
+    expect(grace).toContain("leaves any call it holds");
+    expect(grace).toContain("hands its calling registration back");
+    expect(grace).toContain("A call still ringing is not declined");
+    expect(grace).not.toContain("SIGKILLs its backend");
+    const readme = prose(chartFile("README.md"));
+    expect(readme).toContain("the backend leaves any call you are in");
+    expect(readme).not.toContain("the launcher SIGKILLs its backend");
   });
 });
 

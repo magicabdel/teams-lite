@@ -606,8 +606,9 @@ wait_for() {
   return "$_rc"
 }
 
-# The trap. The FIRST signal stops the launcher (which takes its backend down with it —
-# `killChildOnExit` in launcher/src/backend.ts); every later one is SAID and changes nothing, so a
+# The trap. The FIRST signal stops the launcher (which stops its backend gracefully — the backend
+# leaves any call and hands its calling registration back first — `stopGracefully` in
+# launcher/src/backend.ts); every later one is SAID and changes nothing, so a
 # second Ctrl+C or a second TERM can never cut the Intune container's poweroff short — a stop
 # killed halfway leaves the keyring and the broker's state half-written in a volume that holds the
 # device's enrollment.

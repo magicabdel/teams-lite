@@ -3,6 +3,7 @@ import {
   UNKNOWN_CALL_STATUS,
   callDurationLabel,
   CALL_END_ANSWERED_ELSEWHERE,
+  CALL_END_BACKEND_STOPPING,
   CALL_END_CALLER_CANCELLED,
   CALL_END_FORWARDED,
   CALL_END_LEFT_RINGING,
@@ -447,6 +448,12 @@ describe("what the bar says", () => {
     expect(callEndLabel(call({ end_reason: "CallEndReasonReconnected" }))).toMatch(/connection/);
     expect(callEndLabel(call({ end_reason: "CallEndReasonCallingTurnedOff" }))).toMatch(
       /stopped taking calls/,
+    );
+    // A call the user was IN, left because teams-lite stopped: the backend hung up on its way
+    // out, so the sentence says they LEFT — and names what took them out, which they did not press.
+    expect(CALL_END_BACKEND_STOPPING).toBe("CallEndReasonBackendStopping");
+    expect(callEndLabel(call({ end_reason: CALL_END_BACKEND_STOPPING }))).toBe(
+      "teams-lite stopped, so you left the call.",
     );
     // A code we have never seen still says something rather than nothing.
     expect(callEndLabel(call({ end_reason: "code 486" }))).toBe("The call ended.");

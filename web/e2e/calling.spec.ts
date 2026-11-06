@@ -1,5 +1,5 @@
 import { expect } from "@playwright/test";
-import { CALL_END_UNREACHABLE } from "../src/lib/call";
+import { CALL_END_BACKEND_STOPPING, CALL_END_UNREACHABLE } from "../src/lib/call";
 import { callFailureMessage } from "../src/lib/call-failure";
 import {
   calendarEvent,
@@ -429,6 +429,29 @@ test.describe("Audio calling", () => {
     // are written for whoever holds the socket (lib/call-failure.ts makes the same promise).
     await expect(notice).not.toContainText(/addParticipant|subCode|endpoint/);
     // And the call is gone, so the next one can be placed.
+    await expect(stage).toHaveCount(0);
+    await expectCallCanBePlaced(page);
+  });
+
+  /**
+   * A call the user was IN, left because teams-lite STOPPED — a service or container stop, Ctrl+C,
+   * the idle exit, a restart. The backend hangs up on its way out and says why on its last frame,
+   * so the page must SAY it rather than "The call ended.": the user pressed nothing, and what took
+   * them out is the one thing they cannot work out for themselves. The microphone goes with it.
+   */
+  test("says teams-lite stopping took the user out of the call", async ({ page }) => {
+    await gotoApp(page);
+    await openConversationNamed(page, "Ava Thompson");
+    await callFromMenu(page);
+    const stage = page.locator('[data-testid="call-stage"]');
+    await expect(stage).toHaveAttribute("data-phase", "connected", { timeout: 10_000 });
+    await expect(stage).toHaveAttribute("data-media", "held");
+
+    await endCallWithReason(page, CALL_END_BACKEND_STOPPING);
+
+    await expect(page.locator('[data-testid="call-notice"]')).toHaveText(
+      "teams-lite stopped, so you left the call.",
+    );
     await expect(stage).toHaveCount(0);
     await expectCallCanBePlaced(page);
   });

@@ -5086,7 +5086,13 @@ user. Two independent mechanisms enforce that split:
   delete of its pod — see § Running teams-lite on Kubernetes) — and
   `teams-lite-service.sh update --now`, the switch that skips the wait for a live
   `@claude` run and so freezes a half-written reply in the thread — and `restart_backend`,
-  which is that same failure from inside the app (see § Settings › This app) — and cycling the
+  which is that same failure from inside the app (see § Settings › This app) — and, while a
+  backend holds a LIVE CALL, every stop of it (rule 3a-iii: a `systemctl --user stop|kill|freeze`
+  or `disable|mask --now` of a teams-lite unit, the same over raw D-Bus,
+  `teams-lite-service.sh stop|uninstall`, and a kill naming the backend or the launcher), because a
+  stop now LEAVES that call and would hang up on the people the user is talking to; the proof is
+  the backend's own call marker under `$XDG_RUNTIME_DIR/teams-lite/calls/`, counted only while it
+  names a running pid (see § Audio calls) — and cycling the
   user's Intune container in the spellings its rule 3b lists: the CLI's own lifecycle verbs
   (directly, behind a wrapper such as `timeout` or `setsid`, inside a subshell or a
   substitution, or handed to `systemd-run`), the container's unit and the repair's (over
@@ -5924,16 +5930,14 @@ call does — this side never handles RTP, and the page never learns a Teams URL
       the broker when the cached session is stale — exactly as the live feed's do, once per
       backoff step — so the no-polling rule is the START's, and the calling socket after it is
       the shape it always had.
-  - **The registration is TAKEN BACK as the app goes away.** `stop_calling` runs on the
-    idle shutdown, because a registration Teams still believes in keeps routing their
-    calls to a process that is gone, and a call offered to a device that never rings is a
-    call they miss. It would expire within the hour on its own; every call inside that
-    hour is the reason not to wait for it. **It is NOT taken back when the launcher stops its
-    backend** — a container or pod stop, a `teams` Ctrl+C — because the launcher SIGKILLs its
-    child (`killChildOnExit`) and the backend has no TERM handler of its own: that is a known
-    gap, recorded in § Running teams-lite in a container image, and mending it is a separate
-    change (a backend that answers TERM with `stop_calling`, and a launcher that sends TERM and
-    waits before it KILLs).
+  - **The registration is TAKEN BACK as the app goes away — EVERY way it goes**, by the one
+    stop described under § A STOP LEAVES THE CALL below: a signal (a service, container or pod
+    stop, a `teams` Ctrl+C), the idle exit, and a restart. A registration Teams still believes in
+    keeps routing the user's calls to a process that is gone, and a call offered to a device that
+    never rings is a call they miss. It would expire within the hour on its own; every call
+    inside that hour is the reason not to wait for it. It used to be taken back on the idle exit
+    alone — the launcher SIGKILLed its child and the backend had no TERM handler — and that gap is
+    what plane-reliability M5 closed.
   - **What a window cannot do, it says — and a window that calls says WHY it cannot yet, one
     sentence per registration state** (`callUnavailableReason` / `meetingUnavailableReason`,
     over one `unavailableReason` so the call row and the Join row can never give two answers
@@ -6410,6 +6414,99 @@ call does — this side never handles RTP, and the page never learns a Teams URL
   that directory is the review. **Unverified against the tenant**: no request has timed out live;
   every measured signaling answer arrived in about two seconds, so the bounds are the pathological
   case, and what a live call checks is that the verified one-to-one and meeting join still work.
+- **A STOP LEAVES THE CALL, AND HANDS THE REGISTRATION BACK** (plane-reliability M5;
+  docs/calling-roadmap/plane-reliability.md § 4.8). A backend that simply died left the people on
+  its call with a participant gone silent until the service gave up on it, and Teams went on
+  offering the user's calls to an endpoint that was gone, for up to an hour. Every way out is now
+  ONE stop (`leave_and_exit`, over `Ctx::leave_calls_for_exit`): a signal — SIGTERM from systemd,
+  Docker, Kubernetes or the launcher, SIGINT from a terminal, SIGHUP from a closed one — the idle
+  exit, and a restart the supervisor carries out. **It is one of the stated exceptions to "nothing
+  in this feature acts on its own", and the user approved it, the idle exit included**
+  (docs/calling-roadmap/README.md § 5, D2's first item): the call dies with the process either way,
+  and telling the service is what the real client does on page close. Nine rules, each pinned by a
+  test:
+  - **Only a call that HOLDS THE USER is left** (`call_holds_the_user`: Dialing, Connecting or
+    Connected), with the very body End sends (`hangup_payload`) on its own door
+    (`CallSession::hangup_link`), and ended here as `calling::END_REASON_BACKEND_STOPPING` — "teams-lite
+    stopped, so you left the call." A call still RINGING is never declined: it posts nothing, is
+    dropped as the machine stopping taking calls, and goes on ringing the user's other devices.
+    The real client declines a ringing call on page close; this app deliberately does not.
+  - **The call's snapshot and its local end are ONE critical section** (`mark_call_ended` inside
+    the stop's own lock, then `announce_call_ended`). A start whose answer is applied before it put
+    its door in the call, and the stop posts it; one applied after it finds the call ended and hangs
+    up what it made. Taken apart, an answer landing between the two was in neither.
+  - **The call ends HERE first**, so every page is told while the requests travel; the hangup and
+    the registration's DELETE then go out TOGETHER under one budget (`SHUTDOWN_BUDGET`, 5 s), each
+    bounded by `SignalClass::Shutdown` (4 s), and the process exits after a quarter-second flush
+    whatever came of them.
+  - **A START STILL ON THE WIRE IS WAITED FOR** (`StartsInFlight`, counted by `await_call_start`
+    for every invite, join, attach and acceptance). A call whose creating request has not answered
+    names no door yet, and that answer is the leg's only address — so the process stays up for it,
+    within the same budget, and the answer finds the call ended and hangs the leg up
+    (`hang_up_orphan`, which on a stopping backend also signs with what is held and takes the
+    Shutdown bound). Exiting first would leave a colleague's phone ringing for a call nothing holds.
+  - **Only credentials it already HOLDS** (`cached_signal_credentials`, over `session_within` and
+    `auth::TokenCache::cached_within`, each allowed `EXIT_CREDENTIAL_GRACE` — a minute — past its
+    fifty-minute bound, against credentials issued for an hour or more). A fetch at exit could start
+    an interactive rescue whose window no process is left to take back. **Nothing else would keep
+    them fresh during a QUIET call**: the call's `keepAlive` door is one no measured call names, so
+    the keep-alive tick sends nothing. So the tick WARMS both while a call holds the user
+    (`warm_call_credentials`), reaching the broker only when one has gone stale — about once an
+    hour of call, which is what any request during the call would do. The warm-up runs in a task
+    of its OWN, one at a time (`WARMING`), never awaited by the tick — which is also what frees a
+    ring nobody answered, so a credential read that hung must not hold it — and after a failure it
+    waits `WARM_RETRY_AFTER` (5 min) before asking the broker again. A stop that still finds
+    nothing usable sends nothing, and says the call as "This machine stopped taking calls." rather
+    than as one the user left: nobody on it was told. The review of this milestone found the
+    original claim — that the keep-alive kept them fresh — false.
+  - **Repeated signals are ONE stop.** `KillMode=control-group` TERMs the launcher and the backend
+    together and the launcher then forwards its own; a terminal's Ctrl+C reaches the whole process
+    group. Listening for the three signals REPLACES the default terminate action, so after the first
+    the rest are drained and SAID (`StopSignals::ignore_from_now_on`), and a second caller of the
+    stop waits for the first rather than hanging up twice (`stopping`, set once and never cleared).
+  - **It EXITS rather than returning** (`std::process::exit` after the flush), because dropping the
+    runtime waits on every blocking task it holds and a return could hang until the supervisor's KILL.
+  - **A process on its way out starts nothing**: `start_calling` stands down, and `call_prepare`
+    refuses on every path because the address is taken out of the plane.
+  - **The launcher STOPS GRACEFULLY** (`stopGracefully` in launcher/src/backend.ts): SIGTERM, up to
+    `BACKEND_STOP_GRACE_MS` (7 s) for the backend to exit, and only then a KILL. Its own signals go
+    through `exitSignalHandler`: the first stops the backend and exits, a repeat within
+    `REPEAT_SIGNAL_MS` (1 s) is the same stop delivered twice and is ignored, and a later one is a
+    person asking twice and KILLs at once. An in-app update stops the BACKEND before the web server
+    (`relaunch`), so the last `call_state` frame still reaches a phone through the relay. Under the
+    launcher, `restart_backend` only ASKS (`backend_restart`) and the launcher's TERM runs the stop,
+    so a launcher that never acts leaves calling as it was. Because a stop is now seconds long, a
+    stop signal landing INSIDE a restart's or an update's own stop is honoured: neither spawns
+    anything after it (`BackendHandle.leaving`), a replacement child is tracked from the moment it
+    is spawned so the exit fallback can reach it, `teams --dev` stops the backend gracefully when
+    Vite exits rather than leaving the exit hook to KILL it mid-hangup, and a restart is ONE AT A
+    TIME (`oneAtATime`): a second press while the first is still stopping shares it, where it used
+    to race a second stop-and-spawn for one port. A backend that is already stopping answers a
+    restart without asking the launcher again.
+  - **The budgets CLOSE** (`the_stop_budgets_close`, which reads the launcher, both systemd units,
+    both compose files, the chart's template and the embedded stop's lock wait): 5 s + 0.25 s < the
+    launcher's 7 s < each unit's `TimeoutStopSec` (10 s) and Docker's default 10 s; the app unit is
+    `KillMode=control-group`; 7 s + 25 s + the crate's 20 s ≤ compose.yaml's 60 s and the chart's
+    90 s; 7 s < the chart's 30 s host-mode grace.
+  - **A backend IN A CALL publishes a marker, and tooling may not stop it** (the user's decision,
+    README § 5 D4). `$XDG_RUNTIME_DIR/teams-lite/calls/<port>` holds `pid=`, `port=`, `phase=` and
+    `since_ms=` — no call id and no name — and `start=`, the process's own start time, because a pid
+    the kernel has handed on is no identity: a marker counts only while its pid is the SAME process
+    (on both sides, `marker_names_a_live_process` and the guard). It is written by
+    `Ctx::sync_call_marker` on a TRANSITION of the call that holds the user — an answered call's
+    included the moment the attach takes it, before its acceptance answers — and removed when it
+    stops holding them; at boot a backend removes its own port's marker whatever it says, and clears
+    the dead ones (`clear_dead_call_markers`). The path is a FIELD of the context (`Ctx::call_marker`), and a
+    test context has none: every test runs as the default port, so a lookup would have a test run
+    write or delete the marker of the user's own backend. Guard rule 3a-iii reads it (§ Automation
+    safety).
+
+  **Unverified against the tenant**: no stop has left a live call yet. What is measured is the
+  body — End on a connected outgoing one-to-one ended the call for both people, and a meeting leave
+  was confirmed by the service's own `callEnd` — and the stop itself is driven end to end against
+  stand-in services (`a_stopping_backend_leaves_the_call_and_hands_the_registration_back`). The
+  live check is the user's: Ctrl+C on a dev backend while a consenting colleague is on a call with
+  them, who must see them leave at once.
 - **A FAILED ANSWER NEVER DECLINES, and a LOST answer is not a refusal.** The Answer's catch
   used to hang the call up, and on a call still ringing that posted the invite's reject — so a
   microphone the browser refused, a page that timed out or a socket that dropped showed the
@@ -10484,12 +10581,16 @@ button says what it costs before it is pressed.
   The web server runs inside that process and the backend is its child, so it is the one
   process that can free both ports and bring both back: the backend asks with an
   `update_restart` event on the keepalive socket it already holds, and the launcher stops the
-  web server, kills the backend, spawns the new build detached with `--no-open`, and exits.
-  The order is the feature — a listener still up when the new process starts makes it die
-  on `EADDRINUSE`, which would leave the user with no app rather than an updated one — and
-  the backend's exit is AWAITED (`BackendHandle.waitForExit`), because a signalled process
-  still holds its port for a moment and the new build's first act is to ask whether
-  something is listening on it: a yes makes it attach to the backend we just killed.
+  backend GRACEFULLY (it leaves any call and tells every page why, and that last frame reaches
+  a phone through the web server's relay, which is why the backend goes first), then the web
+  server, spawns the new build detached with `--no-open`, and exits. The order is the feature —
+  a listener still up when the new process starts makes it die on `EADDRINUSE`, which would
+  leave the user with no app rather than an updated one — and the backend's exit is AWAITED
+  (`BackendHandle.stop` resolves once the child is reaped), because a signalled process still
+  holds its port for a moment and the new build's first act is to ask whether something is
+  listening on it: a yes makes it attach to the backend we just stopped. A stop signal that
+  lands during that graceful stop ends the update there (`BackendHandle.leaving`): the app is
+  going, not coming back on the new build.
 - **`Restarting…` is the one state that outlives the socket.** Applying takes the backend
   and the web server down together, so the page is disconnected for a few seconds; every
   other phase hides itself when the socket is down (a stale "update available" is a claim
@@ -10594,8 +10695,12 @@ container instead. Five rules hold it, and each is pinned by a test:
   The sentence never says the answer is lost, because it is not: whichever backend comes up
   rewrites that message as interrupted (`repair_abandoned_agent_runs`).
 - **The answer goes out before the process does** (`RESTART_ANSWER_GRACE`), because the reply
-  travels on the socket the restart drops — and the calling registration is handed back on the
-  way out, exactly as the idle shutdown does it and for its reason.
+  travels on the socket the restart drops — and the call is LEFT and the calling registration
+  handed back on the way out, by the one stop every way out takes (§ Audio calls, A STOP LEAVES
+  THE CALL). Under a supervisor the backend runs it and exits; under the launcher it only asks, and
+  the launcher's graceful TERM runs it. Until plane-reliability M6 lands, a restart pressed during
+  a call does NOT ask first: the call ends, and the page says "teams-lite stopped, so you left the
+  call."
 - **The SOCKET is the proof.** It drops when the backend goes and returns when it is back, so
   a restart this page watched happen is one it can report. Nothing dropping inside
   `RESTART_STALLED_MS` is the launcher not being there at all — the backend accepted, asked,
@@ -10668,7 +10773,11 @@ phone. `bin/teams-lite-service.sh` owns it and `packaging/systemd/` holds the un
   § Running the released build beside the staged one for what keeps the two apart.
 - **What is yours:** `install`, `update`, `units`, `status`, `logs`, `stop`,
   `uninstall`, and every `systemctl --user status|cat|show` /
-  `journalctl --user -u …`. Diagnosing the service is normal work. Two of them refuse or hold
+  `journalctl --user -u …`. Diagnosing the service is normal work. **One exception, the user's
+  own decision: `stop` and `uninstall` are NOT yours while a backend holds a live call.** A stop
+  now LEAVES that call (§ Audio calls, A STOP LEAVES THE CALL), so tooling stopping it would hang
+  up on the people the user is talking to; the automation hook refuses every stop spelling it
+  knows while a call marker names a running backend (rule 3a-iii), and the answer is to ask. Two of them refuse or hold
   back on a machine staged before the backend found the broker itself, and both say so:
   `units` stages nothing, so it writes nothing at all in front of a staged backend older than
   the units it would write — `update` is the run that mends that, and `status` names it — and
@@ -11097,7 +11206,7 @@ Six rules hold them, and each is pinned by a test in `src/intune_embedded.rs`, `
 `src/bin/server.rs`:
 
 - **THE STOP TAKES THE SLOT BEFORE IT LOOKS** (`the_stop_takes_the_slot_before_the_lifecycle_lock`).
-  At shutdown the launcher SIGKILLs the backend, but a boot helper it spawned lives on in its own
+  At shutdown the launcher stops the backend (SIGTERM, and a KILL after `BACKEND_STOP_GRACE_MS`), but a boot helper it spawned lives on in its own
   session — and a stop that took only the lifecycle lock could find "not running" in the moment
   before that boot took the lock, exit 0, and let the boot start the container a moment before the
   runtime SIGKILLed everything in it. Holding the slot, a boot spawned after the stop leaves
@@ -11707,12 +11816,12 @@ for what the chart shares with them, and by the guard's tests for every refusal.
   test was no substitute — in host mode tini is a subreaper rather than PID 1. The stop is reached
   only from the copy that holds the lock, never in host mode (the container is the user's) and never
   read-only (a read-only run never booted one, so the only container a stop could reach is somebody
-  else's). **A KNOWN GAP, a separate change:** the launcher SIGKILLs its backend on TERM
-  (`killChildOnExit` in launcher/src/backend.ts) and the backend has no TERM handler of its own, so
-  at a container stop the CALLING registration is not handed back (`stop_calling` runs on the idle
-  shutdown and on a restart the app asked for, never on a signal) — Teams keeps offering the account's calls to an endpoint that is gone until the
-  registration's TTL, an hour, runs out. Mending it takes both halves: a backend that answers TERM
-  with `stop_calling`, and a launcher that sends TERM and waits before it KILLs.
+  else's). **And the launcher's own stop is graceful too**, which it was not: on the trap's TERM it
+  TERMs its backend and waits up to 7 s before a KILL (`stopGracefully` in launcher/src/backend.ts),
+  and in that time the backend leaves any call it holds and hands the CALLING registration back
+  (§ Audio calls, A STOP LEAVES THE CALL) — so Teams stops offering the account's calls to the
+  container's endpoint at once rather than for up to an hour. Both budgets fit compose.yaml's 60 s,
+  and the host-broker file's Docker default of 10 s (`the_stop_budgets_close`).
 - **THE DIAGNOSTIC DROPS A ROOT CALLER TO `teams`** (`packaging/docker/teams-lite-intune-status`,
   wrapping `examples/intune_status.rs`). The image starts as root, so a plain `docker exec` and
   `kubectl exec` land as root — and root is the one id that cannot answer: the Intune container's
@@ -12049,10 +12158,11 @@ Kubernetes refuses to change in place: uninstall first (the claims are kept), th
   ~20 s for the poweroff); killed before that, the inner systemd, the broker and the keyring die
   mid-write. The twenty seconds are the crate's own wait, so a longer grace period does not lengthen
   the poweroff: one that outlasts it is SAID (the stop helper exits 1, the entrypoint warns) and the
-  container ends with the pod. The same TERM does NOT hand the calling registration back — the launcher SIGKILLs its
-  backend — so Teams offers the account's calls to the pod's gone endpoint until the registration's
-  TTL (an hour) runs out; values.yaml and the chart's README say so, and a chart test pins the words
-  to the launcher's own code. A longer grace period would not change it.
+  container ends with the pod. Before all of that the same TERM reaches the backend through the
+  launcher's graceful stop (7 s before a KILL), and the backend LEAVES any call it holds and hands
+  the calling registration back — so Teams stops offering the account's calls to the pod's endpoint
+  at once, and nobody on a call is left with a participant gone silent. values.yaml and the chart's
+  README say so, and a chart test pins the words to the launcher's and the backend's own code.
 - **`hostNetwork: true` IS REFUSED in this mode, and not needed.** The pod's Intune container shares
   the pod's network namespace, and its `:99` binds an ABSTRACT socket: in the node's namespace it
   would collide with the `:99` of an Intune container already running there, and whichever starts

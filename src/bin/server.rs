@@ -910,6 +910,165 @@ const RESTART_GRACE: Duration = Duration::from_secs(10);
 /// press feels delayed.
 const RESTART_ANSWER_GRACE: Duration = Duration::from_millis(250);
 
+/// How long a STOPPING backend spends leaving its call and handing its calling registration back
+/// (see [`Ctx::leave_calls_for_exit`]) before it exits regardless. The two requests go out together,
+/// each bounded by [`calling::SignalClass::Shutdown`] (4 s), so this is that bound plus the moment
+/// to read the answers.
+///
+/// It is the first term of a chain that has to CLOSE, and `the_stop_budgets_close` pins it: this,
+/// plus the flush after it ([`RESTART_ANSWER_GRACE`]), must end before the launcher gives up and
+/// KILLs (`BACKEND_STOP_GRACE_MS` in launcher/src/backend.ts), which must in turn end before every
+/// supervisor's own kill — systemd's `TimeoutStopSec`, Docker's default and the chart's grace.
+const SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
+
+/// How far past their own freshness bound a STOPPING backend may still sign with the session and
+/// the ic3 token it holds (see [`Ctx::cached_signal_credentials`]). While a call holds the user both
+/// are kept warm on every keep-alive tick ([`CALL_KEEPALIVE`], 20 s), so a stop finds them at most a
+/// tick past the bound; a minute covers that tick and the warm it runs. Both bounds are fifty minutes
+/// against credentials the service issues for an hour or more, so a minute past is still valid.
+const EXIT_CREDENTIAL_GRACE: Duration = Duration::from_secs(60);
+
+/// Whether a warm-up of a call's credentials is running (see `Ctx::warm_call_credentials`). One at a
+/// time, in a task of its own: the warm-up reaches the broker and the network with nothing bounding
+/// it, and it must never hold up the keep-alive tick, which is also what frees a ring nobody answered.
+static WARMING: AtomicBool = AtomicBool::new(false);
+
+/// When the last warm-up FAILED, if the one after it has not yet worked. A sign-in outage during a call
+/// then asks the broker once every [`WARM_RETRY_AFTER`] rather than on every tick, and is said once.
+static WARM_FAILED_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// How long a failed warm-up waits before it asks the broker again. Nothing a call does can mend a
+/// sign-in, and a broker that is down is asked nothing more on calling's behalf than this.
+const WARM_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
+
+/// Clears [`WARMING`] however a warm-up task ends.
+struct Warming;
+
+impl Drop for Warming {
+    fn drop(&mut self) {
+        WARMING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// The creating requests of calls — an invite, a join, an attach, an acceptance — still running in
+/// tasks of their own (see `Ctx::await_call_start`).
+///
+/// A stop has to know about them, because each one is the only thing that can take back what it
+/// made: the service's answer is that leg's only address, and the answer comes back to a task that
+/// finds the call ended and hangs the leg up (`hang_up_orphan`). If the process exits first, a
+/// colleague's phone rings for a call nothing holds, or the user stays in a meeting as a silent
+/// participant. So a stop waits for this count to reach zero, within its budget.
+#[derive(Default)]
+struct StartsInFlight {
+    count: std::sync::atomic::AtomicUsize,
+    settled: tokio::sync::Notify,
+}
+
+impl StartsInFlight {
+    /// Count one start until the guard it returns is dropped.
+    fn enter(self: &Arc<Self>) -> StartInFlight {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        StartInFlight(Arc::clone(self))
+    }
+
+    /// Resolves once no start is running.
+    async fn settled(&self) {
+        loop {
+            let settled = self.settled.notified();
+            tokio::pin!(settled);
+            // Registered BEFORE the count is read, so a start that ends in between is not missed.
+            settled.as_mut().enable();
+            if self.count.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            settled.await;
+        }
+    }
+}
+
+/// One start counted by [`StartsInFlight`]; the count goes down however the task ends.
+struct StartInFlight(Arc<StartsInFlight>);
+
+impl Drop for StartInFlight {
+    fn drop(&mut self) {
+        self.0.count.fetch_sub(1, Ordering::SeqCst);
+        self.0.settled.notify_waiters();
+    }
+}
+
+/// What a stopping backend needs to LEAVE the call that holds the user, taken out of the plane
+/// before the call is ended there (see [`Ctx::leave_calls_for_exit`]).
+struct LeavingCall {
+    call_id: String,
+    /// The door End posts to (`CallSession::hangup_link`), when the call has named one yet.
+    url: Option<String>,
+    local: calling::LocalParticipant,
+    phase: &'static str,
+}
+
+/// Leave the call, hand the calling registration back, give the pages their last frame, and exit.
+///
+/// The one way out for every stop: a signal, the idle exit and a restart the supervisor carries
+/// out. It EXITS rather than returning, because dropping the runtime waits on every blocking task
+/// it holds (an X11 capture, an agent CLI's pipes), and a return could hang until the supervisor's
+/// KILL. Typed `Infallible` so a caller can match on it in place of the never type.
+async fn leave_and_exit(ctx: &Ctx, why: &str) -> std::convert::Infallible {
+    ctx.leave_calls_for_exit(why).await;
+    // The last `call_state` frame travels on sockets this exit closes: give it a moment to go.
+    tokio::time::sleep(RESTART_ANSWER_GRACE).await;
+    std::process::exit(0)
+}
+
+/// The three signals that ask this process to stop: a supervisor's (SIGTERM — systemd, Docker,
+/// Kubernetes, the launcher), a terminal's (SIGINT, Ctrl+C) and a closed terminal's (SIGHUP).
+///
+/// Listening REPLACES the default action, which is the point: with these registered the process
+/// no longer dies the instant one arrives, so it can leave the call it holds first. It also means
+/// nothing but this code stops it on those signals — so after the first one the rest are drained
+/// and SAID by [`StopSignals::ignore_from_now_on`], and the bound on the stop is the launcher's
+/// KILL or the supervisor's.
+struct StopSignals {
+    terminate: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
+}
+
+impl StopSignals {
+    fn listen() -> std::io::Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
+        Ok(Self {
+            terminate: signal(SignalKind::terminate())?,
+            interrupt: signal(SignalKind::interrupt())?,
+            hangup: signal(SignalKind::hangup())?,
+        })
+    }
+
+    /// The next stop signal, by name.
+    async fn next(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.terminate.recv() => "SIGTERM",
+            _ = self.interrupt.recv() => "SIGINT",
+            _ = self.hangup.recv() => "SIGHUP",
+        }
+    }
+
+    /// Every signal after the first is part of the SAME stop. `KillMode=control-group` TERMs the
+    /// launcher and this backend together, the launcher then forwards its own TERM, and a
+    /// terminal's Ctrl+C reaches every process of the group — so the repeats are the rule rather
+    /// than the exception, and acting on one would cut the hangup short.
+    fn ignore_from_now_on(mut self) {
+        tokio::spawn(async move {
+            loop {
+                let name = self.next().await;
+                eprintln!(
+                    "[lifecycle] {name} while stopping — ignored; the launcher or the supervisor \
+                     bounds this stop"
+                );
+            }
+        });
+    }
+}
+
 /// Read-only mode (`TEAMS_LITE_READ_ONLY=1`): refuse every {@link OUTWARD_METHODS}
 /// call before it can reach the network.
 ///
@@ -2168,6 +2327,20 @@ struct Ctx {
     /// loop it has arrived. `notify_one` rather than `notify_waiters`, so a session adopted
     /// while the loop is busy is kept as a permit and never lost.
     calling_wake: Arc<tokio::sync::Notify>,
+    /// Set once this process has begun to EXIT, by [`Ctx::leave_calls_for_exit`], and never
+    /// cleared: a process on its way out starts no call, registers for no calls, and leaves the
+    /// call it holds ONCE however many stops arrive — a supervisor's TERM, the launcher's, and a
+    /// terminal's Ctrl+C reaching the whole process group are one stop, not three.
+    stopping: Arc<AtomicBool>,
+    /// Where THIS backend publishes its call marker (see [`Ctx::sync_call_marker`]), or `None` for
+    /// none. A field rather than a lookup, because a test context must never touch the runtime
+    /// directory a real backend publishes in: every test runs as the default port, so a lookup
+    /// would have a test run write a marker naming the user's own backend — or delete the one it
+    /// wrote while the user was on a call.
+    call_marker: Option<std::path::PathBuf>,
+    /// The creating requests of calls still on the wire (see [`StartsInFlight`]): a stop waits for
+    /// them, because each one's answer is the only address of the leg it made.
+    starts_in_flight: Arc<StartsInFlight>,
     /// The GitLab reads being refreshed behind the page right now, by cache key.
     ///
     /// Single-flight, and it earns its place on the hot path: the merge-request page polls
@@ -2258,6 +2431,10 @@ struct CallingPlane {
     /// from the store at boot, and every call takes a copy when it enters the plane
     /// ([`CallingPlane::admit`]).
     protocol: calling::CallProtocol,
+    /// What this backend's call MARKER says right now — the call that holds the user and the phase
+    /// it is in — or `None` when there is no marker (see [`Ctx::sync_call_marker`]). Remembered so
+    /// the file is written on a transition and never on every frame.
+    marker: Option<CallMarker>,
 }
 
 /// The kinds of frame the routing in `handle_call_frame` has already journaled, so the journal
@@ -2702,6 +2879,48 @@ impl CallPhase {
             CallPhase::Ended => "ended",
         }
     }
+}
+
+/// Mark the plane's call ENDED — the one call, or `only` that one — and say what it ended as.
+///
+/// `None` when there is no such call, or it is already over. The page is not told here; that is
+/// [`Ctx::announce_call_ended`], once the lock is released. A call that rang NOBODY ends with a phrase
+/// about the symptom ("no one else has joined"), and the cause arrived on its own frame a beat
+/// earlier, so the cause wins wherever we have it.
+fn mark_call_ended(plane: &mut CallingPlane, only: Option<&str>, reason: &str) -> Option<(String, String)> {
+    let call = plane
+        .call
+        .as_mut()
+        .filter(|call| call.phase != CallPhase::Ended && only.is_none_or(|id| call.id == id))?;
+    call.phase = CallPhase::Ended;
+    let stated = if call.unreachable {
+        calling::END_REASON_UNREACHABLE.to_string()
+    } else {
+        reason.to_string()
+    };
+    call.end_reason = Some(stated.clone());
+    Some((call.id.clone(), stated))
+}
+
+/// Whether a call in `phase` HOLDS THE USER — they placed it, answered it or joined it, and it is
+/// not over. That is the line a stopping backend draws: a call that holds the user is LEFT on the
+/// way out (the hangup End sends), and its marker tells tooling not to stop this backend
+/// (`guard-live-automation.sh`, rule 3a-iii). A ring the user has not taken does not hold them, so
+/// it is never declined at a stop and never blocks one: it goes on ringing their other devices.
+///
+/// A hold or a park phase, should one ever be added, holds the user too — and must be named here,
+/// or a stop would abandon a call the user is on hold in.
+fn call_holds_the_user(phase: CallPhase) -> bool {
+    matches!(phase, CallPhase::Dialing | CallPhase::Connecting | CallPhase::Connected)
+}
+
+/// What a call marker says (see [`Ctx::sync_call_marker`]): which call, its phase, and since when.
+/// No id leaves the process — the file names the phase and a moment, never a person or a call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CallMarker {
+    call_id: String,
+    phase: &'static str,
+    since_ms: i64,
 }
 
 /// The one call this machine is in.
@@ -3163,9 +3382,14 @@ struct SessionCell {
 impl SessionCell {
     /// The session held, when it was minted less than `SESSION_TTL` before `now`.
     fn fresh_at(&self, now: std::time::Instant) -> Option<&Session> {
+        self.fresh_within(now, std::time::Duration::ZERO)
+    }
+
+    /// The session held, when it was minted less than `SESSION_TTL` plus `grace` before `now`.
+    fn fresh_within(&self, now: std::time::Instant, grace: std::time::Duration) -> Option<&Session> {
         self.session
             .as_ref()
-            .filter(|_| now.saturating_duration_since(self.minted) < SESSION_TTL)
+            .filter(|_| now.saturating_duration_since(self.minted) < SESSION_TTL + grace)
     }
 }
 
@@ -4974,9 +5198,10 @@ impl Ctx {
     ///   * **The answer goes out before the process does.** The reply travels on the socket
     ///     this restart takes down, so both paths wait `RESTART_ANSWER_GRACE` first —
     ///     otherwise the click's own outcome is the one frame that never arrives.
-    ///   * **The calling registration is taken back on the way out**, exactly as the idle
-    ///     shutdown does and for its reason: Teams routes a call to the endpoints it
-    ///     believes are running, and a device that does not ring is a call the user misses.
+    ///   * **The call is LEFT and the calling registration taken back on the way out**, by the
+    ///     same stop every other way out takes ([`leave_and_exit`]). Under a supervisor this
+    ///     process exits itself; under the launcher it only ASKS, and the launcher's TERM is what
+    ///     runs the stop — so a launcher that never acts leaves calling exactly as it was.
     async fn restart_backend(&self, params: &Value) -> Result<Value> {
         use teams_lite::restart::Restarter;
 
@@ -4996,25 +5221,31 @@ impl Ctx {
             Restarter::Supervisor => "supervisor",
             Restarter::Nothing => unreachable!("refused above"),
         };
+        // A backend already on its way out is restarting already — its launcher TERMed it, or an
+        // earlier restart's stop is leaving the call. Asking the launcher again would only race a
+        // second stop-and-spawn beside the first.
+        if self.stopping.load(Ordering::SeqCst) {
+            return Ok(json!({ "restarted": true, "via": via }));
+        }
         eprintln!("[lifecycle] restarting on request — the {via} brings this backend back");
 
         let ctx = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(RESTART_ANSWER_GRACE).await;
-            ctx.stop_calling().await;
             match restarter {
                 // The launcher listens for this on the keepalive socket it already holds
                 // (launcher/src/backend-restart.ts) and re-spawns the backend alone. The
                 // port is what tells it the frame is about the child it owns — the same
                 // check `update_restart` makes with the binary path, and for the same
-                // reason: anything on this machine can open a frame on this socket.
+                // reason: anything on this machine can open a frame on this socket. Its
+                // graceful stop TERMs this process, and the signal arm leaves the call.
                 Restarter::Launcher => {
                     ctx.emit("backend_restart", json!({ "port": own_port() }));
                 }
                 // Nothing to ask: exiting IS the restart, and the supervisor starts us
                 // again. SQLite runs in WAL with per-request commits, so an abrupt stop
                 // loses nothing that was acknowledged (see the backend unit's own note).
-                Restarter::Supervisor => std::process::exit(0),
+                Restarter::Supervisor => match leave_and_exit(&ctx, "the restart").await {},
                 Restarter::Nothing => {}
             }
         });
@@ -5051,6 +5282,13 @@ impl Ctx {
     /// else adopts.
     async fn session_if_fresh(&self) -> Option<Session> {
         self.session.lock().await.fresh_at(std::time::Instant::now()).cloned()
+    }
+
+    /// The cached session while it is younger than `SESSION_TTL` plus `grace`, and `None`
+    /// otherwise. Never rebuilds one, like [`Ctx::session_if_fresh`] — it is the read a STOPPING
+    /// backend signs its last requests with (see [`Ctx::cached_signal_credentials`]).
+    async fn session_within(&self, grace: std::time::Duration) -> Option<Session> {
+        self.session.lock().await.fresh_within(std::time::Instant::now(), grace).cloned()
     }
 
     /// Hold on to a session this process just established, and remember the account
@@ -5621,6 +5859,9 @@ async fn serve() -> Result<()> {
         signin: Arc::new(Mutex::new(None)),
         calling: Arc::new(Mutex::new(CallingPlane::default())),
         calling_wake: Arc::new(tokio::sync::Notify::new()),
+        stopping: Arc::new(AtomicBool::new(false)),
+        starts_in_flight: Arc::new(StartsInFlight::default()),
+        call_marker: call_marker_path(),
         gitlab_refreshing: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
         csa_syncing: Arc::new(Mutex::new((false, None))),
         tracker_people: Arc::new(Mutex::new(None)),
@@ -5727,6 +5968,13 @@ async fn serve() -> Result<()> {
     // markers of runs whose process is gone, then sweep for the replies to close.
     clear_dead_agent_run_markers();
     spawn_agent_run_repair(ctx.clone());
+    // Likewise a call marker left by a backend that died in a call: it would refuse tooling a stop
+    // that ends no call. This backend's OWN port's marker goes whatever it says — only one process
+    // can hold this port, so a marker for it can only be a dead predecessor's.
+    if let Some(path) = &ctx.call_marker {
+        remove_call_marker(path);
+    }
+    clear_dead_call_markers();
 
     // best-effort, and for the whole life of the process: has the rolling `latest` tag
     // moved off this build? An app left open for weeks has to be able to notice.
@@ -5754,18 +6002,40 @@ async fn serve() -> Result<()> {
     }
     let idle_shutdown = wait_for_idle_shutdown(clients.clone(), no_idle_exit);
     tokio::pin!(idle_shutdown);
+    // A stop is no longer instant: the process leaves the call it holds and hands its calling
+    // registration back first (see `leave_and_exit`). Listening is what makes that possible —
+    // without it SIGTERM ends the process before a line of this runs.
+    let mut signals = StopSignals::listen()?;
 
     loop {
-        let accepted = tokio::select! {
-            accepted = listener.accept() => accepted,
-            _ = &mut idle_shutdown => {
-                eprintln!("[lifecycle] no UI clients remain — shutting down");
-                // Stop being a device the user's calls ring on, before the process that
-                // would answer is gone. The registration would expire on its own within
-                // the hour, and every call offered inside that hour is one they miss:
-                // Teams routes to the endpoints it believes are running.
-                ctx.stop_calling().await;
-                return Ok(());
+        /// What woke the loop. Decided inside the `select!` and acted on outside it, so the stop's
+        /// own long await never runs with the other branches' futures still borrowed.
+        enum Woke {
+            Accepted(std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>),
+            Idle,
+            Signal(&'static str),
+        }
+        let woke = tokio::select! {
+            accepted = listener.accept() => Woke::Accepted(accepted),
+            _ = &mut idle_shutdown => Woke::Idle,
+            name = signals.next() => Woke::Signal(name),
+        };
+        let accepted = match woke {
+            Woke::Accepted(accepted) => accepted,
+            // Stop being a device the user's calls ring on, and leave a call nothing can control
+            // any more. In the launcher's shapes this fires only once the launcher itself is gone
+            // (its keepalive socket is a client), so no surface can end, mute or see the call.
+            Woke::Idle => {
+                eprintln!("[lifecycle] no UI clients remain — leaving any call, then exiting");
+                match leave_and_exit(&ctx, "the idle exit").await {}
+            }
+            Woke::Signal(name) => {
+                eprintln!(
+                    "[lifecycle] {name} — leaving any call and handing the calling registration \
+                     back, then exiting"
+                );
+                signals.ignore_from_now_on();
+                match leave_and_exit(&ctx, name).await {}
             }
         };
         // A transient accept() error (e.g. fd pressure) must not take down the
@@ -13708,21 +13978,100 @@ fn marker_name(message_id: &str) -> String {
 /// answering days ago. The store row is NOT dropped here: that one is the record a
 /// repair still has to act on (see `repair_abandoned_agent_runs`).
 fn clear_dead_agent_run_markers() {
-    let Some(dir) = agent_run_marker_dir() else { return };
-    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    if let Some(dir) = agent_run_marker_dir() {
+        clear_dead_markers_in(&dir);
+    }
+}
+
+/// Remove every marker in `dir` whose `pid=` names no running process. Shared by the agent's
+/// markers and the call markers, which are one shape: a file a shell reads, naming a pid.
+fn clear_dead_markers_in(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
         let alive = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|body| {
-                body.lines()
-                    .find_map(|line| line.strip_prefix("pid="))
-                    .and_then(|pid| pid.trim().parse::<u32>().ok())
-            })
-            .is_some_and(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists());
+            .is_ok_and(|body| marker_names_a_live_process(&body));
         if !alive {
             let _ = std::fs::remove_file(&path);
         }
+    }
+}
+
+/// Whether a marker's `pid=` line names a process that is still running — and, where the marker
+/// states the process's START TIME (`start=`, a call marker does), that it is still the SAME process.
+///
+/// A pid alone is not an identity: the kernel hands a freed pid to the next process, so a marker left
+/// by a backend killed in a call could otherwise name an unrelated process for as long as it lived,
+/// and the guard would refuse every stop for a call that ended long ago. A marker without `start=`
+/// (the agent's) is judged by its pid alone, as it always was.
+fn marker_names_a_live_process(body: &str) -> bool {
+    let field = |name: &str| body.lines().find_map(|line| line.strip_prefix(name)).map(str::trim);
+    let Some(pid) = field("pid=").and_then(|pid| pid.parse::<u32>().ok()) else {
+        return false;
+    };
+    match field("start=") {
+        Some(start) => process_start_ticks(&format!("/proc/{pid}/stat")).is_some_and(|ticks| ticks.to_string() == start),
+        None => std::path::Path::new(&format!("/proc/{pid}")).exists(),
+    }
+}
+
+/// A process's start time, in clock ticks since boot: field 22 of its `/proc/<pid>/stat`, counted
+/// after the command name, whose parentheses may hold spaces of their own.
+fn process_start_ticks(stat_path: &str) -> Option<u64> {
+    let stat = std::fs::read_to_string(stat_path).ok()?;
+    let after_name = &stat[stat.rfind(')')? + 1..];
+    // Fields 3 onwards: the state is the first, so field 22 is the twentieth.
+    after_name.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Where a backend publishes that a call HOLDS THE USER, for tooling that must not stop it.
+///
+/// The automation guard reads it (`.claude/hooks/guard-live-automation.sh`, rule 3a-iii): a stop
+/// now LEAVES the call the backend holds, so tooling stopping a backend would hang up on the
+/// people the user is talking to. The runtime directory only, as for the agent's markers and for
+/// their reason — a marker names a pid, and one that outlived a reboot could name a pid something
+/// else now holds. No `XDG_RUNTIME_DIR`, no marker: that is the container, whose stops the guard
+/// refuses by other rules.
+fn call_marker_dir() -> Option<std::path::PathBuf> {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")?;
+    let runtime = std::path::PathBuf::from(runtime);
+    runtime.is_absolute().then(|| runtime.join("teams-lite/calls"))
+}
+
+/// One marker per BACKEND, named after its port: this machine runs several send-capable backends,
+/// and each holds at most one call.
+fn call_marker_path() -> Option<std::path::PathBuf> {
+    call_marker_dir().map(|dir| dir.join(own_port().to_string()))
+}
+
+/// What a call marker holds: whose process it is, which port, the phase and since when — and no
+/// call id, no conversation and no name, because a marker is a fact for a shell rather than a
+/// record of who the user is talking to.
+fn call_marker_body(marker: &CallMarker, pid: u32, port: u16, start: Option<u64>) -> String {
+    let start = start.map(|ticks| format!("start={ticks}\n")).unwrap_or_default();
+    format!("pid={pid}\n{start}port={port}\nphase={}\nsince_ms={}\n", marker.phase, marker.since_ms)
+}
+
+fn write_call_marker(path: &std::path::Path, marker: &CallMarker) {
+    if let Some(dir) = path.parent() {
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+    }
+    let start = process_start_ticks("/proc/self/stat");
+    let _ = std::fs::write(path, call_marker_body(marker, std::process::id(), own_port(), start));
+}
+
+fn remove_call_marker(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+/// Drop the call markers of backends that no longer have a process, once, at startup. Every one
+/// of them is a backend that died in a call — killed, or crashed — and left behind it would tell
+/// the guard a call is live on a machine where none is.
+fn clear_dead_call_markers() {
+    if let Some(dir) = call_marker_dir() {
+        clear_dead_markers_in(&dir);
     }
 }
 
@@ -15057,7 +15406,48 @@ impl Ctx {
     }
 
     fn emit_call_state(&self) {
+        // Every change a page is told about passes through here, so the marker cannot fall behind
+        // the call: whatever a page reads about the call, the marker reads too.
+        self.sync_call_marker();
         self.emit("call_state", self.call_state_payload());
+    }
+
+    /// Keep this backend's CALL MARKER in step with the call: present while a call holds the user
+    /// ([`call_holds_the_user`]), gone otherwise.
+    ///
+    /// It exists for a reader that is a SHELL — the automation guard, which must refuse tooling a
+    /// stop of a backend the user is in a call on, because a stop now LEAVES that call
+    /// ([`Ctx::leave_calls_for_exit`]). The agent's markers are the precedent and for the same
+    /// reason: a shell can read a file, and the alternative was opening the store or guessing from
+    /// a process tree.
+    ///
+    /// Written on a TRANSITION and never on every frame — a new call, a phase that moved, the call
+    /// ending — because a roster update arrives every few seconds and a write per frame is churn
+    /// for no reader. The file and the remembered state move under the plane's lock together, so
+    /// two emits racing cannot leave a marker for a call that is over. Best-effort throughout: a
+    /// marker is a courtesy to tooling, and no call may fail because a tmpfs would not take a
+    /// file. A read-only backend never holds a call, so it never writes one.
+    fn sync_call_marker(&self) {
+        let mut plane = self.calling.lock().unwrap();
+        let now = plane
+            .call
+            .as_ref()
+            .filter(|call| call_holds_the_user(call.phase))
+            .map(|call| CallMarker {
+                call_id: call.id.clone(),
+                phase: call.phase.as_str(),
+                since_ms: call.started_at_ms,
+            });
+        if plane.marker == now {
+            return;
+        }
+        if let Some(path) = &self.call_marker {
+            match &now {
+                Some(marker) => write_call_marker(path, marker),
+                None => remove_call_marker(path),
+            }
+        }
+        plane.marker = now;
     }
 
     /// Change the calling plane, and tell the pages only when something they READ changed.
@@ -15109,8 +15499,10 @@ impl Ctx {
     /// that names no calling service, and it is typed so the loop can say so.
     fn start_calling(&self, session: &Session) -> Result<(), CallingStartError> {
         // Idempotent, and it can be: the one caller is the start loop, and nothing between
-        // this check and the handle being stored below awaits.
-        if self.calling.lock().unwrap().connection.is_some() {
+        // this check and the handle being stored below awaits. A process on its way out
+        // registers for nothing — a registration made now would outlive it — and standing down
+        // is the loop's "done": there is nothing left to start for.
+        if self.stopping.load(Ordering::SeqCst) || self.calling.lock().unwrap().connection.is_some() {
             return Ok(());
         }
         let endpoints = calling::endpoints(session).map_err(CallingStartError::NoCallingEndpoints)?;
@@ -15211,6 +15603,14 @@ impl Ctx {
                     return; // calling was turned off; this connection is gone
                 }
                 ctx_keepalive.expire_unanswered_call().await;
+                // In a task of its own, never awaited here: see `WARMING`.
+                if !WARMING.swap(true, Ordering::SeqCst) {
+                    let warmer = ctx_keepalive.clone();
+                    tokio::spawn(async move {
+                        let _warming = Warming;
+                        warmer.warm_call_credentials().await;
+                    });
+                }
                 ctx_keepalive.keep_call_alive().await;
             }
         });
@@ -15230,45 +15630,223 @@ impl Ctx {
         Ok(())
     }
 
-    /// Stop the calling connection and unregister the endpoint.
+    /// Leave the call this process holds, and hand its calling registration back, because the
+    /// process is going away — a signal, the idle exit, or a restart (see [`leave_and_exit`]).
     ///
-    /// Unregistering is the load-bearing half. A registration Teams still believes in
-    /// keeps routing the user's calls to a client that is gone, and a call offered to
-    /// a device that never rings is a call they miss — so the DELETE goes out even if
-    /// dropping the socket already did.
-    async fn stop_calling(&self) {
-        let (handle, endpoint_id) = {
+    /// THE CALL IS LEFT, NOT ABANDONED. A backend that simply died left the people on the call
+    /// with a participant gone silent until the service gave up on it, and Teams went on offering
+    /// the user's calls to an endpoint that was gone, for up to an hour. So on the way out:
+    ///
+    ///   1. `stopping` is set — once. A second caller (a TERM landing while a restart's own stop
+    ///      runs) waits for the first to end the process rather than hanging up a second time.
+    ///   2. the call, its hangup door and the registration are taken out of the plane — so from
+    ///      here `call_prepare` refuses on every path, in the sentence it already has.
+    ///   3. the call ends HERE first, so every page is told while the requests below travel: a
+    ///      call that HOLDS the user ([`call_holds_the_user`]) as [`calling::END_REASON_BACKEND_STOPPING`],
+    ///      and a ring as the machine having stopped taking calls.
+    ///   4. the calling socket is dropped.
+    ///   5. the hangup End sends, and the registration's DELETE, go out TOGETHER under one budget
+    ///      ([`SHUTDOWN_BUDGET`]), each request bounded by [`calling::SignalClass::Shutdown`].
+    ///
+    /// Three rules hold it:
+    ///
+    ///   * **A ring is never declined.** It posts nothing and goes on ringing the user's other
+    ///     devices; only the Decline press declines (`hangup_door`). The real client declines a
+    ///     ringing call on page close; this app deliberately does not.
+    ///   * **Only credentials it already HOLDS.** A fetch here could start an interactive rescue
+    ///     whose window no process is left to take back ([`Ctx::cached_signal_credentials`]). With
+    ///     nothing cached the requests are skipped with one line, and the registration expires on
+    ///     its own within the hour, as it did before this existed.
+    ///   * **A read-only backend sends nothing** — it never calls, and this says so a second time.
+    async fn leave_calls_for_exit(&self, why: &str) {
+        if self.stopping.swap(true, Ordering::SeqCst) {
+            // Another stop is already leaving; it ends the process. Waiting for it, rather than
+            // returning, keeps this caller from exiting before the hangup went out.
+            std::future::pending::<()>().await;
+        }
+        // Read FIRST, because what the pages are told depends on it: a call this stop cannot sign a
+        // hangup for is ABANDONED, and saying "you left the call" about it would tell the user the
+        // others saw them go when they saw nothing. A read-only backend holds no call and signs
+        // nothing.
+        let credentials = if read_only() { None } else { self.cached_signal_credentials().await };
+        // The snapshot and the local end are ONE critical section. A start whose answer is applied
+        // before it put its door in the call, and the snapshot has it; one applied after it finds the
+        // call ended and hangs up what it made (`hang_up_orphan`), which the stop waits for below.
+        // Taken apart, an answer landing between the two was in neither — and its leg was left.
+        let (handle, endpoint_id, leaving, ending, reason) = {
             let mut plane = self.calling.lock().unwrap();
             plane.connected = false;
             plane.relay = None;
             plane.relay_credentials = None;
-            (plane.connection.take(), plane.channel.take().map(|c| c.endpoint_id))
+            let leaving = plane.call.as_ref().filter(|call| call_holds_the_user(call.phase)).map(
+                |call| LeavingCall {
+                    call_id: call.id.clone(),
+                    url: call.hangup_link().map(str::to_string),
+                    local: call.local.clone(),
+                    phase: call.phase.as_str(),
+                },
+            );
+            let reason = if leaving.is_some() && credentials.is_some() {
+                calling::END_REASON_BACKEND_STOPPING
+            } else {
+                "CallEndReasonCallingTurnedOff"
+            };
+            let ending = mark_call_ended(&mut plane, None, reason);
+            (plane.connection.take(), plane.channel.take().map(|c| c.endpoint_id), leaving, ending, reason)
         };
-        self.end_call_locally("CallEndReasonCallingTurnedOff").await;
+        self.announce_call_ended(ending, reason);
         if let Some(handle) = handle {
             handle.abort();
         }
-        if let Some(endpoint_id) = endpoint_id {
-            if let Err(e) = self.unregister_calling(&endpoint_id).await {
-                eprintln!("[calling] could not unregister {endpoint_id}: {e:#}");
-            } else {
-                eprintln!("[calling] unregistered {endpoint_id} — calls stop ringing here");
+        if read_only() {
+            self.emit_call_state();
+            return;
+        }
+        if leaving.is_none() && endpoint_id.is_none() {
+            self.emit_call_state();
+            return;
+        }
+        let Some((session, ic3)) = credentials else {
+            eprintln!(
+                "[calling] {why}: no credentials are held to leave with — {}the registration \
+                 expires on its own within the hour",
+                if leaving.is_some() { "the call is abandoned, and " } else { "" }
+            );
+            self.emit_call_state();
+            return;
+        };
+        let hangup = async {
+            let Some(leaving) = &leaving else { return };
+            let Some(url) = &leaving.url else {
+                // No door yet: the request that creates the call is still on the wire, or was never
+                // sent (the user is still answering the microphone prompt). A request on the wire
+                // is waited for below, and its own answer — finding the call ended here — hangs up
+                // what it made (`hang_up_orphan`).
+                eprintln!(
+                    "[calling] {why}: the {} call has no door to leave by yet — any start still \
+                     on the wire hangs up what it made when it answers",
+                    leaving.phase
+                );
+                return;
+            };
+            let payload = calling::hangup_payload(&leaving.local);
+            match calling::post_signal(
+                &self.http,
+                calling::SignalClass::Shutdown,
+                url,
+                &session,
+                &ic3,
+                &leaving.call_id,
+                &payload,
+            )
+            .await
+            {
+                Ok(_) => eprintln!("[calling] {why}: left the {} call", leaving.phase),
+                Err(e) => eprintln!("[calling] {why}: the call could not be left: {e:#}"),
             }
+        };
+        let unregister = async {
+            let Some(endpoint_id) = &endpoint_id else { return };
+            match self.unregister_with(&session, &ic3, endpoint_id, calling::SignalClass::Shutdown).await
+            {
+                Ok(()) => eprintln!("[calling] unregistered {endpoint_id} — calls stop ringing here"),
+                Err(e) => eprintln!("[calling] could not unregister {endpoint_id}: {e:#}"),
+            }
+        };
+        // A start whose answer is still on the wire — an invite, a join, an attach or an
+        // acceptance — is the only thing that can take back what it made: its answer is that
+        // leg's only address. So the process stays up for it, within the same budget.
+        let starts = self.starts_in_flight.settled();
+        if tokio::time::timeout(SHUTDOWN_BUDGET, futures_util::future::join3(hangup, unregister, starts))
+            .await
+            .is_err()
+        {
+            eprintln!(
+                "[calling] {why}: leaving took longer than {} s — exiting regardless",
+                SHUTDOWN_BUDGET.as_secs()
+            );
         }
         self.emit_call_state();
     }
 
-    async fn unregister_calling(&self, endpoint_id: &str) -> Result<()> {
-        let session = self.session().await?;
-        let ic3 = self.tokens.get(IC3_SCOPE).await?;
-        let endpoints = calling::endpoints(&session)?;
+    /// The credentials a STOPPING backend may sign a request with: the session and the ic3 token
+    /// it already holds, and nothing it would have to fetch. Neither read reaches the broker
+    /// ([`Ctx::session_within`], [`auth::TokenCache::cached_within`]). While a call holds the user
+    /// both are kept warm on the keep-alive tick ([`Ctx::warm_call_credentials`]), so they are at
+    /// most a tick past their freshness bound — which [`EXIT_CREDENTIAL_GRACE`] covers.
+    async fn cached_signal_credentials(&self) -> Option<(Session, String)> {
+        let session = self.session_within(EXIT_CREDENTIAL_GRACE).await?;
+        let ic3 = self.tokens.cached_within(IC3_SCOPE, EXIT_CREDENTIAL_GRACE)?;
+        Some((session, ic3))
+    }
+
+    /// Keep the session and the ic3 token FRESH while a call holds the user, so a stop can sign the
+    /// hangup that leaves it.
+    ///
+    /// A stop signs only with what is held ([`Ctx::cached_signal_credentials`]), and nothing else
+    /// keeps either fresh during a QUIET call — nobody mutes, nothing renegotiates, and the call's
+    /// `keepAlive` door is one no measured call names, so `keep_call_alive` sends nothing. Without
+    /// this a stop fifty minutes after the last request would abandon the call. Each read reaches
+    /// the broker only when its value has gone stale — about once an hour of call, which is what
+    /// the next request made during the call would do anyway. It runs in a task of its own
+    /// ([`WARMING`]); a failure is said once and then waits [`WARM_RETRY_AFTER`] before the broker is
+    /// asked again, while a session any other path adopts still refreshes the cell.
+    async fn warm_call_credentials(&self) {
+        let holds = self
+            .calling
+            .lock()
+            .unwrap()
+            .call
+            .as_ref()
+            .is_some_and(|call| call_holds_the_user(call.phase));
+        if !holds || self.stopping.load(Ordering::SeqCst) || read_only() {
+            return;
+        }
+        let backing_off = WARM_FAILED_AT
+            .lock()
+            .ok()
+            .and_then(|failed| *failed)
+            .is_some_and(|at| at.elapsed() < WARM_RETRY_AFTER);
+        if backing_off {
+            return;
+        }
+        let warmed = match self.session().await {
+            Ok(_) => self.tokens.get(IC3_SCOPE).await.map(|_| ()),
+            Err(e) => Err(e),
+        };
+        let Ok(mut failed) = WARM_FAILED_AT.lock() else { return };
+        match warmed {
+            Ok(()) => *failed = None,
+            Err(e) => {
+                if failed.is_none() {
+                    eprintln!(
+                        "[calling] could not keep the call's credentials fresh ({e:#}) — a stop \
+                         now may not be able to hang up; asking again in {} min",
+                        WARM_RETRY_AFTER.as_secs() / 60
+                    );
+                }
+                *failed = Some(std::time::Instant::now());
+            }
+        }
+    }
+
+    /// Hand the calling registration back with credentials the caller already has, bounded by
+    /// `class`.
+    async fn unregister_with(
+        &self,
+        session: &Session,
+        ic3: &str,
+        endpoint_id: &str,
+        class: calling::SignalClass,
+    ) -> Result<()> {
+        let endpoints = calling::endpoints(session)?;
         trouter::unregister(
             &self.http,
             &session.skypetoken,
-            &ic3,
+            ic3,
             &endpoints.registrar,
             endpoint_id,
-            calling::SignalClass::End.timeout(),
+            class.timeout(),
         )
         .await
     }
@@ -16011,27 +16589,14 @@ impl Ctx {
     }
 
     async fn end_call_where(&self, only: Option<&str>, reason: &str) {
-        let ending = {
-            let mut plane = self.calling.lock().unwrap();
-            match plane.call.as_mut() {
-                Some(call)
-                    if call.phase != CallPhase::Ended && only.is_none_or(|id| call.id == id) =>
-                {
-                    call.phase = CallPhase::Ended;
-                    // A call that rang NOBODY ends with a phrase about the symptom ("no one
-                    // else has joined"), and the cause arrived on its own frame a beat
-                    // earlier. The cause wins wherever we have it.
-                    let stated = if call.unreachable {
-                        calling::END_REASON_UNREACHABLE.to_string()
-                    } else {
-                        reason.to_string()
-                    };
-                    call.end_reason = Some(stated.clone());
-                    Some((call.id.clone(), stated))
-                }
-                _ => None,
-            }
-        };
+        let ending = mark_call_ended(&mut self.calling.lock().unwrap(), only, reason);
+        self.announce_call_ended(ending, reason);
+    }
+
+    /// Tell every page about a call [`mark_call_ended`] marked, and free the slot. Split from the
+    /// marking so a caller that must mark the call inside a critical section of its own (the stop,
+    /// in `leave_calls_for_exit`) tells the pages after it, exactly as every other ending does.
+    fn announce_call_ended(&self, ending: Option<(String, String)>, reason: &str) {
         let Some((ended, stated)) = ending else {
             return;
         };
@@ -16239,6 +16804,13 @@ impl Ctx {
         failed: &str,
         start: impl std::future::Future<Output = Result<Value>> + Send + 'static,
     ) -> Result<Value> {
+        // Counted while it runs, its orphan hangup included, so a stop waits for its answer (see
+        // `StartsInFlight`).
+        let in_flight = self.starts_in_flight.enter();
+        let start = async move {
+            let _in_flight = in_flight;
+            start.await
+        };
         match detached(CALL_START_WAIT, start).await {
             Detached::Finished(outcome) => outcome,
             Detached::StillRunning => {
@@ -16645,6 +17217,10 @@ impl Ctx {
                     self.hang_up_orphan("call_accept", &call_id, &local, &orphan_doors).await;
                     return Ok(json!({ "call_id": call_id, "cancelled": true }));
                 }
+                // The call holds the user from here — a stop would leave it — while the pages are
+                // told only once the acceptance has answered. So the marker is written now, or
+                // tooling could stop this backend in the whole window the acceptance travels.
+                self.sync_call_marker();
                 // The conversation's doors, now the call is known to be held — `leave` for the
                 // hangup, `updateEndpointState` for the mute — through the sequence gate.
                 if let Some(leg) = joined.clone() {
@@ -16822,7 +17398,29 @@ impl Ctx {
         };
         let url = url.to_string();
         let payload = calling::hangup_payload(local);
-        match self.post_signal_for(call_id, calling::SignalClass::End, &url, &payload).await {
+        // On a backend that is STOPPING this is the stop's own last request — the answer of a start
+        // it waited for — so it signs with what is held and takes the stop's bound, exactly as the
+        // stop's hangup does (see `leave_calls_for_exit`).
+        let sent = if self.stopping.load(Ordering::SeqCst) {
+            match self.cached_signal_credentials().await {
+                Some((session, ic3)) => {
+                    calling::post_signal(
+                        &self.http,
+                        calling::SignalClass::Shutdown,
+                        &url,
+                        &session,
+                        &ic3,
+                        call_id,
+                        &payload,
+                    )
+                    .await
+                }
+                None => Err(anyhow::anyhow!("no credentials are held to hang it up with")),
+            }
+        } else {
+            self.post_signal_for(call_id, calling::SignalClass::End, &url, &payload).await
+        };
+        match sent {
             Ok(_) => eprintln!("[calling] {method}: the call was cancelled — hung it up"),
             Err(e) => eprintln!("[calling] {method}: the cancelled call did not hang up: {e:#}"),
         }
@@ -18837,9 +19435,10 @@ mod tests {
     /// Scanned rather than run, because the method ends in a killed process: what has to
     /// hold is the ORDER of three things. The agent count is read BEFORE anything is taken
     /// down (a reply frozen mid-answer is the one cost the user has to be asked about); the
-    /// reply's grace comes before the exit (the answer travels on the socket this drops, so
-    /// acting at once swallows it); and the calling registration is handed back before the
-    /// process that would answer a call is gone.
+    /// reply's grace comes before anything goes (the answer travels on the socket this drops,
+    /// so acting at once swallows it); and the call is LEFT and the calling registration handed
+    /// back by the one stop every way out takes — under a supervisor HERE, and under the launcher
+    /// by the TERM it sends, so the launcher arm must ask and nothing more.
     #[test]
     fn a_requested_restart_asks_about_the_agent_and_answers_before_it_goes() {
         let source = include_str!("server.rs");
@@ -18852,12 +19451,693 @@ mod tests {
             .expect("the handler ends before the next method");
 
         let agent = body.find("live_agent_runs_here()").expect("the agent count");
-        let grace = body.find("RESTART_ANSWER_GRACE").expect("the answer's own grace");
-        let calling = body.find("stop_calling()").expect("the calling registration");
-        let exit = body.find("std::process::exit(0)").expect("the exit");
+        let grace = body.find("tokio::time::sleep(RESTART_ANSWER_GRACE)").expect("the answer's own grace");
+        let supervisor = body
+            .find("Restarter::Supervisor => match leave_and_exit(&ctx, \"the restart\").await {},")
+            .expect("under a supervisor the restart is the one stop: leave the call, then exit");
         assert!(agent < grace, "the runs a restart would cut off are read before it starts");
-        assert!(grace < calling, "the click's own answer goes out before anything is stopped");
-        assert!(calling < exit, "a device Teams still routes calls to must be taken back");
+        assert!(grace < supervisor, "the click's own answer goes out before anything is stopped");
+        // A backend already on its way out is restarting already: it answers without asking the
+        // launcher again, which would race a second stop-and-spawn beside the first.
+        let stopping = body
+            .find("if self.stopping.load(Ordering::SeqCst) {\n            return Ok(json!({ \"restarted\": true, \"via\": via }));")
+            .expect("a stopping backend answers a restart without asking again");
+        assert!(stopping < grace, "it answers before anything is scheduled");
+        // No exit of its own and no stop of its own beside the shared one: an exit here would
+        // abandon the call, and a second spelling of the stop would drift from it.
+        assert!(!body.contains("std::process::exit"), "the restart exits through leave_and_exit alone");
+        assert!(!body.contains("leave_calls_for_exit"), "the restart stops through leave_and_exit alone");
+        // The launcher arm only ASKS: the launcher's own TERM runs the stop, so a launcher that
+        // never acts leaves calling exactly as it was.
+        let launcher = &body[body.find("Restarter::Launcher => {").expect("the launcher arm")..];
+        let launcher = &launcher[..launcher.find("\n                }").expect("the arm ends")];
+        assert!(launcher.contains("ctx.emit(\"backend_restart\""), "the launcher is asked");
+        assert!(!launcher.contains("leave_and_exit"), "the launcher's TERM is what stops this process");
+    }
+
+    /// A context that can LEAVE a call: a fresh session whose directory names `registrar` (and no
+    /// other calling service — nothing here may fall back to the real registrar), and an ic3
+    /// token in a cache that reaches no broker.
+    async fn stopping_ctx(registrar: &str) -> Ctx {
+        let mut ctx = test_ctx();
+        ctx.tokens = auth::TokenCache::preloaded(&[(IC3_SCOPE, "ic3")]);
+        let mut session = test_session();
+        session.gtms = json!({
+            "calling_conversationServiceUrl": "https://conversation.invalid/",
+            "calling_trouterUrl": "https://trouter.invalid/",
+            "calling_registrarUrl": registrar,
+        });
+        ctx.adopt_session(session).await;
+        ctx
+    }
+
+    /// Put `call` in the plane of `ctx`, registered as `epid-1` on a socket that is up.
+    fn holding(ctx: &Ctx, call: CallSession) {
+        let mut plane = ctx.calling.lock().unwrap();
+        plane.call = Some(call);
+        plane.channel = Some(trouter::CallingChannel {
+            surl: "https://tr/v4/f/a/".into(),
+            endpoint_id: "epid-1".into(),
+            registrar_status: 200,
+        });
+        plane.connected = true;
+    }
+
+    /// The end reason the last `call_state` frame on `events` carried.
+    fn last_end_reason(events: &mut broadcast::Receiver<Value>) -> Option<String> {
+        let mut reason = None;
+        while let Ok(frame) = events.try_recv() {
+            if frame["event"] == "call_state" {
+                if let Some(said) = frame.pointer("/data/call/end_reason").and_then(Value::as_str) {
+                    reason = Some(said.to_string());
+                }
+            }
+        }
+        reason
+    }
+
+    /// A STOPPING BACKEND LEAVES THE CALL THAT HOLDS THE USER, and hands its registration back —
+    /// both, within the budget, on the credentials it already holds. Driven against stand-in
+    /// services: the hangup End sends reaches the call's own door, the DELETE reaches the
+    /// registrar, nothing is declined, and the call ends here as teams-lite stopping.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stopping_backend_leaves_the_call_and_hands_the_registration_back() {
+        let (door, doors) = stand_in_service("{}", Duration::ZERO);
+        let (registrar, registrars) = stand_in_service("", Duration::ZERO);
+        let ctx = stopping_ctx(&registrar).await;
+        let mut call = call_on_session("live");
+        call.links = calling::Links::collect(&json!({
+            "links": { "hangup": door, "reject": "https://cc/never/reject" }
+        }));
+        let local = call.local.clone();
+        holding(&ctx, call);
+        let mut events = ctx.events.subscribe();
+
+        let started = std::time::Instant::now();
+        ctx.leave_calls_for_exit("a test").await;
+        assert!(started.elapsed() < SHUTDOWN_BUDGET, "the stop ran past its budget");
+
+        let left = doors.recv_timeout(Duration::from_secs(2)).expect("the call was left");
+        assert!(left.starts_with("POST /stand-in/ "), "the hangup went to the call's door: {left}");
+        assert_eq!(request_body(&left), calling::hangup_payload(&local), "it is End's own body");
+        let delete = registrars.recv_timeout(Duration::from_secs(2)).expect("the registration went back");
+        assert!(delete.starts_with("DELETE /stand-in/epid-1 "), "{delete}");
+        assert_eq!(
+            last_end_reason(&mut events).as_deref(),
+            Some(calling::END_REASON_BACKEND_STOPPING),
+            "every page is told the call ended because teams-lite stopped"
+        );
+        let plane = ctx.calling.lock().unwrap();
+        assert!(plane.call.is_none() && plane.channel.is_none(), "nothing of the call is left");
+        assert!(ctx.stopping.load(Ordering::SeqCst), "the process is marked as on its way out");
+    }
+
+    /// A RING IS NEVER DECLINED AT A STOP. A call still ringing holds nobody: nothing goes to any
+    /// of its doors, so it goes on ringing the user's other devices — and the registration still
+    /// goes back, so this machine stops being one the next call rings.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stopping_backend_never_declines_a_ring() {
+        let (door, doors) = stand_in_service("{}", Duration::ZERO);
+        let (registrar, registrars) = stand_in_service("", Duration::ZERO);
+        let ctx = stopping_ctx(&registrar).await;
+        let mut call = ringing_incoming_call(&door, calling::IncomingProtocol::Answer);
+        call.links = calling::Links::collect(&json!({
+            "links": { "attach": door, "reject": door, "hangup": door }
+        }));
+        holding(&ctx, call);
+        let mut events = ctx.events.subscribe();
+
+        ctx.leave_calls_for_exit("a test").await;
+
+        assert!(
+            doors.recv_timeout(Duration::from_millis(300)).is_err(),
+            "a ringing call was sent something at a stop"
+        );
+        registrars.recv_timeout(Duration::from_secs(2)).expect("the registration went back");
+        assert_eq!(
+            last_end_reason(&mut events).as_deref(),
+            Some("CallEndReasonCallingTurnedOff"),
+            "a ring is dropped as the machine stopping taking calls, never as a call the user left"
+        );
+    }
+
+    /// WITH NOTHING CACHED, NOTHING IS FETCHED. A stop that minted a token could start an
+    /// interactive rescue whose window no process is left to take back — so with no session and
+    /// no token held it sends nothing at all, still ends the call here at once, and says it as the
+    /// machine stopping taking calls rather than as a call the user left.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_with_nothing_cached_sends_nothing_and_still_ends_the_call() {
+        let (door, doors) = stand_in_service("{}", Duration::ZERO);
+        let mut ctx = test_ctx();
+        // A cache that holds nothing and reaches no broker: a fetch would fail rather than mint.
+        ctx.tokens = auth::TokenCache::preloaded(&[]);
+        let mut call = call_on_session("live");
+        call.links = calling::Links::collect(&json!({ "links": { "hangup": door } }));
+        holding(&ctx, call);
+        let mut events = ctx.events.subscribe();
+
+        let started = std::time::Instant::now();
+        ctx.leave_calls_for_exit("a test").await;
+        assert!(started.elapsed() < Duration::from_secs(1), "a stop with nothing to send waits for nothing");
+        assert!(doors.recv_timeout(Duration::from_millis(300)).is_err(), "something was sent");
+        // Nobody on the call was told, so the page must not say the user LEFT it.
+        assert_eq!(
+            last_end_reason(&mut events).as_deref(),
+            Some("CallEndReasonCallingTurnedOff")
+        );
+    }
+
+    /// REPEATED STOPS ARE ONE STOP. A second caller — a TERM landing while a restart's own stop
+    /// runs — never sends a second hangup and never returns: the first stop ends the process.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_stop_waits_for_the_first_and_sends_nothing() {
+        let (door, doors) = stand_in_answers(
+            vec![("200 OK", "{}".to_string()), ("200 OK", "{}".to_string())],
+            Duration::ZERO,
+        );
+        let (registrar, _registrars) = stand_in_service("", Duration::ZERO);
+        let ctx = stopping_ctx(&registrar).await;
+        let mut call = call_on_session("live");
+        call.links = calling::Links::collect(&json!({ "links": { "hangup": door } }));
+        holding(&ctx, call);
+
+        ctx.leave_calls_for_exit("the first").await;
+        doors.recv_timeout(Duration::from_secs(2)).expect("the first stop left the call");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), ctx.leave_calls_for_exit("the second"))
+                .await
+                .is_err(),
+            "the second stop returned, so its caller could exit before the first one's hangup"
+        );
+        assert!(doors.recv_timeout(Duration::from_millis(300)).is_err(), "a second hangup went out");
+    }
+
+    /// THE HANGUP AND THE UNREGISTER TRAVEL TOGETHER. Sent one after the other, two slow answers
+    /// would add up past the budget and the second would be cut off by the exit; sent together,
+    /// the stop takes as long as the slower of the two.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_hangup_and_the_unregister_travel_together() {
+        let slow = Duration::from_millis(2_000);
+        let (door, doors) = stand_in_service("{}", slow);
+        let (registrar, registrars) = stand_in_service("", slow);
+        let ctx = stopping_ctx(&registrar).await;
+        let mut call = call_on_session("live");
+        call.links = calling::Links::collect(&json!({ "links": { "hangup": door } }));
+        holding(&ctx, call);
+
+        let started = std::time::Instant::now();
+        ctx.leave_calls_for_exit("a test").await;
+        let took = started.elapsed();
+        doors.recv_timeout(Duration::from_secs(1)).expect("the call was left");
+        registrars.recv_timeout(Duration::from_secs(1)).expect("the registration went back");
+        assert!(
+            took < slow * 2 - Duration::from_millis(500),
+            "the two requests went one after the other ({took:?})"
+        );
+    }
+
+    /// A BACKEND ON ITS WAY OUT REGISTERS FOR NOTHING. A registration made during the stop would
+    /// outlive the process — Teams would ring the user's calls on an endpoint that is gone — so the
+    /// start loop's attempt stands down and starts no connection.
+    #[tokio::test]
+    async fn a_stopping_backend_registers_for_nothing() {
+        // Built so that a REGRESSION stays harmless: a start that did not stand down would spawn a
+        // calling connection, whose credentials come from this context — so its cache reaches no
+        // broker and its session is adopted, and the endpoint id it would persist lands in a
+        // directory of this test's own rather than beside `:memory:` in the checkout.
+        let dir = marker_test_dir("registers");
+        let mut ctx = test_ctx();
+        ctx.db_path = Arc::new(dir.join("store.db").to_string_lossy().into_owned());
+        ctx.tokens = auth::TokenCache::preloaded(&[(IC3_SCOPE, "ic3")]);
+        let mut session = test_session();
+        session.gtms = json!({
+            "calling_conversationServiceUrl": "https://conversation.invalid/",
+            "calling_trouterUrl": "https://trouter.invalid/",
+            "calling_registrarUrl": "https://registrar.invalid/",
+        });
+        let session = ctx.adopt_session(session).await;
+        ctx.stopping.store(true, Ordering::SeqCst);
+        assert!(ctx.start_calling(&session).is_ok(), "standing down is the start loop's done");
+        let started = ctx.calling.lock().unwrap().connection.take();
+        if let Some(handle) = &started {
+            handle.abort();
+        }
+        assert!(started.is_none(), "a backend on its way out started a calling connection");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CREDENTIALS PAST THE GRACE ARE NOT CREDENTIALS. A stop that finds its session older than
+    /// its bound plus the grace signs nothing — and then must not tell the pages the user LEFT,
+    /// because nobody on the call was told: the call is said as the machine stopping taking calls.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_whose_credentials_have_gone_stale_abandons_the_call_and_says_so() {
+        let (door, doors) = stand_in_service("{}", Duration::ZERO);
+        let (registrar, registrars) = stand_in_service("", Duration::ZERO);
+        let ctx = stopping_ctx(&registrar).await;
+        // Minted long enough ago to be past the bound and the grace. A machine up for less than
+        // that cannot express the instant, and the test has nothing to say there.
+        let Some(minted) =
+            std::time::Instant::now().checked_sub(SESSION_TTL + EXIT_CREDENTIAL_GRACE + Duration::from_secs(1))
+        else {
+            return;
+        };
+        ctx.session.lock().await.minted = minted;
+        let mut call = call_on_session("live");
+        call.links = calling::Links::collect(&json!({ "links": { "hangup": door } }));
+        holding(&ctx, call);
+        let mut events = ctx.events.subscribe();
+
+        ctx.leave_calls_for_exit("a test").await;
+
+        assert!(doors.recv_timeout(Duration::from_millis(300)).is_err(), "it signed with a stale session");
+        assert!(registrars.recv_timeout(Duration::from_millis(300)).is_err(), "it unregistered with one");
+        assert_eq!(
+            last_end_reason(&mut events).as_deref(),
+            Some("CallEndReasonCallingTurnedOff"),
+            "a call that was not left is not said as left"
+        );
+    }
+
+    /// A SESSION A TICK PAST ITS BOUND STILL SIGNS THE STOP. A call keeps its credentials warm on
+    /// every keep-alive tick, so a stop can land a tick after they went stale; inside the grace the
+    /// hangup still goes out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_signs_with_a_session_just_past_its_bound() {
+        let (door, doors) = stand_in_service("{}", Duration::ZERO);
+        let (registrar, _registrars) = stand_in_service("", Duration::ZERO);
+        let ctx = stopping_ctx(&registrar).await;
+        let Some(minted) = std::time::Instant::now().checked_sub(SESSION_TTL + Duration::from_secs(20)) else {
+            return;
+        };
+        ctx.session.lock().await.minted = minted;
+        let mut call = call_on_session("live");
+        call.links = calling::Links::collect(&json!({ "links": { "hangup": door } }));
+        holding(&ctx, call);
+
+        ctx.leave_calls_for_exit("a test").await;
+        doors.recv_timeout(Duration::from_secs(2)).expect("a session inside the grace signed the hangup");
+    }
+
+    /// A START STILL ON THE WIRE IS WAITED FOR, AND ITS ANSWER HANGS UP WHAT IT MADE. The stop finds
+    /// a call that names no door yet — the invite's answer, its only address, is still travelling —
+    /// so the process stays up for it, within the budget; the answer finds the call ended and hangs
+    /// the leg up before the exit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_waits_for_a_start_on_the_wire_and_its_answer_hangs_up() {
+        let (door, doors) = stand_in_service("{}", Duration::ZERO);
+        let (registrar, _registrars) = stand_in_service("", Duration::ZERO);
+        let ctx = stopping_ctx(&registrar).await;
+        let mut call = call_on_session("live");
+        call.phase = CallPhase::Dialing;
+        call.links = calling::Links::default();
+        let local = call.local.clone();
+        holding(&ctx, call);
+
+        // A start in a task of its own, through the very wait every start takes: its answer lands
+        // 800 ms from now and names the leg it made.
+        let worker = ctx.clone();
+        let links = calling::Links::collect(&json!({ "links": { "hangup": door } }));
+        let start = async move {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            worker.hang_up_orphan("call_place", "call-1", &local, &links).await;
+            Ok(json!({}))
+        };
+        let waiting = {
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                ctx.await_call_start("call_place", "call-1", "CallEndReasonPlaceFailed", start).await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let started = std::time::Instant::now();
+        ctx.leave_calls_for_exit("a test").await;
+        let took = started.elapsed();
+        let hung_up = doors.recv_timeout(Duration::from_secs(1)).expect("the late answer's leg was hung up");
+        assert!(hung_up.starts_with("POST /stand-in/ "), "{hung_up}");
+        assert!(took >= Duration::from_millis(600), "the stop did not wait for the start ({took:?})");
+        assert!(took < SHUTDOWN_BUDGET, "the wait ran past the budget ({took:?})");
+        let _ = waiting.await;
+    }
+
+    /// AN ANSWERED CALL HAS ITS MARKER BEFORE ITS ACCEPTANCE ANSWERS. The call holds the user — a
+    /// stop would leave it — from the moment the attach takes it, while the pages are told only
+    /// once the acceptance answers. Tooling must be refused a stop in that whole window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_answered_call_has_its_marker_while_its_acceptance_travels() {
+        let dir = marker_test_dir("accepting");
+        let marker = dir.join("19420");
+        let (acceptance, acceptances) = stand_in_service("{}", Duration::from_millis(1_500));
+        let attached = format!(r#"{{"links":{{"acceptance":"{acceptance}","callLeg":"https://cc/leg"}}}}"#);
+        let (attach, _attaches) = stand_in_answers(vec![("200 OK", attached)], Duration::ZERO);
+        let mut ctx = sending_ctx("https://conversation.invalid/").await;
+        ctx.call_marker = Some(marker.clone());
+        ctx.calling.lock().unwrap().call = Some(ringing_incoming_call(&attach, calling::IncomingProtocol::Answer));
+
+        let answering = {
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                ctx.accept_ringing_call("call-1".into(), "v=0 answer".into(), "answer-1".into()).await
+            })
+        };
+        acceptances.recv_timeout(Duration::from_secs(5)).expect("the acceptance went out");
+        let body = std::fs::read_to_string(&marker).expect("no marker while the acceptance travels");
+        assert!(body.contains("phase=connected\n"), "{body}");
+        answering.await.expect("the accept ran").expect("answered");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The stop's requests are SIGNED WITH WHAT IS HELD and decline nothing. Scanned, because the
+    /// failure is a request that reaches the broker or a door the user never pressed — neither of
+    /// which a test that passes can see.
+    #[test]
+    fn a_stop_signs_with_what_it_holds_and_declines_nothing() {
+        let source = include_str!("server.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let start = code.find("    async fn leave_calls_for_exit(").expect("the stop");
+        let end = code[start..]
+            .find("    /// The credentials a STOPPING backend may sign a request with:")
+            .map(|end| start + end)
+            .expect("the stop ends before its credentials");
+        let stop = &code[start..end];
+        let held = code[end..]
+            .find("    /// Keep the session and the ic3 token FRESH")
+            .map(|to| &code[end..end + to])
+            .expect("the credentials end before the warm-up");
+        for reaches in [
+            ".session().await",
+            "tokens.get(",
+            "tokens.refresh(",
+            "post_signal_for(",
+            "post_call_signal(",
+            "rejection_payload",
+            ".reject()",
+        ] {
+            assert!(!stop.contains(reaches), "the stop names {reaches}");
+        }
+        assert_eq!(
+            stop.matches("calling::SignalClass::Shutdown").count(),
+            2,
+            "the hangup AND the unregister take the stop's own bound"
+        );
+        for class in ["SignalClass::End", "SignalClass::Create", "SignalClass::Answer"] {
+            assert!(!stop.contains(class), "a request of the stop takes {class}");
+        }
+        assert!(stop.contains("self.cached_signal_credentials().await"), "the stop signs with what is held");
+        for reaches in [".session().await", "tokens.get(", "tokens.refresh(", "teams::connect"] {
+            assert!(!held.contains(reaches), "the stop's credentials name {reaches}");
+        }
+        assert!(
+            held.contains("self.tokens.cached_within(IC3_SCOPE, EXIT_CREDENTIAL_GRACE)?"),
+            "the token is read, never fetched"
+        );
+        assert!(
+            held.contains("self.session_within(EXIT_CREDENTIAL_GRACE).await?"),
+            "the session is read, never rebuilt"
+        );
+        // And what the pages are told follows from them: a call that cannot be signed for is
+        // abandoned, never said as left.
+        assert!(
+            stop.contains("let reason = if leaving.is_some() && credentials.is_some() {\n                calling::END_REASON_BACKEND_STOPPING"),
+            "the reason is chosen from the credentials"
+        );
+        // And the snapshot and the local end are one critical section, so a start's answer is in
+        // the snapshot or finds the call ended — never neither.
+        let section = &stop[stop.find("let mut plane = self.calling.lock().unwrap();").expect("the snapshot")..];
+        let section = &section[..section.find("\n        };\n").expect("the section ends")];
+        assert!(section.contains("let ending = mark_call_ended(&mut plane, None, reason);"), "{section}");
+        assert!(!stop.contains("self.end_call_locally("), "the stop ends the call outside its snapshot");
+        assert!(
+            stop.contains("filter(|call| call_holds_the_user(call.phase))"),
+            "only a call that holds the user is left"
+        );
+        // A start's own orphan hangup is the stop's last request when it lands during the stop, so
+        // there it signs with what is held and takes the stop's bound too.
+        let orphan = code.find("    async fn hang_up_orphan(").expect("the orphan hangup");
+        let orphan = &code[orphan..orphan + code[orphan..].find("\n    }\n").expect("it ends")];
+        assert!(
+            orphan.contains(
+                "let sent = if self.stopping.load(Ordering::SeqCst) {\n            match self.cached_signal_credentials().await {"
+            ),
+            "{orphan}"
+        );
+        assert!(orphan.contains("calling::SignalClass::Shutdown,"), "{orphan}");
+    }
+
+    /// A CALL KEEPS ITS CREDENTIALS WARM, because nothing else does during a quiet one and a stop
+    /// signs only with what is held. The tick warms them before its keep-alive, and only while a
+    /// call holds the user — never on a backend that is stopping, where a fetch is what the stop
+    /// must not make.
+    #[test]
+    fn a_call_keeps_its_credentials_warm_while_it_holds_the_user() {
+        let source = include_str!("server.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let tick = code.find("ctx_keepalive.expire_unanswered_call().await;").expect("the keep-alive tick");
+        let tick = &code[tick..tick + code[tick..].find("\n            }\n").expect("the tick ends")];
+        // In a task of its own and one at a time: never awaited by the tick, which also frees a ring
+        // nobody answered and must not wait on the broker or the network to do it.
+        let warm = tick
+            .find("if !WARMING.swap(true, Ordering::SeqCst) {")
+            .expect("the tick starts one warm-up at a time");
+        let spawned = &tick[warm..];
+        assert!(spawned.contains("tokio::spawn(async move {\n                        let _warming = Warming;\n                        warmer.warm_call_credentials().await;"), "{spawned}");
+        let alive = tick.find("ctx_keepalive.keep_call_alive().await;").expect("the keep-alive");
+        assert!(warm < alive, "the credentials are warmed on every tick, keep-alive door or not");
+        assert!(!tick.contains("ctx_keepalive.warm_call_credentials().await"), "the tick awaits the warm-up");
+        let at = code.find("    async fn warm_call_credentials(&self) {").expect("the warm-up");
+        let body = &code[at..at + code[at..].find("\n    }\n").expect("it ends")];
+        assert!(body.contains(".is_some_and(|call| call_holds_the_user(call.phase));"), "{body}");
+        assert!(
+            body.contains("if !holds || self.stopping.load(Ordering::SeqCst) || read_only() {\n            return;"),
+            "it warms nothing for a ring, on a stopping backend or a read-only one: {body}"
+        );
+        // And after a failure it waits before it asks the broker again.
+        assert!(body.contains(".is_some_and(|at| at.elapsed() < WARM_RETRY_AFTER);\n        if backing_off {\n            return;"), "{body}");
+    }
+
+    /// A call holds the user from the moment they placed, answered or joined it — never while it
+    /// is merely ringing, and never once it is over.
+    #[test]
+    fn a_call_holds_the_user_once_they_are_in_it() {
+        assert!(!call_holds_the_user(CallPhase::Ringing));
+        assert!(call_holds_the_user(CallPhase::Dialing));
+        assert!(call_holds_the_user(CallPhase::Connecting));
+        assert!(call_holds_the_user(CallPhase::Connected));
+        assert!(!call_holds_the_user(CallPhase::Ended));
+    }
+
+    /// A marker is a fact for a shell: whose process, which port, the phase and since when — and
+    /// no call id, no conversation and no name.
+    #[test]
+    fn a_call_marker_names_a_process_and_a_phase_and_nobody() {
+        let marker = CallMarker { call_id: "call-secret".into(), phase: "connected", since_ms: 1_700 };
+        let body = call_marker_body(&marker, 4242, 19420, Some(987));
+        assert_eq!(body, "pid=4242\nstart=987\nport=19420\nphase=connected\nsince_ms=1700\n");
+        // Without a start time to state, the line is simply absent.
+        assert_eq!(
+            call_marker_body(&marker, 4242, 19420, None),
+            "pid=4242\nport=19420\nphase=connected\nsince_ms=1700\n"
+        );
+        assert!(!body.contains("call-secret"), "the marker names the call");
+    }
+
+    /// A temporary directory of this test's own, which nothing else on the machine reads.
+    fn marker_test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("teams-lite-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a test directory");
+        dir
+    }
+
+    /// THE MARKER FOLLOWS THE CALL, ON TRANSITIONS ONLY. Written once a call holds the user,
+    /// rewritten when its phase moves, NOT rewritten by a frame that changes nothing, and removed
+    /// when the call stops holding the user.
+    #[tokio::test]
+    async fn the_call_marker_is_written_on_transitions_and_removed_with_the_call() {
+        let dir = marker_test_dir("transitions");
+        let path = dir.join("19420");
+        let mut ctx = test_ctx();
+        ctx.call_marker = Some(path.clone());
+        let read = || std::fs::read_to_string(&path).ok();
+
+        let mut call = call_on_session("live");
+        call.phase = CallPhase::Ringing;
+        ctx.calling.lock().unwrap().call = Some(call);
+        ctx.emit_call_state();
+        assert_eq!(read(), None, "a ring holds nobody, so it has no marker");
+
+        ctx.calling.lock().unwrap().call.as_mut().unwrap().phase = CallPhase::Connecting;
+        ctx.emit_call_state();
+        assert!(read().is_some_and(|body| body.contains("phase=connecting\n")), "{:?}", read());
+
+        // A frame that changes nothing the marker says writes nothing: the file is taken away
+        // behind the backend's back, and an unchanged emit does not put it back.
+        std::fs::remove_file(&path).unwrap();
+        ctx.emit_call_state();
+        assert_eq!(read(), None, "an unchanged frame rewrote the marker");
+
+        ctx.calling.lock().unwrap().call.as_mut().unwrap().phase = CallPhase::Connected;
+        ctx.emit_call_state();
+        assert!(read().is_some_and(|body| body.contains("phase=connected\n")), "{:?}", read());
+
+        ctx.end_call_locally("CallEndReasonHangup").await;
+        assert_eq!(read(), None, "the marker outlived the call");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A TEST CONTEXT PUBLISHES NO MARKER. Every test runs as the default port, so one that did
+    /// would write a marker naming the user's own backend — or delete the one it wrote.
+    #[test]
+    fn a_test_context_publishes_no_call_marker() {
+        assert!(test_ctx().call_marker.is_none());
+    }
+
+    /// The markers of a process that is gone are cleared at boot, and a live one is kept.
+    #[test]
+    fn a_dead_backends_call_marker_is_cleared_and_a_live_one_kept() {
+        let dir = marker_test_dir("dead");
+        let live = dir.join("19420");
+        let dead = dir.join("19422");
+        let nameless = dir.join("19421");
+        std::fs::write(&live, format!("pid={}\nport=19420\n", std::process::id())).unwrap();
+        // A pid past any kernel's pid_max, so it can name no running process.
+        std::fs::write(&dead, "pid=999999999\nport=19422\n").unwrap();
+        std::fs::write(&nameless, "port=19421\n").unwrap();
+        // A pid that is alive but is no longer the process that wrote it: the kernel reused it.
+        let reused = dir.join("19423");
+        std::fs::write(&reused, format!("pid={}\nstart=1\nport=19423\n", std::process::id())).unwrap();
+        // And the same process, stated with its own start time, is kept.
+        let same = dir.join("19430");
+        let ours = process_start_ticks("/proc/self/stat").expect("this process has a start time");
+        std::fs::write(&same, format!("pid={}\nstart={ours}\nport=19430\n", std::process::id())).unwrap();
+        clear_dead_markers_in(&dir);
+        assert!(!reused.exists(), "a marker whose pid was reused was kept");
+        assert!(same.exists(), "a marker naming this very process was cleared");
+        assert!(live.exists(), "a live backend's marker was cleared");
+        assert!(!dead.exists(), "a dead backend's marker was kept");
+        assert!(!nameless.exists(), "a marker naming no process was kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE STOP BUDGETS CLOSE, across every process that times a stop. The backend leaves within
+    /// its budget plus the flush; the launcher waits longer than that before it KILLs; and every
+    /// supervisor waits longer than the launcher (and, in the image, than the launcher plus the
+    /// Intune container's own graceful stop). Move one number and this names which chain broke.
+    #[test]
+    fn the_stop_budgets_close() {
+        fn millis_in(text: &str, name: &str) -> u64 {
+            let at = text.find(name).unwrap_or_else(|| panic!("{name} is stated"));
+            let digits: String = text[at + name.len()..]
+                .chars()
+                .skip_while(|c| !c.is_ascii_digit())
+                .take_while(|c| c.is_ascii_digit() || *c == '_')
+                .filter(|c| *c != '_')
+                .collect();
+            digits.parse().unwrap_or_else(|_| panic!("{name} is a number"))
+        }
+        fn seconds_after(text: &str, key: &str) -> Option<u64> {
+            text.lines().find_map(|line| {
+                let line = line.trim();
+                line.strip_prefix(key).map(|rest| {
+                    rest.trim().trim_end_matches('s').parse().unwrap_or_else(|_| panic!("{line}"))
+                })
+            })
+        }
+        let launcher = include_str!("../../launcher/src/backend.ts");
+        let grace = Duration::from_millis(millis_in(launcher, "export const BACKEND_STOP_GRACE_MS ="));
+        let repeat = Duration::from_millis(millis_in(launcher, "export const REPEAT_SIGNAL_MS ="));
+
+        // 1. The backend's own stop: each request under the budget, the budget and the flush
+        //    under the launcher's grace.
+        assert!(calling::SignalClass::Shutdown.timeout() < SHUTDOWN_BUDGET);
+        assert!(
+            SHUTDOWN_BUDGET + RESTART_ANSWER_GRACE < grace,
+            "the launcher KILLs before the backend has left its call"
+        );
+        assert!(repeat < grace, "a duplicate signal is told apart from a human's second ask");
+
+        // 2. systemd: both units outlast the launcher, and the app unit TERMs the whole group —
+        //    the backend leaves on the unit's own TERM, and the launcher's is a repeat.
+        for (name, unit) in [
+            ("teams-lite-backend.service", include_str!("../../packaging/systemd/teams-lite-backend.service")),
+            ("teams-lite-app.service", include_str!("../../packaging/systemd/teams-lite-app.service")),
+        ] {
+            let timeout = seconds_after(unit, "TimeoutStopSec=").unwrap_or_else(|| panic!("{name} states its stop timeout"));
+            assert!(grace < Duration::from_secs(timeout), "{name} KILLs before the launcher's grace ends");
+            assert!(unit.contains("\nKillSignal=SIGTERM\n"), "{name} stops with SIGTERM, the signal the backend leaves on");
+        }
+        let app = include_str!("../../packaging/systemd/teams-lite-app.service");
+        assert!(
+            app.lines().all(|line| !line.trim_start().starts_with("KillMode=")),
+            "the app unit's KillMode is control-group, the default"
+        );
+
+        // 3. The image. The host-broker file names no grace, so Docker's default (10 s) stands;
+        //    the embedded one also waits for the Intune container's poweroff after the launcher:
+        //    the stop helper's wait for the lifecycle lock, then the crate's own 20 s.
+        const DOCKER_DEFAULT_GRACE: Duration = Duration::from_secs(10);
+        const CRATE_POWEROFF_WAIT: Duration = Duration::from_secs(20);
+        let host = include_str!("../../packaging/docker/compose.host-broker.yaml");
+        assert!(!host.contains("stop_grace_period:"), "the host-broker file sets a grace: check it here");
+        assert!(grace < DOCKER_DEFAULT_GRACE);
+        let embedded = include_str!("../../packaging/docker/compose.yaml");
+        let compose_grace = seconds_after(embedded, "stop_grace_period:").expect("compose.yaml grants a grace");
+        let after_launcher = grace + teams_lite::intune_embedded::STOP_LOCK_WAIT + CRATE_POWEROFF_WAIT;
+        assert!(after_launcher <= Duration::from_secs(compose_grace), "compose.yaml's grace is too short");
+
+        // 4. The chart: 90 s where the pod boots its own container, 30 s otherwise.
+        let chart = include_str!("../../packaging/helm/teams-lite/templates/statefulset.yaml");
+        assert!(chart.contains("terminationGracePeriodSeconds: {{ ternary 90 30 $boots }}"));
+        assert!(after_launcher <= Duration::from_secs(90));
+        assert!(grace < Duration::from_secs(30));
+    }
+
+    /// EVERY WAY OUT IS THE ONE STOP. The signal arm and the idle exit both leave the call and
+    /// hand the registration back through `leave_and_exit` — never a bare return, which dropped
+    /// the runtime and abandoned the call, and never an exit of their own. And the signals are
+    /// listened for BEFORE the loop, so no signal can arrive to a process that would die on it.
+    #[test]
+    fn every_way_out_of_the_serve_loop_leaves_the_call_first() {
+        let source = include_str!("server.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let listen = code.find("let mut signals = StopSignals::listen()?;").expect("the signals are listened for");
+        let lp = code[listen..].find("\n    loop {").map(|at| listen + at).expect("the serve loop");
+        let body = &code[lp..];
+        let body = &body[..body.find("\n    }\n}\n").expect("the loop ends with serve")];
+        let idle = body
+            .find("Woke::Idle => {")
+            .expect("the idle arm");
+        let signal = body.find("Woke::Signal(name) => {").expect("the signal arm");
+        let idle_arm = &body[idle..signal];
+        assert!(
+            idle_arm.contains("match leave_and_exit(&ctx, \"the idle exit\").await {}"),
+            "the idle exit leaves the call: {idle_arm}"
+        );
+        let signal_arm = &body[signal..];
+        let signal_arm = &signal_arm[..signal_arm.find("\n            }\n").expect("the arm ends")];
+        let ignore = signal_arm.find("signals.ignore_from_now_on();").expect("the repeats are drained");
+        let leave = signal_arm.find("match leave_and_exit(&ctx, name).await {}").expect("a signal leaves the call");
+        assert!(ignore < leave, "the repeats are ignored before the stop runs, so none can cut it short");
+        for arm in [idle_arm, signal_arm] {
+            assert!(!arm.contains("return"), "no arm of the stop returns: {arm}");
+            assert!(!arm.contains("std::process::exit"), "no arm exits but through leave_and_exit");
+        }
+        // And the shared exit leaves BEFORE it flushes and exits.
+        let exit = code.find("async fn leave_and_exit(").expect("the shared exit");
+        let exit = &code[exit..code[exit..].find("\n}\n").map(|end| exit + end).expect("it ends")];
+        let left = exit.find("ctx.leave_calls_for_exit(why).await;").expect("it leaves");
+        let flush = exit.find("tokio::time::sleep(RESTART_ANSWER_GRACE).await;").expect("it flushes");
+        let gone = exit.find("std::process::exit(0)").expect("it exits");
+        assert!(left < flush && flush < gone, "leave, flush the last frame, then exit");
+        // A backend coming up removes its OWN port's marker whatever it says — only one process can
+        // hold the port, so a marker for it is a dead predecessor's — before it clears the rest.
+        assert!(
+            code.contains(
+                "    if let Some(path) = &ctx.call_marker {\n        remove_call_marker(path);\n    }\n    clear_dead_call_markers();"
+            ),
+            "a backend leaves its predecessor's marker in place"
+        );
     }
 
     #[test]
@@ -21079,6 +22359,9 @@ mod tests {
             signin: Arc::new(Mutex::new(None)),
             calling: Arc::new(Mutex::new(CallingPlane::default())),
             calling_wake: Arc::new(tokio::sync::Notify::new()),
+            stopping: Arc::new(AtomicBool::new(false)),
+            starts_in_flight: Arc::new(StartsInFlight::default()),
+            call_marker: None,
             gitlab_refreshing: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             csa_syncing: Arc::new(Mutex::new((false, None))),
             tracker_people: Arc::new(Mutex::new(None)),

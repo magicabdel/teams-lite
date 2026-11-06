@@ -1,6 +1,6 @@
 // Manages the Rust backend as a child process (opencode model): the `teams`
 // command owns the server lifecycle — spawn it, wait until it's listening, and
-// kill it on exit. One command starts everything.
+// stop it on exit. One command starts everything.
 
 import { spawn, type Subprocess } from "bun";
 import { chmodSync, existsSync, mkdirSync, openSync } from "node:fs";
@@ -208,21 +208,24 @@ export const ATTACHED_BACKEND_CANNOT_RESTART =
   "this launcher attached to a backend it did not start, so it cannot restart it";
 
 export type BackendHandle = {
-  stop: () => void;
+  /// Stop the backend we spawned GRACEFULLY, resolving once it is really gone — not merely
+  /// signalled (see {@link stopGracefully}).
+  ///
+  /// Graceful, because a stop is no longer instant on the backend's side: on SIGTERM it leaves
+  /// the call it holds and hands its calling registration back, and a KILL would abandon the
+  /// call — a participant gone silent for everybody else, and Teams offering the user's calls
+  /// to an endpoint that is gone for up to an hour. And AWAITED, because an in-app update needs
+  /// the difference: a signalled process still holds port 19420 for a moment, and the new
+  /// build's first act is to ask whether something is already listening there — a yes makes it
+  /// ATTACH to the backend we just stopped, and the app comes back on the new UI with a dead
+  /// backend behind it. Resolves immediately when we only attached to somebody else's backend,
+  /// which is not ours to stop.
+  stop: () => Promise<void>;
   /// The write token we pinned for the backend we SPAWNED, which the caller must hand to
   /// its own frontend (see `mintWriteToken`). Null when we merely attached to a backend
   /// somebody else started: that one published its own token, and the frontend reads it
   /// from the file the way it always did.
   writeToken: string | null;
-  /// Resolves once the backend we spawned is really gone — not merely signalled.
-  ///
-  /// An in-app update needs that difference. `kill()` returns before the kernel has
-  /// reaped the process and released port 19420, and the new build's first act is to ask
-  /// whether something is already listening there: a yes makes it ATTACH to the backend
-  /// we just killed, and the app comes back on the new UI with a dead backend behind it.
-  /// Resolves immediately when we only attached to somebody else's backend, which is not
-  /// ours to stop or to wait for.
-  waitForExit: () => Promise<void>;
   /// Stop the backend we spawned and start it again, resolving once it is listening.
   ///
   /// What Settings › This app asks for: the backend goes, our web server does NOT, so the
@@ -234,6 +237,11 @@ export type BackendHandle = {
   /// new child that never binds — the caller says so rather than leaving the user with a
   /// page that quietly has nothing behind it.
   restart: () => Promise<void>;
+  /// Whether this launcher is going away for good — a stop signal has reached it. A restart or
+  /// an update whose own graceful stop such a signal landed in must spawn nothing after it: the
+  /// stop is seconds long now (the backend leaves its call), and a child spawned behind the
+  /// signal is one nothing will ever stop.
+  leaving: () => boolean;
 };
 
 /// Ensure the backend is running. If a server is already up, attach to it and
@@ -248,40 +256,75 @@ export async function ensureBackend(opts: { keepAlive?: boolean } = {}): Promise
     // Someone else owns it: neither ours to stop, nor ours to wait for, and its token is
     // its own — published to the file our frontend already reads.
     return {
-      stop: () => {},
-      waitForExit: () => Promise.resolve(),
+      stop: () => Promise.resolve(),
       writeToken: null,
       restart: () => Promise.reject(new Error(ATTACHED_BACKEND_CANNOT_RESTART)),
+      leaving: () => false,
     };
   }
 
   const bin = await backendBinary();
   const writeToken = mintWriteToken();
   // `let`, because a restart replaces it — and `stop` below reads it through this binding
-  // rather than capturing one child, so the exit handlers registered ONCE always kill
+  // rather than capturing one child, so the exit handlers registered ONCE always stop
   // whichever backend is current.
   let proc = await startBackend(bin, opts.keepAlive === true, writeToken);
+  /// A replacement child from the moment it is SPAWNED until it is listening and becomes `proc`.
+  /// The wait for its port takes up to a minute, and a launcher stopped inside it must still reach
+  /// the child it just started — the exit hooks look at this as well as at `proc`.
+  let pending: Subprocess | null = null;
   /// WHICH child is the current one. A deliberate stop bumps it BEFORE it kills, so the
   /// dying child's own exit reads as superseded and the supervisor stands down — see
   /// {@link superviseBackend} for why that ordering is the whole of it.
   let generation = 0;
-  /// Set once this launcher is going away for good: the exit hooks, and the in-app update,
-  /// which kills the backend and then replaces this whole process.
+  /// Set once this launcher is going away for good — by a stop signal, through the exit hooks.
+  /// Read by the supervisor, by a restart and by an in-app update, none of which may spawn
+  /// anything after it.
   let gone = false;
-  const stop = () => {
+  const stop = async (): Promise<void> => {
+    // BEFORE the signal, so the dying child's own exit reads as superseded and the supervisor
+    // does not race a respawn of its own.
     generation += 1;
-    try {
-      proc.kill(9);
-    } catch {}
+    const child = proc;
+    await stopGracefully({
+      terminate: () => child.kill("SIGTERM"),
+      kill: () => child.kill(9),
+      exited: () => child.exited.then(() => {}),
+      wait: (ms) => Bun.sleep(ms),
+      log: (message) => console.error(message),
+    });
   };
-  killChildOnExit(() => {
-    gone = true;
-    stop();
+  stopChildOnExit({
+    leaving: () => {
+      gone = true;
+    },
+    stop,
+    kill: () => {
+      for (const child of [proc, pending]) {
+        try {
+          child?.kill(9);
+        } catch {}
+      }
+    },
+    alive: () =>
+      [proc, pending].some((child) => child !== null && child.exitCode === null && child.signalCode === null),
   });
   /// Spawn a replacement and re-arm the watch over it. One place, so the first child and
   /// every one after it are supervised identically.
   const spawnSupervised = async (): Promise<void> => {
-    proc = await startBackend(bin, opts.keepAlive === true, writeToken);
+    if (gone) return;
+    const child = await startBackend(bin, opts.keepAlive === true, writeToken, (spawned) => {
+      pending = spawned;
+    });
+    pending = null;
+    if (gone) {
+      // A stop arrived while this child was coming up: it is not ours to keep.
+      try {
+        child.kill("SIGTERM");
+      } catch {}
+      return;
+    }
+    proc = child;
     generation += 1;
     watch(proc, generation);
   };
@@ -300,20 +343,20 @@ export async function ensureBackend(opts: { keepAlive?: boolean } = {}): Promise
   return {
     stop,
     writeToken,
-    // `proc.exited` resolves when the kernel has reaped it, which is also when its
-    // port is free — the one thing a relaunch has to wait for.
-    waitForExit: async () => {
-      await proc.exited;
-    },
-    restart: async () => {
-      // `stop` bumps the generation first, so the child it kills does not read its own
-      // death as a crash and race this replacement.
-      stop();
-      // AWAITED for the reason `waitForExit` exists: a signalled process still holds its
-      // port for a moment, and the replacement's own bind would fail on it.
-      await proc.exited;
+    // ONE AT A TIME. A stop takes seconds now (the backend leaves its call), so a second press —
+    // the phone's, while the laptop's restart is still stopping — would otherwise run a second
+    // stop-and-spawn beside the first: two children racing for one port, and the one that bound
+    // first held by neither `proc` nor `pending`, so nothing could ever stop it.
+    restart: oneAtATime(async () => {
+      // `stop` bumps the generation first, so the child it stops does not read its own
+      // death as a crash and race this replacement — and it resolves once that child is
+      // reaped, because a signalled process still holds its port for a moment and the
+      // replacement's own bind would fail on it. A stop signal that landed meanwhile asked for
+      // the app to go, and `spawnSupervised` spawns nothing after it.
+      await stop();
       await spawnSupervised();
-    },
+    }),
+    leaving: () => gone,
   };
 }
 
@@ -327,7 +370,7 @@ const RESTART_BACKOFF_MS = 5_000;
  * Why the backend is SUPERVISED, and what the generation counter is for.
  *
  * **This is a real outage, not a hypothetical.** `launch()` spawned the backend as a child
- * and never looked at it again: `waitForExit` existed but was only ever awaited by a restart
+ * and never looked at it again: waiting for its exit was only ever done by a restart
  * or an update, both of which ask for the exit. So a backend that died for any other reason —
  * a crash, an OOM kill, an idle exit whose keepalive had dropped — left this process serving
  * the app against a dead socket, for ever. Measured on the always-on EC2 instance: the web
@@ -336,7 +379,7 @@ const RESTART_BACKOFF_MS = 5_000;
  * itself back — the backend is our child and only we can spawn another — so nobody could.
  *
  * The GENERATION is what keeps that apart from an exit somebody ASKED for, and the ordering is
- * the whole of it: `stop()` bumps the counter and then kills, so by the time the dying child's
+ * the whole of it: `stop()` bumps the counter and then signals, so by the time the dying child's
  * `exited` resolves its own generation is stale and the supervisor stands down. Without that,
  * a Settings restart and an in-app update would each race a respawn of their own — two
  * backends fighting for one port, which is worse than the bug being fixed.
@@ -346,7 +389,7 @@ const RESTART_BACKOFF_MS = 5_000;
  *
  * An ATTACHED backend gets none of this. It is somebody else's child, we cannot wait for it
  * and we must not start a second one on its port — `ensureBackend`'s attach branch returns a
- * handle whose `waitForExit` resolves at once, and a supervisor over that would respawn in a
+ * handle whose `stop` resolves at once, and a supervisor over that would respawn in a
  * tight loop against a backend that is perfectly healthy.
  */
 export type SupervisorDeps = {
@@ -405,6 +448,7 @@ async function startBackend(
   bin: string,
   keepAlive: boolean,
   writeToken: string,
+  onSpawn: (child: Subprocess) => void = () => {},
 ): Promise<Subprocess> {
   // APPENDED, and one file per PORT.
   //
@@ -423,6 +467,7 @@ async function startBackend(
     stdin: "ignore",
     env: { ...process.env, ...backendEnv(keepAlive, writeToken) },
   });
+  onSpawn(proc);
 
   // wait for it to bind (auth broker handshake can take a few seconds)
   const deadline = Date.now() + 60_000;
@@ -439,20 +484,141 @@ async function startBackend(
   throw new Error(`backend still not listening after 60s. See ${backendLogLocation()}`);
 }
 
-/// Kill the backend whenever this process goes away, for any reason.
+/// How long the launcher waits for its backend to EXIT after a SIGTERM, before it KILLs it.
 ///
-/// Two hooks are needed, not one. "exit" covers a normal return and an uncaught
-/// error, but a signal terminates the process WITHOUT running exit handlers — and
-/// Ctrl+C on the launcher is the ordinary way to stop it. Without the signal
-/// handlers a `--dev` backend, which we start with idle-exit disabled, would
-/// survive as an orphan holding the port and the user's account, and only a manual
-/// kill would clear it.
-function killChildOnExit(stop: () => void): void {
-  process.on("exit", stop);
+/// The backend spends that time leaving the call it holds and handing its calling registration
+/// back (`leave_calls_for_exit` in src/bin/server.rs), within a budget of its own — 5 s plus a
+/// quarter-second flush. This is the next link of a chain that has to CLOSE: longer than the
+/// backend's own stop, and shorter than every supervisor's — systemd's `TimeoutStopSec`, Docker's
+/// default grace and the chart's. `the_stop_budgets_close` (src/bin/server.rs) reads this line.
+export const BACKEND_STOP_GRACE_MS = 7_000;
+
+/// A second stop signal this soon after the first is the SAME stop arriving twice, not a
+/// person asking again. Two sources make that the rule rather than the exception: a unit's
+/// `KillMode=control-group` TERMs this launcher and its backend together, and a terminal's
+/// Ctrl+C reaches every process of the group. Acting on the duplicate would KILL the backend
+/// in the middle of its hangup. A signal later than this is a human's second ask, and is obeyed.
+export const REPEAT_SIGNAL_MS = 1_000;
+
+/**
+ * `run`, at most one at a time: a call made while one is in flight shares that one rather than
+ * starting another, and a call after it has settled runs again.
+ */
+export function oneAtATime(run: () => Promise<void>): () => Promise<void> {
+  let running: Promise<void> | null = null;
+  return () =>
+    (running ??= run().finally(() => {
+      running = null;
+    }));
+}
+
+/** What one graceful stop needs, injected so the sequence is pinned by a test with no process. */
+export type GracefulStopDeps = {
+  /** Ask the child to stop (SIGTERM). */
+  terminate: () => void;
+  /** Make it stop (SIGKILL). */
+  kill: () => void;
+  /** Resolves once the child has really gone. */
+  exited: () => Promise<void>;
+  wait: (ms: number) => Promise<void>;
+  log: (message: string) => void;
+  /** Defaults to {@link BACKEND_STOP_GRACE_MS}. */
+  graceMs?: number;
+};
+
+/**
+ * Stop a backend the way it can leave its call: SIGTERM, wait up to the grace for it to exit,
+ * and only then KILL it — and resolve once it is gone either way.
+ *
+ * It used to be `kill(9)` and nothing else, which was safe only while a stop had nothing to do.
+ * It has: a backend on SIGTERM hangs up the call the user is in and hands the calling
+ * registration back, and a KILL skips both — the people on the call are left with a participant
+ * gone silent, and Teams goes on offering the user's calls to an endpoint that is gone.
+ */
+export async function stopGracefully(deps: GracefulStopDeps): Promise<void> {
+  const grace = deps.graceMs ?? BACKEND_STOP_GRACE_MS;
+  const exited = deps.exited().then(() => true as const);
+  try {
+    deps.terminate();
+  } catch {}
+  const inTime = await Promise.race([exited, deps.wait(grace).then(() => false as const)]);
+  if (inTime) return;
+  deps.log(`[backend] the backend did not stop within ${grace / 1000} s of SIGTERM — killing it`);
+  try {
+    deps.kill();
+  } catch {}
+  await exited;
+}
+
+/** What a stop signal reaching THIS launcher does, injected for the same reason. */
+export type ExitSignalDeps = {
+  now: () => number;
+  /** This launcher is going away for good: no supervisor may respawn behind it. */
+  leaving: () => void;
+  /** The graceful stop of the current backend ({@link stopGracefully}). */
+  stop: () => Promise<void>;
+  /** KILL the current backend at once. */
+  kill: () => void;
+  exit: () => void;
+  log: (message: string) => void;
+};
+
+/**
+ * The handler for SIGINT, SIGTERM and SIGHUP on the launcher.
+ *
+ * The FIRST signal stops the backend gracefully and then exits; a repeat within
+ * {@link REPEAT_SIGNAL_MS} is the same stop delivered twice and is ignored; a later one is a
+ * person asking twice — a second Ctrl+C — and KILLs the backend at once, because a stop the user
+ * wants faster than the backend's own budget is theirs to have.
+ */
+export function exitSignalHandler(deps: ExitSignalDeps): (signal: string) => void {
+  let firstAt: number | null = null;
+  return (signal) => {
+    const now = deps.now();
+    if (firstAt === null) {
+      firstAt = now;
+      deps.leaving();
+      deps.log(`[backend] ${signal} — stopping the backend; it leaves any call first`);
+      void deps
+        .stop()
+        .catch((e) => deps.log(`[backend] the backend did not stop cleanly: ${String(e)}`))
+        .finally(() => deps.exit());
+      return;
+    }
+    if (now - firstAt < REPEAT_SIGNAL_MS) return;
+    deps.log(`[backend] ${signal} again — killing the backend now`);
+    deps.kill();
+    deps.exit();
+  };
+}
+
+/// Stop the backend whenever this process goes away, for any reason.
+///
+/// Two hooks are needed, not one. A signal terminates the process WITHOUT running exit
+/// handlers — and Ctrl+C on the launcher is the ordinary way to stop it — so the signals stop
+/// the backend gracefully ({@link exitSignalHandler}). "exit" covers a normal return and an
+/// uncaught error, and it is SYNCHRONOUS, so it can only KILL: it is the fallback for a backend
+/// still alive when this process ends some other way. Without either a `--dev` backend, which
+/// we start with idle-exit disabled, would survive as an orphan holding the port and the user's
+/// account, and only a manual kill would clear it.
+function stopChildOnExit(deps: {
+  leaving: () => void;
+  stop: () => Promise<void>;
+  kill: () => void;
+  alive: () => boolean;
+}): void {
+  process.on("exit", () => {
+    if (deps.alive()) deps.kill();
+  });
+  const onSignal = exitSignalHandler({
+    now: () => Date.now(),
+    leaving: deps.leaving,
+    stop: deps.stop,
+    kill: deps.kill,
+    exit: () => process.exit(0),
+    log: (message) => console.error(message),
+  });
   for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
-    process.on(signal, () => {
-      stop();
-      process.exit(0);
-    });
+    process.on(signal, () => onSignal(signal));
   }
 }

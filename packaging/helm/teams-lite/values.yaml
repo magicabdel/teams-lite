@@ -521,12 +521,13 @@ podLabels: {}
 priorityClassName: ""
 # A CEILING, not a delay: the pod is gone the moment its entrypoint exits. Unset, it is 90 s where
 # the pod boots its own Intune container and 30 s otherwise (a host mode, or a read-only release).
-# The entrypoint forwards TERM to the launcher, which SIGKILLs its backend and exits
-# (`killChildOnExit` in launcher/src/backend.ts) — so the backend never hands its calling
-# registration back: Teams keeps offering the account's calls to this pod's endpoint, which is
-# gone, until that registration expires on its own (its TTL is an hour). A longer grace period does
-# not change that; a backend that takes a TERM and the launcher sending one would. In the embedded
-# mode the entrypoint then powers the Intune container off (`server __teams-lite-intune-stop`,
-# which waits up to ~25 s for a boot to release the lifecycle lock and ~20 s for the poweroff).
-# Killed before that, the inner systemd, the broker and the keyring die mid-write.
+# The entrypoint forwards TERM to the launcher, which TERMs its backend and waits up to 7 s for it
+# to exit before it KILLs it (`stopGracefully` in launcher/src/backend.ts). In that time the backend
+# leaves any call it holds — the same hangup End sends, so the people on the call see the user
+# leave — and hands its calling registration back, so Teams stops offering the account's calls to
+# this pod's endpoint at once rather than for up to an hour (its TTL). A call still ringing is not
+# declined: it goes on ringing the user's other devices. In the embedded mode the entrypoint then
+# powers the Intune container off (`server __teams-lite-intune-stop`, which waits up to ~25 s for a
+# boot to release the lifecycle lock and ~20 s for the poweroff). Killed before that, the inner
+# systemd, the broker and the keyring die mid-write.
 terminationGracePeriodSeconds: null

@@ -2549,15 +2549,166 @@ def advice_cases():
     ]
 
 
-def run_hook(command: str, cwd: Path) -> subprocess.CompletedProcess:
+# A runtime directory of the suite's OWN, empty, handed to every case that does not name one. Rule
+# 3a-iii reads the call markers under $XDG_RUNTIME_DIR, and the hook falls back to the user's real
+# /run/user/<uid> without it — so a suite run while the user is IN A CALL would see their live
+# marker and refuse every stop case below, and a run while they are not could never prove the rule.
+EMPTY_RUNTIME = tempfile.mkdtemp(prefix="guard-runtime-")
+
+
+def run_hook(command: str, cwd: Path, runtime: str = EMPTY_RUNTIME) -> subprocess.CompletedProcess:
     return subprocess.run(
         [str(HOOK)],
         input=json.dumps({"tool_input": {"command": command}}),
         capture_output=True,
         text=True,
         cwd=cwd,
-        env={"CLAUDE_PROJECT_DIR": str(PROJECT), "HOME": str(Path.home()), "PATH": "/usr/bin:/bin"},
+        env={
+            "CLAUDE_PROJECT_DIR": str(PROJECT),
+            "HOME": str(Path.home()),
+            "PATH": "/usr/bin:/bin",
+            "XDG_RUNTIME_DIR": runtime,
+        },
     )
+
+
+# RULE 3a-iii: A STOP MAY NOT END A LIVE CALL. Every stop spelling below is ALLOWED with no call (the
+# suite's empty runtime directory, and one whose only marker names a process that is gone) and
+# BLOCKED while a marker names a running process — this suite's own pid stands in for a backend.
+# Reading the service stays allowed either way, and so does a restart's refusal stay rule 3a's.
+LIVE_CALL_STOPS = [
+    "systemctl --user stop teams-lite.target",
+    "systemctl --user stop teams-lite-backend.service",
+    "systemctl --user stop teams-lite-app.service",
+    "systemctl --user kill teams-lite-backend.service",
+    "systemctl --user freeze teams-lite-app.service",
+    "systemctl --user disable --now teams-lite.target",
+    "systemctl --user disable teams-lite.target --now",
+    "systemctl --user --now mask teams-lite-backend.service",
+    "timeout 10 systemctl --user stop teams-lite-backend",
+    "echo ok; systemctl --user stop teams-lite.target",
+    "bin/teams-lite-service.sh stop",
+    "bin/teams-lite-service.sh uninstall",
+    "busctl --user call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager StopUnit ss teams-lite-backend.service replace",
+    "busctl --user call org.freedesktop.systemd1 /org/freedesktop/systemd1/unit/teams_2dlite_2dbackend_2eservice org.freedesktop.systemd1.Unit Stop s replace",
+    "gdbus call --session --dest org.freedesktop.systemd1 --object-path /org/freedesktop/systemd1 --method org.freedesktop.systemd1.Manager.KillUnit teams-lite-app.service all 15",
+    "pkill -f target/release/server",
+    "pkill -f target/debug/server",
+    "pkill -f teams-bin",
+    "pkill -f .cache/teams-lite/server",
+    "killall server",
+    "pkill teams",
+    "pkill teams-lite",
+    "skill teams",
+    "kill $(pgrep -f target/release/server)",
+    # The bare names from inside a substitution, which the executable view splits from its kill.
+    "kill $(pgrep -x server)",
+    'kill "$(pgrep -x server)"',
+    "kill -TERM $(pidof server)",
+    "kill `pgrep teams`",
+    # A pid list piped into a kill.
+    "pgrep -f target/release/server | xargs kill",
+    "systemctl --user show -p MainPID --value teams-lite-backend | xargs kill",
+    # The dev launcher and the installed binary, by their own paths.
+    "pkill -f launcher/dist/teams",
+    "kill $(pgrep -f launcher/dist/teams)",
+    "pkill -f ~/.teams-lite/bin/teams-bin",
+    "pkill -f ~/.local/share/teams-lite/service/server",
+    # The D-Bus verbs the first list did not reach.
+    "busctl --user call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager FreezeUnit s teams-lite-app.service",
+    "busctl --user call org.freedesktop.systemd1 /org/freedesktop/systemd1/unit/teams_2dlite_2dbackend_2eservice org.freedesktop.systemd1.Unit Kill si all 15",
+    "gdbus call --session --dest org.freedesktop.systemd1 --object-path /org/freedesktop/systemd1/unit/teams_2dlite_2dapp_2eservice --method org.freedesktop.systemd1.Unit.Freeze",
+    # A signal-0 probe exempts ITSELF, never the kill after it.
+    "kill -0 1; pkill -f target/release/server",
+    # A quoted alternation, a subshell, a brace group and a substitution: one command in the
+    # executable view, fragments on the raw line.
+    "pkill -f 'vite|target/release/server'",
+    "pkill -f 'mock/server.ts|teams'",
+    "(pkill -f target/release/server || true)",
+    "{ pkill -f teams-bin; } 2>/dev/null",
+    "n=$(pkill -c -f target/release/server)",
+    "kill -0 1 $(pkill -f target/release/server)",
+    # The backend's own paths, short.
+    "pkill -f teams-lite/server",
+    "pkill -f 'cache/teams-lite/server'",
+    "pkill -f teams-lite/service/server",
+    "pgrep -f teams-lite/server | xargs kill",
+    "pgrep -f ~/.local/share/teams-lite/service/server | xargs kill",
+]
+# The same words, as text or as a look, and stops of things that are not a teams-lite backend:
+# allowed whatever the markers say.
+LIVE_CALL_ALLOWS = [
+    "bin/teams-lite-service.sh status",
+    "bin/teams-lite-service.sh logs",
+    "systemctl --user status teams-lite-backend.service",
+    "systemctl --user show teams-lite-app.service -p ActiveState",
+    "systemctl --user disable teams-lite.target",
+    "journalctl --user -u teams-lite-backend -n 50 --no-pager",
+    "git commit -m 'fix: systemctl --user stop teams-lite.target leaves the call'",
+    "grep -rn 'pkill -f target/release/server' AGENTS.md",
+    "pkill -f 'vite dev'",
+    "pkill -f mock/server.ts",
+    # A checkout's own path names a directory called teams-lite, never a backend.
+    "pkill -f /home/user/src/teams-lite/web/mock/server.ts",
+    "systemctl --user stop syncthing.service",
+    "kill -0 12345",
+    # A probe that sends signal 0 asks whether the backend is there, and sends it nothing.
+    "kill -0 $(pgrep -f target/release/server)",
+    "pkill -0 -f target/release/server",
+    # A SEARCH whose quoted alternation puts a stop at a raw command position runs nothing.
+    "grep -nE 'x|pkill -f target/release/server' AGENTS.md",
+    "rg 'stop|systemctl --user stop teams-lite.target' AGENTS.md",
+]
+
+
+def own_start_ticks() -> str:
+    """This process's start time, as a call marker states it: field 22 of /proc/self/stat."""
+    stat = Path("/proc/self/stat").read_text()
+    return stat[stat.rindex(")") + 1:].split()[19]
+
+
+def check_live_call() -> int:
+    failures = 0
+    with tempfile.TemporaryDirectory(prefix="guard-calls-") as live, \
+            tempfile.TemporaryDirectory(prefix="guard-calls-") as stated, \
+            tempfile.TemporaryDirectory(prefix="guard-calls-") as reused, \
+            tempfile.TemporaryDirectory(prefix="guard-calls-") as dead:
+        def marker(root: str, body: str) -> None:
+            (Path(root) / "teams-lite" / "calls").mkdir(parents=True)
+            (Path(root) / "teams-lite" / "calls" / "19420").write_text(body)
+        # This suite's own process stands in for a backend in a call: without a start time (an
+        # older backend's marker) and with its own.
+        marker(live, f"pid={os.getpid()}\nport=19420\nphase=connected\nsince_ms=1\n")
+        marker(stated, f"pid={os.getpid()}\nstart={own_start_ticks()}\nport=19420\nphase=connected\nsince_ms=1\n")
+        # A live pid that is no longer the process that wrote the marker: the kernel reused it.
+        marker(reused, f"pid={os.getpid()}\nstart=1\nport=19420\nphase=connected\nsince_ms=1\n")
+        # A pid past any kernel's pid_max: a backend that died in a call refuses nothing.
+        marker(dead, "pid=999999999\nport=19420\nphase=connected\nsince_ms=1\n")
+        for runtime, name, stops_blocked in [
+            (EMPTY_RUNTIME, "no call", False),
+            (dead, "a dead call", False),
+            (reused, "a reused pid", False),
+            (live, "a live call", True),
+            (stated, "a live call with its start time", True),
+        ]:
+            for command, want_block in [(c, stops_blocked) for c in LIVE_CALL_STOPS] + [
+                (c, False) for c in LIVE_CALL_ALLOWS
+            ]:
+                proc = run_hook(command, PROJECT, runtime)
+                blocked = proc.returncode != 0
+                # Under a live call the refusal must be THIS rule's, naming the call it protects.
+                says_why = not blocked or not want_block or "holds a live call" in proc.stderr
+                ok = blocked == want_block and says_why
+                failures += 0 if ok else 1
+                got = "BLOCK" if blocked else "ALLOW"
+                want = "BLOCK" if want_block else "ALLOW"
+                print(f"{'ok  ' if ok else 'FAIL'} {got:5} (want {want}) <- [{name}] {command}")
+        # The refusal names the phase and the port the marker states — and nothing else of it.
+        proc = run_hook("systemctl --user stop teams-lite.target", PROJECT, live)
+        named = "connected call on the backend on port 19420" in proc.stderr
+        failures += 0 if named else 1
+        print(f"{'ok  ' if named else 'FAIL'} the refusal names the call it protects")
+    return failures
 
 
 def flattened(text: str) -> str:
@@ -2648,13 +2799,15 @@ def main() -> int:
 
     advice_failures = check_advice()
     probe_failures = check_sanctioned_probe()
+    live_call_failures = check_live_call()
     total = len(cases(Path("/tmp")))
     print(f"\n{total - failures}/{total} as expected")
     advice_total = len(advice_cases())
     print(f"{advice_total - advice_failures}/{advice_total} refusals recommend what works")
     probe_total = len(SANCTIONED_PROBE_CASES)
     print(f"{probe_total - probe_failures}/{probe_total} sanctioned-probe shapes as expected")
-    return 1 if failures or advice_failures or probe_failures else 0
+    print(f"{live_call_failures} live-call decision(s) wrong")
+    return 1 if failures or advice_failures or probe_failures or live_call_failures else 0
 
 
 if __name__ == "__main__":

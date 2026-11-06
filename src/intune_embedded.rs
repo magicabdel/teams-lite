@@ -1397,7 +1397,8 @@ fn container_elsewhere() -> Option<String> {
 /// namespace's.
 ///
 /// THE SLOT FIRST, and that is what makes the stop's answer true. At shutdown the launcher
-/// SIGKILLs the backend, but a boot helper it spawned lives on in its own session — and a stop
+/// stops the backend (SIGTERM, then a KILL after its grace), but a boot helper it spawned lives on
+/// in its own session — and a stop
 /// that took the lifecycle lock alone would find "not running" in the moment before that boot
 /// took the lock, exit 0, and let the boot start the container a moment before the runtime
 /// SIGKILLed everything in it. Holding the slot, a boot spawned after the stop finds it taken and

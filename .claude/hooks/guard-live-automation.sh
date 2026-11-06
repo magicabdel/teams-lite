@@ -49,6 +49,13 @@
 #      it on any address but loopback or onto a local port the browser guard does not know as
 #      live — and, irreversibly, a delete of its volume claims or of any namespace. Rendering,
 #      `--dry-run`, a new release with `--set readOnly=true` and every read stay open;
+#   3a-iii. STOPPING a backend while it holds a LIVE CALL. A stop now leaves the call the
+#      backend holds — the hangup End sends — so tooling stopping it would hang up on the people
+#      the user is talking to. While a marker under $XDG_RUNTIME_DIR/teams-lite/calls/ names a
+#      running pid, a `systemctl --user stop|kill|freeze` (or `disable|mask --now`) of a
+#      teams-lite unit, the same over raw D-Bus, `teams-lite-service.sh stop|uninstall`, and a
+#      kill naming the backend or the launcher are refused. With no live call every stop is
+#      tooling's, as before;
 #   4. starting the Rust backend without TEAMS_LITE_READ_ONLY=1 — an agent has no
 #      reason to run a send-capable backend; the user starts that one. The spellings it
 #      knows: the binary in target/, the staged copy the always-on service runs, the
@@ -2284,6 +2291,125 @@ Run the update without the flag: it waits for the agent, then restarts.
 
 Only the user may decide a half-written reply is worth losing. If an update must go out
 now, say why and let them run it."
+fi
+
+# --- 3a-iii. a stop may not end a live call ----------------------------------------
+# A backend that stops now LEAVES the call it holds and hands its calling registration back
+# (`leave_calls_for_exit` in src/bin/server.rs): on SIGTERM it posts the very hangup the End
+# button sends. That is right for the user's own stop — the call dies with the process either
+# way, and the honest alternative to telling the service is a participant gone silent for
+# everybody else — and it makes a stop by TOOLING an outward act: an agent tidying up its
+# processes would hang up on the people the user is talking to, mid-sentence.
+#
+# So while one of this machine's backends holds a call, tooling may not stop it. The proof is
+# the backend's own CALL MARKER — `$XDG_RUNTIME_DIR/teams-lite/calls/<port>`, written while a
+# call holds the user (placed, answered or joined, and not over) and removed when it ends — and
+# a marker counts only while its `pid=` names a running process, so one left by a backend that
+# died in a call refuses nothing. A ring the user has not taken writes no marker: a stop never
+# declines it.
+#
+# Refused while a call is live: `systemctl --user stop|kill|freeze` naming a teams-lite unit or
+# the target, `disable|mask` with `--now`, the same verbs over raw D-Bus (`StopUnit`, `KillUnit`,
+# `FreezeUnit`, the unit object's own `Stop`/`Kill`/`Freeze`), `teams-lite-service.sh
+# stop|uninstall`, and a `kill`/`pkill`/`killall` naming the backend or the launcher. With no live
+# call every one of them is tooling's, exactly as § The always-on service says.
+#
+# A marker is a live call only while its process is the one that WROTE it: the marker states its
+# start time (`start=`, field 22 of /proc/<pid>/stat), and a pid the kernel has since handed to
+# another process — the backend killed in a call, its pid reused — refuses nothing.
+#
+# A kill is refused only where it names the backend or the launcher, and a probe that sends signal 0
+# (`kill -0`, `pkill -0`) is not a kill. The rule does not ask WHICH backend holds the call: while
+# any one does, a stop of any teams-lite backend is refused, the agent's own read-only one included —
+# the cost of a rule that cannot see which unit or pid a command reaches.
+#
+# WHAT IT CANNOT SEE: a kill by pid (`kill 6410`), a kill whose pattern merely matches the backend
+# without naming it, a pid list arriving through anything but `xargs`, `systemctl --user exit` (the
+# whole manager), and a backend with no `XDG_RUNTIME_DIR` — which in practice is the container image
+# and the chart, whose stops rules 3d and 3e already refuse. Restarts are rule 3a's above, call or no
+# call.
+live_call_marker() {
+  local dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/teams-lite/calls" file pid phase port start stat
+  [ -d "$dir" ] || return 1
+  for file in "$dir"/*; do
+    [ -f "$file" ] || continue
+    pid=$(sed -n 's/^pid=\([0-9][0-9]*\)$/\1/p' "$file" | head -n 1)
+    [ -n "$pid" ] || continue
+    kill -0 "$pid" 2>/dev/null || continue
+    start=$(sed -n 's/^start=\([0-9][0-9]*\)$/\1/p' "$file" | head -n 1)
+    if [ -n "$start" ]; then
+      stat=$(cat "/proc/$pid/stat" 2>/dev/null) || continue
+      # After the command name (whose parentheses may hold spaces), the state is the first field,
+      # so field 22 is the twentieth.
+      # shellcheck disable=SC2086 # the fields are split on purpose
+      set -- ${stat##*) }
+      [ "${20:-}" = "$start" ] || continue
+    fi
+    phase=$(sed -n 's/^phase=\([a-z][a-z]*\)$/\1/p' "$file" | head -n 1)
+    port=$(sed -n 's/^port=\([0-9][0-9]*\)$/\1/p' "$file" | head -n 1)
+    printf '%s call on the backend on port %s' "${phase:-live}" "${port:-?}"
+    return 0
+  done
+  return 1
+}
+stops_a_teams_lite_unit="${at_a_program}systemctl[^;&|]*[[:space:]](stop|kill|freeze)([[:space:]][^;&|]*)?teams-lite"
+stops_a_teams_lite_unit_now="${at_a_program}systemctl[^;&|]*[[:space:]](disable|mask)[[:space:]]([^;&|]*[[:space:]])?--now${ends_a_word}[^;&|]*teams-lite"
+stops_a_teams_lite_unit_now_after="${at_a_program}systemctl[^;&|]*[[:space:]](disable|mask)[[:space:]][^;&|]*teams-lite[^;&|]*[[:space:]]--now${ends_a_word}"
+stops_a_teams_lite_unit_now_first="${at_a_program}systemctl[^;&|]*[[:space:]]--now[[:space:]][^;&|]*(disable|mask)[^;&|]*teams-lite"
+runs_service_script_stop="${at_a_program}teams-lite-service\.sh[[:space:]]+([^;&|]*[[:space:]])?(stop|uninstall)${ends_a_word}"
+dbus_stops_a_unit='(StopUnit|KillUnit|FreezeUnit|systemd1\.Unit[.[:space:]]+(Stop|Kill|Freeze)([[:space:]]|$))'
+stops_a_teams_lite_unit_over_dbus="${raw_dbus_call}(${dbus_stops_a_unit}[^;&|]*teams(-|_2d)lite|teams(-|_2d)lite[^;&|]*${dbus_stops_a_unit})"
+# A KILL naming the backend or the launcher: the paths they really run from — the staged service,
+# the released build's extraction, the installed binary, a checkout's own builds and the dev
+# launcher — and the bare names. A checkout's PATH is not one of them: this worktree lives under a
+# directory called teams-lite, so `pkill -f /…/teams-lite/web/mock/server.ts` names no backend.
+# The bare names end at a `)` and a backtick as well as a space, because `kill $(pgrep -x server)`
+# and `` kill `pgrep teams` `` name the backend from inside a substitution, which the executable
+# view splits away from its kill. (The class is spelled apart from `ends_a_word` so the raw reading
+# leaves it as it is.)
+#
+# The backend's own paths are spelled from `teams-lite/service/` and `teams-lite/server` rather than
+# from their home directory, so `pkill -f teams-lite/server` — the commonest way to aim at the
+# released build's extraction — is named as surely as the full path.
+kills_a_teams_lite_process="${at_a_program}(p?kill|killall|skill)([[:space:]][^;&|]*)?(teams-lite/service/|teams-lite/server|\.teams-lite/bin/|teams-bin|teams-launcher|launcher/dist/teams|target/(release|debug)/server|[[:space:]][\"'\`(]?(server|teams|teams-lite)([)\`\"'[:space:];&|]|\$))"
+# A kill that sends SIGNAL 0 sends nothing: it asks whether the process is there.
+kill_sends_signal_zero='(^|[[:space:]])(-0|-s[[:space:]]*0|--signal(=|[[:space:]]+)0)([[:space:]]|$)'
+# The same names piped into a kill through `xargs` — `pgrep -f target/release/server | xargs kill`,
+# or the unit's own MainPID.
+kills_a_teams_lite_process_through_xargs="(teams-lite/service/|teams-lite/server|teams-bin|launcher/dist/teams|target/(release|debug)/server|teams-lite-(backend|app)(\.service)?|[[:space:]][\"']?(server|teams|teams-lite)[\"'[:space:]])[^;&|]*${at_command_start}xargs([[:space:]][^;&|]*)?[[:space:]](p?kill|killall)${ends_a_word}"
+# Judged one COMMAND at a time, so a probe that sends signal 0 exempts itself and nothing after it —
+# on the raw line, which keeps a kill and the `$(…)` it names together, AND on the executable view,
+# where a quoted `|` is not a separator and a subshell's `(`, a brace group and a `$(` are: a
+# `pkill -f 'vite|target/release/server'`, a `(pkill … || true)` or a `n=$(pkill …)` is one command
+# there and three fragments on the raw line.
+kills_a_teams_lite_backend() {
+  local segment
+  while IFS= read -r segment; do
+    printf '%s\n' "$segment" | grep -qE "$(raw_form "$kills_a_teams_lite_process")" || continue
+    printf '%s\n' "$segment" | grep -qE "$kill_sends_signal_zero" && continue
+    return 0
+  done < <(printf '%s\n' "$command_line" | tr ';&|' '\n\n\n')
+  [ "$command_view" = "$command_line" ] && return 1
+  while IFS= read -r segment; do
+    printf '%s\n' "$segment" | grep -qE "$kills_a_teams_lite_process" || continue
+    printf '%s\n' "$segment" | grep -qE "$kill_sends_signal_zero" && continue
+    return 0
+  done < <(printf '%s\n' "$command_view" | tr ';&|' '\n\n\n')
+  return 1
+}
+if ! searching_text &&
+  { a_command_matches "$stops_a_teams_lite_unit|$stops_a_teams_lite_unit_now|$stops_a_teams_lite_unit_now_after|$stops_a_teams_lite_unit_now_first|$runs_service_script_stop|$stops_a_teams_lite_unit_over_dbus|$kills_a_teams_lite_process_through_xargs" ||
+    kills_a_teams_lite_backend; } &&
+  live_call="$(live_call_marker)"; then
+  block "teams-lite holds a live call right now (a ${live_call}). A stop LEAVES that call: on
+SIGTERM the backend posts the same hangup the End button sends, so this would hang up on the
+people the user is talking to.
+
+Ask the user. They can end the call themselves and then stop the backend, or stop it now
+knowing the call ends. Inspecting the service needs no stop:
+
+  bin/teams-lite-service.sh status
+  journalctl --user -u teams-lite-backend -n 200 --no-pager"
 fi
 
 # --- 3c. the `teams` command is the whole live stack in one word ----------------

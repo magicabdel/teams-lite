@@ -81,9 +81,11 @@ RestartSec=5
 RestartSteps=6
 RestartMaxDelaySec=300
 
-# The backend installs no signal handler, so SIGTERM stops it at once. Nothing needs
-# a drain: SQLite runs in WAL mode with per-request commits, so an abrupt stop can
-# lose nothing that was acknowledged.
+# On SIGTERM the backend leaves any call it holds — the hangup End sends — and hands its
+# calling registration back, within a 5 s budget, then exits (`leave_and_exit` in
+# src/bin/server.rs). TimeoutStopSec outlasts that, and `the_stop_budgets_close` pins the
+# pair. Nothing else needs a drain: SQLite runs in WAL mode with per-request commits, so
+# an abrupt stop can lose nothing that was acknowledged.
 KillSignal=SIGTERM
 TimeoutStopSec=10
 

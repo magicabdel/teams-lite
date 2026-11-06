@@ -294,6 +294,22 @@ impl TokenCache {
         Ok(tok)
     }
 
+    /// The token for `scope` this cache already holds, while it is younger than this cache's own
+    /// freshness bound plus `grace` — and `None` rather than a fetch otherwise.
+    ///
+    /// It never reaches the broker, which is the whole difference from [`TokenCache::get`] and the
+    /// reason it is public: a backend that is EXITING leaves its call and hands its calling
+    /// registration back on what it already holds. A fetch there could start an interactive rescue
+    /// whose window no process is left to take back. The `grace` exists because a holder that keeps
+    /// a token warm on a timer (a call does, every keep-alive tick) can be caught a tick past the
+    /// bound: `TOKEN_TTL` is ten minutes short of the shortest lifetime the service issues, so a
+    /// minute past it is a token that still works.
+    pub fn cached_within(&self, scope: &str, grace: Duration) -> Option<String> {
+        let map = self.inner.lock().ok()?;
+        let (tok, at) = map.get(scope)?;
+        (at.elapsed() < TOKEN_TTL + grace).then(|| tok.clone())
+    }
+
     fn cached_fresh(&self, scope: &str) -> Option<String> {
         let map = self.inner.lock().ok()?;
         let (tok, at) = map.get(scope)?;

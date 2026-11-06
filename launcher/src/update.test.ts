@@ -19,6 +19,7 @@ function recordingDeps(overrides: Partial<RelaunchDeps> = {}) {
     stopBackend: async () => {
       steps.push("stopBackend");
     },
+    leaving: () => false,
     execPath: "/home/u/.teams-lite/bin/teams-bin",
     args: ["--port", "19440"],
     start: (command) => steps.push(`start:${command.join(" ")}`),
@@ -43,13 +44,15 @@ describe("relaunchArgs", () => {
 describe("relaunch", () => {
   // THE ORDER IS THE FEATURE. Both listeners have to be down before the new build
   // starts, or it exits on EADDRINUSE and the user is left with no app at all — and the
-  // exit has to come after the spawn, or nothing starts.
-  test("frees both ports, then starts the new build, then exits", async () => {
+  // exit has to come after the spawn, or nothing starts. The BACKEND goes first, while the
+  // web server still relays: it leaves any call on its way out and tells every page why, and
+  // that last frame reaches a phone through this web server.
+  test("stops the backend, then the web server, then starts the new build, then exits", async () => {
     const { deps, steps } = recordingDeps();
     await relaunch(deps);
     expect(steps).toEqual([
-      "stopWeb",
       "stopBackend",
+      "stopWeb",
       "start:/home/u/.teams-lite/bin/teams-bin --port 19440 --no-open",
       "exit",
     ]);
@@ -79,8 +82,25 @@ describe("relaunch", () => {
       },
     });
     await relaunch(deps);
-    expect(steps).toEqual(["stopWeb", "stopBackend", "exit"]);
+    expect(steps).toEqual(["stopBackend", "stopWeb", "exit"]);
     expect(logs.join("\n")).toContain("run `teams` again");
+  });
+
+  // The backend's stop is seconds long now (it leaves its call), and a Ctrl+C or a `docker stop`
+  // landing inside it asked for the app to GO. Starting the new build after it would bring the
+  // app back up against that ask — the signal handler is the one that exits.
+  test("a stop that lands during the backend's stop starts nothing", async () => {
+    let leaving = false;
+    const { deps, steps, logs } = recordingDeps({
+      stopBackend: async () => {
+        steps.push("stopBackend");
+        leaving = true;
+      },
+      leaving: () => leaving,
+    });
+    await relaunch(deps);
+    expect(steps).toEqual(["stopBackend"]);
+    expect(logs.join("\n")).toContain("not starting the new build");
   });
 });
 

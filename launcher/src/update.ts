@@ -11,11 +11,15 @@
 //
 // The order below is the whole of it, and every step is load-bearing:
 //
-//   1. Stop the web server. Its port is the one the new process binds first, and a
+//   1. Stop the backend child GRACEFULLY, and wait until it is reaped (`BackendHandle.stop`:
+//      SIGTERM, and a KILL only after `BACKEND_STOP_GRACE_MS`). It leaves any call on its way
+//      out and tells every page why, and that last frame reaches a phone through THIS web
+//      server's relay, which is why the backend goes first. Its port is the new process's too,
+//      and a backend still holding it would be ATTACHED to by the new build. A stop signal that
+//      arrives meanwhile ends the update here: the app is going, not coming back.
+//   2. Stop the web server. Its port is the one the new process binds first, and a
 //      listener that is still up when the new one starts makes it exit on EADDRINUSE —
 //      which would leave the user with no app at all rather than an updated one.
-//   2. Kill the backend child, whose port the new process binds too. It is ours; the
-//      new one spawns its own.
 //   3. Spawn the new build, detached, from the same path with the same arguments plus
 //      `--no-open`: the user already has the page open, and it reconnects on its own.
 //   4. Exit. Not before the spawn, or nothing starts; not long after it, or two
@@ -31,9 +35,13 @@ import { isCompiledBinary } from "./backend";
 export type RelaunchDeps = {
   /** Stop the in-process web server (`server.stop(true)` — closes live sockets too). */
   stopWeb: () => void;
-  /** Kill the backend child we spawned, and resolve once it is really gone (see
-   *  `BackendHandle.waitForExit`): its port has to be free before the new build looks. */
+  /** Stop the backend child we spawned — gracefully, so it leaves any call — and resolve once it
+   *  is really gone (see `BackendHandle.stop`): its port has to be free before the new build looks. */
   stopBackend: () => Promise<void>;
+  /** Whether a stop signal has reached this launcher (see `BackendHandle.leaving`). One that
+   *  lands during the backend's graceful stop asked for the app to GO: starting the new build
+   *  after it would bring the app back up against that ask. */
+  leaving: () => boolean;
   /** The binary to start: the just-replaced `teams`. */
   execPath: string;
   /** Its arguments, without the executable itself. */
@@ -71,17 +79,27 @@ export async function relaunch(deps: RelaunchDeps): Promise<void> {
   deps.log("[update] restarting onto the new build…");
   // Both stops are best-effort: a listener that is already gone is not a reason to
   // strand the user on the old build, and the spawn below is what actually matters.
+  //
+  // The BACKEND first, while the web server still relays: the backend leaves any call on its
+  // way out and tells every page why, and that last frame travels through the relay this
+  // web server is. Stopped the other way round, a page on a phone loses its socket before it
+  // is told the call it was in has ended.
+  try {
+    // AWAITED, unlike the web server's synchronous stop: a signalled process still holds
+    // its port for a moment, and the new build would attach to the backend we just stopped.
+    await deps.stopBackend();
+  } catch (e) {
+    deps.log(`[update] could not stop the backend: ${String(e)}`);
+  }
+  if (deps.leaving()) {
+    // The signal handler that set it exits this process once the backend is gone.
+    deps.log("[update] a stop arrived during the update — not starting the new build");
+    return;
+  }
   try {
     deps.stopWeb();
   } catch (e) {
     deps.log(`[update] could not stop the web server: ${String(e)}`);
-  }
-  try {
-    // AWAITED, unlike the web server's synchronous stop: a signalled process still holds
-    // its port for a moment, and the new build would attach to the backend we just killed.
-    await deps.stopBackend();
-  } catch (e) {
-    deps.log(`[update] could not stop the backend: ${String(e)}`);
   }
 
   try {
@@ -141,7 +159,7 @@ export function spawnDetached(command: string[]): void {
     stdin: "ignore",
   });
   // Bun ties a child's lifetime to this process only through the handlers we install
-  // ourselves (see killChildOnExit in backend.ts); unref'ing states the intent — this
+  // ourselves (see stopChildOnExit in backend.ts); unref'ing states the intent — this
   // one must survive us.
   child.unref();
 }

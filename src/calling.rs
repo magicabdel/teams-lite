@@ -848,6 +848,15 @@ pub const END_REASON_UNREACHABLE: &str = "CallEndReasonNobodyReachable";
 /// nothing for it: the user ended it themselves, and saying "declined" would be false.
 pub const END_REASON_LEFT_RINGING: &str = "CallEndReasonLeftRinging";
 
+/// A call the user was IN that ended because this backend stopped: a signal (a service stop, a
+/// container or pod stop, Ctrl+C), the idle exit, or a restart. The process hangs up on its way
+/// out, so the people on the call see the user leave rather than a participant gone silent.
+///
+/// A name of ours for the reason [`END_REASON_UNREACHABLE`] is. A ring is never ended with it: a
+/// call still ringing is dropped as the machine stopping taking calls, and goes on ringing the
+/// user's other devices.
+pub const END_REASON_BACKEND_STOPPING: &str = "CallEndReasonBackendStopping";
+
 /// The service could not ring anybody it was asked to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InviteFailed {
@@ -4256,6 +4265,18 @@ mod tests {
             call_ts.contains(&format!("\"{END_REASON_LEFT_RINGING}\"")),
             "web/src/lib/call.ts must name {END_REASON_LEFT_RINGING}, or a ring the user let go \
              is reported as \"The call ended.\""
+        );
+    }
+
+    /// The same contract for a call a stopping backend left: unnamed on the page it falls to "The
+    /// call ended.", and the user is not told that teams-lite going away is what took them out.
+    #[test]
+    fn the_page_knows_the_name_of_a_call_left_by_a_stopping_backend() {
+        let call_ts = include_str!("../web/src/lib/call.ts");
+        assert!(
+            call_ts.contains(&format!("\"{END_REASON_BACKEND_STOPPING}\"")),
+            "web/src/lib/call.ts must name {END_REASON_BACKEND_STOPPING}, or a call teams-lite left \
+             as it stopped is reported as \"The call ended.\""
         );
     }
 

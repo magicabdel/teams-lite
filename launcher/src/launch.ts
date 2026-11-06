@@ -15,6 +15,7 @@ import {
   isCompiledBinary,
   repoRoot,
   WRITE_TOKEN_ENV,
+  type BackendHandle,
 } from "./backend";
 import { handleBackendRestartEvent } from "./backend-restart";
 import { handleBackendEvent, spawnDetached } from "./update";
@@ -221,7 +222,7 @@ export function viteDevEnv(
   };
 }
 
-async function runViteDev(options: LaunchOptions): Promise<never> {
+async function runViteDev(options: LaunchOptions, backend: BackendHandle): Promise<never> {
   if (isCompiledBinary()) {
     throw new Error(
       "teams --dev needs the web/ sources and only works from a source checkout " +
@@ -253,6 +254,11 @@ async function runViteDev(options: LaunchOptions): Promise<never> {
   if (options.open) openBrowser(url);
 
   const code = await proc.exited;
+  // Vite exits on the same Ctrl+C that reaches this launcher, and usually first: exiting at once
+  // would leave the synchronous exit hook to KILL a backend still leaving its call. So the backend
+  // is stopped gracefully first — a stop the signal handler already started is the same stop,
+  // resolved on the same exit, and a second Ctrl+C still KILLs at once through that handler.
+  await backend.stop();
   process.exit(code ?? 0);
 }
 
@@ -290,7 +296,7 @@ export async function launch(options: LaunchOptions): Promise<void> {
       }),
     );
     reportWriteLock(options);
-    await runViteDev(options);
+    await runViteDev(options, backend);
   }
 
   // 3. Locate/build the web app and start its SSR server in-process. The server
@@ -318,10 +324,12 @@ export async function launch(options: LaunchOptions): Promise<void> {
   startKeepalive(backendUrl(), (raw) => {
     handleBackendEvent(raw, {
       stopWeb: () => web.server?.stop(true),
-      stopBackend: async () => {
-        backend.stop();
-        await backend.waitForExit();
-      },
+      // Graceful, and resolved once the backend is gone: it leaves any call first, and the new
+      // build must not find it still holding the port.
+      stopBackend: () => backend.stop(),
+      // A stop signal that landed while that graceful stop ran asked for the app to GO, not to
+      // come back on a new build (see `relaunch`).
+      leaving: () => backend.leaving(),
       execPath: process.execPath,
       args: process.argv.slice(2),
       start: spawnDetached,

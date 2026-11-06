@@ -240,11 +240,11 @@ One replica, not configurable. One Teams account, one SQLite store, one send-cap
 - **It is stopped cleanly.** `terminationGracePeriodSeconds` is 90 s where the pod boots its own
   Intune container (30 s in a host mode or a read-only release) — a ceiling, not a delay: the
   entrypoint forwards the TERM to the launcher, and in the embedded mode then powers the Intune
-  container off, so the inner systemd, the broker and the keyring are not killed mid-write. What a
-  stop does NOT do is hand the calling registration back: the launcher SIGKILLs its backend, so
-  Teams keeps offering your calls to the pod's gone endpoint until that registration expires on its
-  own, within the hour — after every stop and every upgrade. A longer grace period does not change
-  that.
+  container off, so the inner systemd, the broker and the keyring are not killed mid-write. Before
+  that the backend leaves any call you are in — the same hangup End sends, so the people on it see
+  you leave — and hands its calling registration back, so Teams stops offering your calls to the
+  pod's endpoint at once. The launcher gives it 7 s for that before it KILLs it, well inside the
+  grace. A call still ringing is not declined; it goes on ringing your other devices.
 
 What it costs: a volume claim template cannot be resized through `helm upgrade`. Grow it with
 `kubectl edit pvc data-teams-lite-0` (or `intune-teams-lite-0`) on a storage class that allows

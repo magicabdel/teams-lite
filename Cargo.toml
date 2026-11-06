@@ -11,7 +11,7 @@ edition = "2024"
 # self-contained mode, and what it spawns is THIS binary again with one hidden argument — the
 # boot, the repair or the enrollment's portal helper, in a session of its own — never anything
 # else, which a test in that module pins (`the_only_program_a_helper_spawn_runs_is_this_binary`).
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "process", "signal"] }
 # rustls-tls => no system openssl dependency, portable static binary
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde = { version = "1", features = ["derive"] }
