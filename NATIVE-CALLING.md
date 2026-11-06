@@ -537,7 +537,7 @@ WebRTC or the microphone.
 
 ## 6. The surface, and what each part is for
 
-Six RPCs, and the split between them IS the consent design (see § 7). There is no RPC
+Eight RPCs here, and the split between them IS the consent design (see § 7). There is no RPC
 that turns calling on: the backend registers as a device the user's calls ring on as soon
 as it can sign in — and again by itself after a sign-in outage, waking on the session the
 rest of the app adopts rather than polling the broker (`run_calling_start`, AGENTS.md
@@ -547,13 +547,55 @@ away. A read-only backend is the only one that never registers.
 
 | Method | Gate | What it does |
 | --- | --- | --- |
-| `call_status` | open | The state the UI draws — `enabled`, `ready`, `call`, `registration` (`{state, registrar_status}`, null where the backend never calls) and `backend_started_ms`. No SDP, no links, no credentials. |
+| `call_status` | open | The state the UI draws — `enabled`, `ready`, `call`, `registration` (`{state, registrar_status}`, null where the backend never calls), `backend_started_ms` and `protocol` (how a call started from now on speaks to Teams; each call states its own). No SDP, no links, no credentials. |
 | `call_prepare` | `MACHINE_METHODS` | Reserves the one call, and returns the ICE servers (plus the offer, when answering). |
 | `call_place` | `OUTWARD_METHODS` | The § 2.3 POST, carrying our offer. Rings a person. |
 | `call_join` | `OUTWARD_METHODS` | The same POST for a MEETING: no `to`, plus `meetingInfo`. Rings nobody. |
 | `call_accept` | `OUTWARD_METHODS` | Answers with our SDP. Opens the microphone to them. |
 | `call_hangup` | `OUTWARD_METHODS` | Ends the call. `intent: "decline"` — the ringing card's Decline, and nothing else — declines a call still ringing; `intent: "end"` on one lets it go here and tells nobody, so it rings on the user's other devices. No intent is an older page and declines, as it always did. Any other word is refused. |
-| `call_mute` | `OUTWARD_METHODS` | Publishes whether the user can be heard. Every accepted press moves the call's `mute_seq` with `muted`, tells every page and names the sequence in its answer, so a press in one window closes the microphone another window holds (AGENTS.md § Audio calls, "MUTE FOLLOWS THE CALL"). An optional `if_seq` makes it conditional: refused when another press was recorded since — what a press sent again after a reconnect carries. |
+| `call_mute` | `OUTWARD_METHODS` | Publishes whether the user can be heard. Every accepted press moves the call's `mute_seq` with `muted`, tells every page and names the sequence in its answer, so a press in one window closes the microphone another window holds (AGENTS.md § Audio calls, "MUTE FOLLOWS THE CALL"). An optional `if_seq` makes it conditional: refused when another press was recorded since — what a press sent again after a reconnect carries. WHERE it publishes is the protocol the call started with: the legacy `muteUnmute` to the call's `mute` link, or the client's `updateEndpointState` on its conversation (§ 6a). |
+| `call_protocol_set` | `MACHINE_METHODS` | Decides how this backend's calls speak to Teams: `{mute: "legacy" \| "endpoint-state"}`, stored per port (`calling_protocol:<port>`), applied from the next call. Posts nothing itself. Any other key, and any other word, is refused. |
+
+### 6a. The conversation leg, and the mute published the client's way
+
+A call has two sets of doors, and the client keeps them apart. The CALL LEG's arrive nested
+in its frames (`callInvitation.links`, the acceptance's) and are merged into one table that
+never forgets a link (`CallSession.links`). The CONVERSATION's are the top-level `links` of
+each conversation object — the place answer, the join answer, every `conversationUpdate`
+frame (and, for the roadmap's attached incoming call, an attach answer's
+`/additionalActionResponses/0/output`) — and the client REPLACES them whole on every object it
+applies, under a sequence gate: an object whose `sequenceNumber` is below the last one applied
+is ignored, and one with none reads as -1 (`processConversationServiceUpdate`, read from the
+2026-11-05 bundle). That is how a withdrawn `unmute` stops being offered. teams-lite keeps the
+second table as `calling::ConversationLeg`, minus any link on its own callback surl.
+
+The user's own mute, the client's way (`mute = endpoint-state`, OFF by default — Settings ›
+This app › Calling protocol):
+
+```text
+POST <the conversation's updateEndpointState>
+{ "from": { "id", "displayName", "endpointId", "participantId", "languageId" },
+  "endpointState": { …the last endpointState this leg published…,
+                     "state": { "isMuted": <bool> },
+                     "endpointStateSequenceNumber": <1, 2, …> } }
+```
+
+It is the client's `uG`, with `m={...latestEndpointState,...{state:{isMuted}},endpointStateSequenceNumber:++seq}`.
+For a call the client STARTS — places, or joins — `startOrJoinCall` seeds `latestEndpointState`
+with the options' own `endpointState` (`configureEndpointStateForStartOrJoin`: sequence 0 and the
+`endpointProperties` the start body carries), so the first publish re-sends those
+`endpointProperties`, numbered 1; teams-lite seeds a call it starts the same way, off the one
+spelling its place and join bodies use (`calling::start_endpoint_state`). An answered incoming
+call never goes through `startOrJoinCall` and starts from nothing. A state equal to the last one
+requested is not sent again unless a request is still pending (`shouldUpdateEndpointState`,
+which reads an absent `isMuted` as false); teams-lite also sends it again when the newest
+request failed, which the client does not. A state asked for before any door exists is sent
+once the join or place answer names one (`handlePendingEndpointState`). The `mute` link is
+never posted for it: that is `muteAsync` — a SERVER mute of the participants it names.
+
+What it fills is measured, the roster's `endpoints[<id>].endpointState.state.isMuted` (§ 10.2's
+frame); **the publish itself is unmeasured** — `bun run join-live -- --pair --toggle-mute`, with
+the released build set to it, is the check.
 
 Two events carry the rest: `call_state` (the whole state, every time, so ONE frame releases
 the microphone) and `call_media` (the far side's SDP, the only frame whose body a client is

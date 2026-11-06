@@ -60,6 +60,8 @@
 //   cd web && bun run join-live -- --pair            # 19442 sends its camera, 19440 watches
 //   cd web && bun run join-live -- --pair --share    # a screen instead
 //   cd web && bun run join-live -- --pair --swap     # the other way round
+//   cd web && bun run join-live -- --pair --toggle-mute  # 19442 mutes, then unmutes; 19440
+//                                                         # reports what the roster said
 //
 // It needs BOTH installs up, which is the user's own start:
 //
@@ -70,6 +72,7 @@ import { chromium, type Browser, type Page } from "playwright-core";
 import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join as joinPath } from "node:path";
+import { EndpointMuteLog, muteRoundTrip, type EndpointMutes } from "./mute-digest";
 import { findChromium, openCalendarView } from "./preview";
 import { LOCAL_ORIGIN, RELEASED_ORIGIN, TAILNET_ORIGIN } from "./sandbox-live";
 
@@ -299,6 +302,9 @@ export type JoinLiveSession = {
   startSendingNow: (what: "screen" | "camera") => Promise<boolean>;
   /** Press it again, if it is still on. Idempotent. */
   stopSendingNow: (what: "screen" | "camera") => Promise<void>;
+  /** Set the stage's own Mute to `muted` — pressed only when it is not already there — and say
+   *  whether the stage then shows it. The one control `--pair --toggle-mute` presses. */
+  setMuted: (muted: boolean) => Promise<boolean>;
   /** Every remote video TILE the stage is drawing, as the app itself labels it. The half a
    *  receiver has to report: a mid, the service's own label, and whether it is a screen. */
   remoteTiles: () => Promise<Array<{ mid: string; label: string; sharing: boolean }>>;
@@ -356,6 +362,18 @@ export type SignalDigest = {
   /** `participantCounts`, verbatim — numbers, so it says how many people were really there
    *  rather than how many this reading managed to find. */
   participantCounts: unknown;
+  /**
+   * Every ENDPOINT the roster named, and what its `endpointState.state.isMuted` said over the
+   * run, in order, with a repeat of the same value folded away — booleans and nothing else.
+   *
+   * It is what `--pair --toggle-mute` reads (docs/calling-roadmap/incoming-and-conversation.md
+   * § 9, M3): the receiver's roster is where the SENDER's published mute arrives, keyed by the
+   * sender's endpoint. An endpoint is named by the order it was first seen in — `endpoint 1` —
+   * because its id is a registration of the user's own and the label is all a reader needs. An
+   * endpoint that never stated a mute is listed with no values, which is a different answer
+   * from one that stated `false` every time.
+   */
+  endpointMutes: EndpointMutes;
 };
 
 /** The only values a skeleton prints. Each one IS the measurement — a stream's kind and its
@@ -539,6 +557,7 @@ export async function withJoinLive<T>(
       send: (what, holdMs = SHARE_HOLD_MS) => sendSomething(page as Page, what, holdMs),
       startSendingNow: (what) => startSendingNow(page as Page, what),
       stopSendingNow: (what) => stopSendingNow(page as Page, what),
+      setMuted: (muted) => setMutedNow(page as Page, muted),
       remoteTiles: () => readRemoteTiles(page as Page),
       localOffer: () => readLocalOffer(page as Page),
       rawDescriptions: () =>
@@ -934,7 +953,9 @@ export async function readSignals(page: Page): Promise<SignalDigest> {
     mediaLines: {},
     participantShape: [],
     participantCounts: null,
+    endpointMutes: [],
   };
+  const endpointMutes = new EndpointMuteLog();
   const publishers = new Map<string, SignalDigest["publishers"][number]>();
   const participantKeys = new Set<string>();
   const joinLinks = new Set<string>();
@@ -989,6 +1010,7 @@ export async function readSignals(page: Page): Promise<SignalDigest> {
       // fuller tree is the one that answers the question.
       const tree = skeleton(person);
       if (tree.length > digest.participantShape.length) digest.participantShape = tree;
+      endpointMutes.note(person);
       // Every participant is kept, streams or not: "the roster names three people and
       // publishes nothing" and "the roster was not read at all" are different answers, and
       // reporting the second as the first is how this reading was wrong the first time.
@@ -1004,6 +1026,7 @@ export async function readSignals(page: Page): Promise<SignalDigest> {
   const everyLink = new Set([...joinLinks, ...[...frameLinks.values()].flatMap((s) => [...s])]);
   digest.sourceRequestLinks = SOURCE_REQUEST_LINKS.filter((name) => everyLink.has(name));
   digest.publishers = [...publishers.values()];
+  digest.endpointMutes = endpointMutes.list();
   digest.participantKeys = [...participantKeys].sort();
   digest.frameLinks = Object.fromEntries(
     [...frameLinks].map(([path, names]) => [path, [...names].sort()]),
@@ -1223,6 +1246,23 @@ async function stopSendingNow(page: Page, what: "screen" | "camera"): Promise<vo
   await page.waitForTimeout(1_500);
 }
 
+/** Press the stage's Mute until it shows `muted`. See {@link JoinLiveSession.setMuted}. */
+async function setMutedNow(page: Page, muted: boolean): Promise<boolean> {
+  const control = page.locator('[data-testid="call-mute"]').first();
+  if ((await control.count()) === 0) {
+    console.log("  no Mute control on the stage — the call is not up");
+    return false;
+  }
+  const shows = async () => (await control.getAttribute("aria-pressed")) === "true";
+  if ((await shows()) !== muted) {
+    console.log(`  pressing ${muted ? "Mute" : "Unmute"}…`);
+    await control.click();
+  }
+  const deadline = Date.now() + 5_000;
+  while ((await shows()) !== muted && Date.now() < deadline) await page.waitForTimeout(200);
+  return (await shows()) === muted;
+}
+
 /** Every remote video tile the stage is drawing, as the app's own attributes state it. */
 async function readRemoteTiles(
   page: Page,
@@ -1307,13 +1347,16 @@ const PAIR_WATCH_MS = 15_000;
  */
 async function runPair(opts: {
   what: "screen" | "camera";
+  /** Toggle the sender's MUTE instead of sending a picture — see {@link toggleMuteAndReport}. */
+  toggleMute: boolean;
   tone: boolean;
   from: "calendar" | "chat";
   receiver: "tailnet" | "local" | "released";
   sender: "tailnet" | "local" | "released";
 }): Promise<void> {
   console.log(
-    `\n  PAIR — ${opts.receiver} receives, ${opts.sender} sends its ${opts.what}\n` +
+    `\n  PAIR — ${opts.receiver} receives, ${opts.sender} ` +
+      `${opts.toggleMute ? "mutes and unmutes" : `sends its ${opts.what}`}\n` +
       "  Two installs, two calling endpoints, one meeting.\n",
   );
   await withJoinLive(
@@ -1335,6 +1378,10 @@ async function runPair(opts: {
               `the SENDER never connected (${up.phase ?? "-"} ${up.detail || up.notice})`,
             );
           }
+          if (opts.toggleMute) {
+            await toggleMuteAndReport(receiver, sender);
+            return;
+          }
           // Both endpoints are in. From here the sender's capture goes on and STAYS on, because
           // the receiver has to be looking while it is.
           if (!(await sender.startSendingNow(opts.what))) {
@@ -1350,6 +1397,59 @@ async function runPair(opts: {
       );
     },
     { front: opts.receiver, tone: opts.tone, from: opts.from },
+  );
+}
+
+/** How long each step of `--toggle-mute` holds. A roster frame arrives every few seconds, so this
+ *  is room for a mute to be published, carried to the other endpoint and read there. */
+const MUTE_TOGGLE_STEP_MS = 10_000;
+
+/**
+ * THE MUTE, published and read back (docs/calling-roadmap/incoming-and-conversation.md § 9, M3):
+ * the sender presses Mute, then Unmute, ten seconds apart, and the receiver says what the
+ * roster told it about every endpoint's `isMuted`.
+ *
+ * It is the one end-to-end check of the mute PUBLISH this machine can run by itself, for the
+ * reason the picture half is: both installs are the user's own endpoints, so the receiver's
+ * roster carries the sender's published state. The sender's backend has to be set to publish it
+ * the client's way first — Settings › This app › Calling protocol, "Publish it the way Teams
+ * does" — which is the user's own press. Run on the legacy flow it is the baseline.
+ *
+ * It presses nothing on the receiver: the receiver never mutes, so its own endpoint is the one
+ * that stays still and the sender's is the one that moves. The receiver's roster is read at three
+ * moments — before the Mute, before the Unmute, and after it — and the verdict is judged against
+ * those moments ({@link muteRoundTrip}), so a colleague in the meeting unmuting on their own can
+ * never pass for the sender's publish.
+ */
+async function toggleMuteAndReport(receiver: JoinLiveSession, sender: JoinLiveSession): Promise<void> {
+  const hold = () => new Promise((resolve) => setTimeout(resolve, MUTE_TOGGLE_STEP_MS));
+  await hold();
+  const beforeMute = (await receiver.signals()).endpointMutes;
+  const muted = await sender.setMuted(true);
+  console.log(`\n  [sender] muted: ${muted ? "yes" : "NO — the stage never showed it"}`);
+  await hold();
+  const afterMute = (await receiver.signals()).endpointMutes;
+  const unmuted = await sender.setMuted(false);
+  console.log(`  [sender] unmuted: ${unmuted ? "yes" : "NO — the stage never showed it"}`);
+  await hold();
+
+  const signal = await receiver.signals();
+  console.log("\n  [receiver] isMuted, per endpoint the roster named, over the whole run:");
+  if (signal.endpointMutes.length === 0) console.log("      (no endpoint at all — the roster was not read)");
+  for (const endpoint of signal.endpointMutes) {
+    console.log(
+      `      ${endpoint.endpoint}: ${endpoint.isMuted.length ? endpoint.isMuted.join(" → ") : "(never stated)"}`,
+    );
+  }
+  const verdict = muteRoundTrip(
+    { beforeMute, afterMute, afterUnmute: signal.endpointMutes },
+    { muted, unmuted },
+  );
+  console.log(
+    `\n  VERDICT: ${verdict}\n` +
+      "  The sender's backend says what it published (its own journal, or the released build's log):\n" +
+      "    grep -E '\\[calling\\] (published the mute|the mute)' /tmp/teams-lite-server-19422.log\n" +
+      "    journalctl --user -u teams-lite-backend -n 80 | grep -E '\\[calling\\] (published the mute|the mute)'\n",
   );
 }
 
@@ -1467,6 +1567,7 @@ if (import.meta.main) {
   if (argv.includes("--pair")) {
     await runPair({
       what: share ? "screen" : "camera",
+      toggleMute: argv.includes("--toggle-mute"),
       tone,
       from: argv.includes("--from-calendar") ? "calendar" : "chat",
       // WHICH install does which, and the default is deliberate: the always-on service (19440)

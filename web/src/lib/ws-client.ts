@@ -10,7 +10,13 @@
 import type { AgentAuthPatch, AgentMode, AgentProviderPatch, AgentStatus } from "./agent";
 import type { AgentPersonaPatch } from "./agent-persona";
 import { BACKEND_WS_ROUTE } from "./backend-route";
-import type { CallHangupIntent, CallPreparation, CallStatus, MeetingAddress } from "./call";
+import type {
+  CallHangupIntent,
+  CallPreparation,
+  CallProtocol,
+  CallStatus,
+  MeetingAddress,
+} from "./call";
 import type { ChessEngineState } from "./chess-engine";
 import type { ChessSoundsState } from "./chess-sound";
 import type { SendImage } from "./composer-image";
@@ -1193,6 +1199,15 @@ export class Backend {
       muted,
       ...(ifSeq === undefined ? {} : { if_seq: ifSeq }),
     });
+  }
+
+  /** Decide how this backend's calls speak to Teams — Settings › This app › Calling protocol.
+   *  A WRITE request: it posts nothing itself, but every call this backend starts from now on
+   *  publishes through what it chose, so a client that merely found the socket must not choose
+   *  it. The backend answers with the protocol now in force, and every page is told through
+   *  `call_state`. */
+  callProtocolSet(changes: Partial<CallProtocol>): Promise<{ protocol: CallProtocol }> {
+    return this.writeRequest<{ protocol: CallProtocol }>("call_protocol_set", { ...changes });
   }
 
   /** What the local agent can do on the backend's machine: which CLIs it holds, which

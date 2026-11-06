@@ -460,6 +460,14 @@ FIXTURES = {
         "const ws = new WebSocket('ws://127.0.0.1:19420');\n"
         "ws.send(JSON.stringify({ method: 'call_prepare' }));\n"
     ),
+    # The calling PROTOCOL: which door the user's mute is published on, and later how an incoming
+    # call is taken. It posts nothing itself, but every later call speaks through what it chose
+    # (MACHINE_METHODS in src/bin/server.rs), so tooling must not choose it.
+    "call-protocol-setter.ts": (
+        "// Switches the live backend's calls to another protocol.\n"
+        "const ws = new WebSocket('ws://127.0.0.1:19422');\n"
+        "ws.send(JSON.stringify({ method: 'call_protocol_set', params: { mute: 'endpoint-state' } }));\n"
+    ),
     "call-status-reader.ts": (
         "// Reads whether this machine takes calls, which is allowed.\n"
         "const ws = new WebSocket('ws://127.0.0.1:19420');\n"
@@ -972,6 +980,7 @@ def cases(tmp: Path):
         ("BLOCK", PROJECT, f"bun run {tmp}/meeting-joiner.ts"),
         ("BLOCK", PROJECT, f"bun run {tmp}/call-registrar.ts"),
         ("BLOCK", PROJECT, f"bun run {tmp}/call-preparer.ts"),
+        ("BLOCK", PROJECT, f"bun run {tmp}/call-protocol-setter.ts"),
         # A cargo example reaches Teams with a broker token, past every port rule.
         ("BLOCK", PROJECT, "cargo run --example guard-test-loose-send"),
         ("BLOCK", PROJECT, "cargo run --example guard-test-real-send"),

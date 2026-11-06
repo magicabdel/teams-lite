@@ -4673,6 +4673,8 @@ type MockCall = {
   /** Who took a ring this machine was offered, when the "service" said it was answered
    *  elsewhere and by whom — the backend's `ended_elsewhere`. */
   ended_elsewhere: { by_self: boolean; name: string } | null;
+  /** The protocol this call kept from its start — the backend's per-call snapshot. */
+  protocol: { mute: MockMuteProtocol };
   /** What the others publish, and the source ids a subscription is addressed by — the
    *  half of the roster the real backend reads out of `endpoints[…].call.mediaStreams`. */
   publishing: MockPublishing[];
@@ -4836,6 +4838,31 @@ function mockSectionRejection(label: string, mid = "2"): string {
  *  ONE backend that really answers `false` — a read-only one, which is the install the user
  *  never opened. */
 let mockCallingEnabled = true;
+
+/** Where the user's own mute is published, as `call_protocol_set` names it — the backend's
+ *  `calling::MuteProtocol::WORDS`, mirrored so the mock refuses what the backend refuses. */
+const MOCK_MUTE_PROTOCOLS = ["legacy", "endpoint-state"] as const;
+type MockMuteProtocol = (typeof MOCK_MUTE_PROTOCOLS)[number];
+
+/** How a call this mock starts from now on speaks to Teams — the backend's `CallingPlane.protocol`,
+ *  the legacy flow out of the box. A call takes a COPY when it starts and keeps it, exactly as
+ *  the backend's `admit` stamps one, so a change mid-call applies from the next call.
+ *  `call_invite {reset:true}` puts it back, and a spec that sets it MUST call it. */
+let mockCallProtocol: { mute: MockMuteProtocol } = { mute: "legacy" };
+
+/** Armed by `{kind:"call_protocol", refuse:true}`: the NEXT `call_protocol_set` is refused, once,
+ *  with nothing changed — the one way to a refusal the page has to say at the row. */
+let mockRefusesNextProtocol = false;
+
+/** Armed by `{kind:"call_protocol", hold_ms}`: the NEXT `call_protocol_set` waits this long before it
+ *  answers, once — the only way to the moment a press is still on its way, which is when the row
+ *  must go on drawing the backend's word rather than its own memory of the press. */
+let mockProtocolHoldMs = 0;
+
+/** The read-only gate's own sentence for `call_protocol_set`, over the backend's
+ *  `machine_effect` — what a backend that never calls answers, since it never reaches the method. */
+const MOCK_CALL_PROTOCOL_READ_ONLY =
+  "refused: `call_protocol_set` decides how this machine's calls speak to Teams, and this server runs read-only (TEAMS_LITE_READ_ONLY=1). Tooling never changes the user's own machine — their own backend does.";
 let mockCall: MockCall | null = null;
 /** Timers of a simulated call, cleared on every ending so a reused mock cannot let an
  *  old call finish connecting inside a later spec. */
@@ -5031,6 +5058,7 @@ function mockCallStatus(): {
   call: MockCall | null;
   registration: { state: MockCallRegistrationState; registrar_status: number | null } | null;
   backend_started_ms: number;
+  protocol: { mute: MockMuteProtocol };
 } {
   return {
     enabled: mockCallingEnabled,
@@ -5042,6 +5070,7 @@ function mockCallStatus(): {
       ? { state: mockCallRegistration, registrar_status: mockRegistrarStatus(mockCallRegistration) }
       : null,
     backend_started_ms: mockBackendStartedMs,
+    protocol: { ...mockCallProtocol },
   };
 }
 
@@ -5216,6 +5245,7 @@ function injectMockCallInvite(conversation: string): MockCall | null {
     connected_at_ms: null,
     end_reason: null,
     ended_elsewhere: null,
+    protocol: { ...mockCallProtocol },
     publishing: [],
     sending: [],
     can_accept: true,
@@ -10524,6 +10554,7 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
           connected_at_ms: null,
           end_reason: null,
           ended_elsewhere: null,
+          protocol: { ...mockCallProtocol },
           publishing: [],
           sending: [],
           can_accept: false,
@@ -10572,6 +10603,7 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
         connected_at_ms: null,
         end_reason: null,
         ended_elsewhere: null,
+        protocol: { ...mockCallProtocol },
         publishing: [],
         sending: [],
         can_accept: false,
@@ -10857,6 +10889,38 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
             : "CallEndReasonHangup",
       );
       return { call_id: callId, told_service: door !== "nothing" };
+    }
+
+    case "call_protocol_set": {
+      // A read-only backend refuses before the method runs — its dispatch gate refuses a
+      // MACHINE method — so the mock's window that does not call answers in those words.
+      if (!mockCallingEnabled) throw new Error(MOCK_CALL_PROTOCOL_READ_ONLY);
+      if (mockProtocolHoldMs > 0) {
+        const hold = mockProtocolHoldMs;
+        mockProtocolHoldMs = 0;
+        await new Promise((resolve) => setTimeout(resolve, hold));
+      }
+      if (mockRefusesNextProtocol) {
+        mockRefusesNextProtocol = false;
+        throw new Error("call_protocol_set: the mock was told to refuse this change");
+      }
+      // Every key must be one the backend knows, and every value one of its words
+      // (`CallProtocol::with_changes`): a typo that changed nothing would leave the user
+      // believing a protocol is in force that is not.
+      const next = { ...mockCallProtocol };
+      for (const [key, value] of Object.entries(asObject(params))) {
+        if (key === "write_token") continue;
+        if (key !== "mute") throw new Error(`call_protocol_set: this backend does not know \`${key}\``);
+        if (!MOCK_MUTE_PROTOCOLS.includes(value as MockMuteProtocol)) {
+          throw new Error(
+            `call_protocol_set: \`mute\` must be one of ${JSON.stringify(MOCK_MUTE_PROTOCOLS)}`,
+          );
+        }
+        next.mute = value as MockMuteProtocol;
+      }
+      mockCallProtocol = next;
+      broadcastMockCall();
+      return { protocol: { ...mockCallProtocol } };
     }
 
     case "call_mute": {
@@ -13877,6 +13941,16 @@ async function handleTestHook(req: Request, url: URL): Promise<Response | null> 
       for (const ws of sockets) ws.close();
       return Response.json({ ok: true, reconnect: true }, { status: 200 });
     }
+    // Refuse the next `call_protocol_set`, once, with nothing changed — and/or hold its answer
+    // `hold_ms`, once. Armed; `call_invite {reset:true}` clears both.
+    if (body.kind === "call_protocol") {
+      if (body.refuse === true) mockRefusesNextProtocol = true;
+      if (typeof body.hold_ms === "number" && body.hold_ms > 0) mockProtocolHoldMs = body.hold_ms;
+      return Response.json(
+        { ok: true, refuse: mockRefusesNextProtocol, hold_ms: mockProtocolHoldMs },
+        { status: 200 },
+      );
+    }
     // Fail the next `call_status` read, once. Armed; `call_invite {reset:true}` clears it.
     if (body.kind === "calling" && body.refuse_status === true) {
       mockRefusesNextStatus = true;
@@ -13902,6 +13976,9 @@ async function handleTestHook(req: Request, url: URL): Promise<Response | null> 
         mockMuteHoldMs = 0;
         mockMuteLosesAnswer = false;
         mockMutes = [];
+        mockCallProtocol = { mute: "legacy" };
+        mockRefusesNextProtocol = false;
+        mockProtocolHoldMs = 0;
         broadcastMockCall();
         return Response.json({ ok: true, reset: true }, { status: 200 });
       }

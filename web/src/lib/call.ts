@@ -77,6 +77,9 @@ export type ActiveCall = {
    *  another device, or somebody else by the name this app gives them. Null on every other
    *  ending and on an answer elsewhere that named nobody; absent from an older backend. */
   ended_elsewhere?: { by_self: boolean; name: string } | null;
+  /** How THIS call speaks to Teams — the protocol it kept from its start, which a setting
+   *  changed since does not move. Absent from an older backend. */
+  protocol?: CallProtocol;
   /** What everybody ELSE in the meeting is publishing, so this page can ask for it. Empty
    *  for a one-to-one call and for a backend too old to say. */
   publishing: PublishingParticipant[];
@@ -189,7 +192,27 @@ export type CallStatus = {
    *  process start time rather than an identity: what it tells a page is that the backend
    *  it is talking to is not the one it was talking to before. */
   backend_started_ms?: number | null;
+  /** How a call this backend starts FROM NOW ON speaks to Teams — Settings › This app ›
+   *  Calling protocol. Per backend, so the two installs on one machine may differ. Absent from
+   *  a backend too old to have the setting, which then offers no row at all. */
+  protocol?: CallProtocol;
 };
+
+/**
+ * Where the user's own mute is published, as `call_protocol_set` names it.
+ *
+ * `legacy` is what this app has always sent: `muteUnmute` to the call's own `mute` link.
+ * `endpoint-state` is the Teams web client's own toggle, `updateEndpointState` on the call's
+ * conversation — what a meeting draws as the crossed-out microphone beside a name
+ * (docs/calling-roadmap/incoming-and-conversation.md § 4.7). A Rust test holds this TYPE to
+ * exactly the backend's words (`calling::MuteProtocol::WORDS`).
+ */
+export type MuteProtocol = "legacy" | "endpoint-state";
+
+/** How a backend's calls speak to Teams, where it has a choice between the flow this app
+ *  measured and the one the Teams web client uses. One field today; the roadmap's others join
+ *  it in the milestone that gives them something to switch. */
+export type CallProtocol = { mute: MuteProtocol };
 
 /** What `call_prepare` hands back: what one `RTCPeerConnection` needs, and — when
  *  answering — the offer to answer. */

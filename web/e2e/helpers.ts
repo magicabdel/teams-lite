@@ -439,6 +439,21 @@ export async function disableCalling(page: Page): Promise<void> {
 }
 
 /**
+ * Make the next `call_protocol_set` FAIL, once, with nothing changed (the mock's
+ * `{kind:"call_protocol", refuse:true}` hook). It is the one way to the state the Calling
+ * protocol row has to say at the row: a press the backend did not carry out. `holdMs` holds the
+ * answer that long first, which is the only way to look at the row while a press travels. Always
+ * finish with
+ * `resetCall`, which also puts the protocol back to the legacy flow.
+ */
+export async function refuseNextCallProtocol(page: Page, holdMs = 0): Promise<void> {
+  const res = await page.request.post(`http://127.0.0.1:${MOCK_PORT}/__test/emit`, {
+    data: { kind: "call_protocol", refuse: true, ...(holdMs > 0 ? { hold_ms: holdMs } : {}) },
+  });
+  expect(res.ok()).toBeTruthy();
+}
+
+/**
  * Put this window's calling REGISTRATION in one state (the mock's
  * `{kind:"calling", registration}` hook, over `CallingPlane.registration` in the backend).
  *

@@ -286,6 +286,18 @@ code), **inferred** (neither).
   under `callInvitation.links`, and the join output, are read-from-bundle. M2/M4a journal the key
   names before anything relies on them. Broker-shaped keys are journaled too (`links.subscribe`,
   or anything naming `broker`).
+- **As implemented (M3, IC3):** `calling::ConversationLeg { controller, links, sequence_number,
+  state }`, read by `from_response(body, own_surl)` off the ONE candidate list the M2 journal
+  reads (`conversation_object`: a `conversationUpdate` key, `/additionalActionResponses/0/output`,
+  the body itself — and only an object carrying a top-level `links` OBJECT, because the client
+  reads `e.links.leave` unguarded). `Links::top_level` takes that object's own `links` and nothing
+  nested; `Links::without_prefix` drops our own callbacks; `apply` is the gate (equal applies,
+  below is ignored, none reads as -1). Learned off the place answer, the join answer and every
+  `conversationUpdate` frame (step 8 of the handler's order), for every call kind. Not learned
+  off the legacy accept's answers: nothing says what they hold, and M4a's attach brings the
+  conversation the incoming path really has. Accessors built: `update_endpoint_state`, `leave`,
+  `mute`, `unmute`; `notification_links` is not, because a non-URL value never enters `Links`
+  and nothing reads it yet.
 
 ### 4.4 Accept (unchanged body; the claim; the inline acknowledgement)
 
@@ -411,6 +423,20 @@ code), **inferred** (neither).
 
 - **Status:** the roster field it fills (`endpoints[<id>].endpointState.state.isMuted`) is measured
   (NATIVE-CALLING.md:1052-1068). The publish itself is unmeasured.
+- **As implemented (M3, IC3):** `calling::next_endpoint_state` (the shallow spread),
+  `endpoint_state_is_muted` (an absent mute reads as false) and `endpoint_state_payload` (`{from,
+  endpointState}`, no other key). The per-call state is `CallConversation` in server.rs: the
+  protocol snapshot, the leg, the last endpoint state REQUESTED (the client's `latestEndpointState`,
+  set when sent — and, for a call this app placed or joined, SEEDED with the start body's own
+  `endpointState`, `calling::start_endpoint_state`, the one spelling the place and join bodies
+  use; § 13 note 23), its sequence, the publishes in flight, and whether the NEWEST one failed. A press
+  is planned in `record_mute`, under the plane's lock, as `NoDoor`, `Holds` or `Send`; a repeat of
+  the requested state is sent again while one is in flight (the client's `hasPendingRequest`) and —
+  the one divergence, § 13 note 22 — after the newest one failed. A press with no door is OWED and
+  published once a door appears (`owed_endpoint_state`, the client's `handlePendingEndpointState`),
+  spawned from `adopt_conversation`. Journal: `[calling] published the mute on updateEndpointState
+  (isMuted=…, sequence N) → accepted`, `[calling] the mute is owed: …`, `[calling] the mute needs no
+  publish: …`.
 
 ### 4.8 Server mute: read by meeting-awareness, honoured here only by narrowing
 
@@ -693,6 +719,11 @@ code), **inferred** (neither).
   JoinAtAnswer | Ring, ring_kinds: Vec<Kind>, keepalive: Off | Client, mute: Legacy |
   EndpointState, server_mute: Display | Enforce }`. An unknown or absent value reads as the
   default. `server_mute` is added by meeting-awareness M6 (README § 3, collision 10).
+  **As implemented (M3, IC3):** `CallProtocol { mute: MuteProtocol }` and nothing else, with
+  `MuteProtocol::WORDS = ["legacy", "endpoint-state"]`; `incoming` and `keepalive` join it in M4a
+  and M6, because a choice that changes nothing reads as a bug. `from_stored` reads field by field
+  and ignores a key it does not know (a newer build's); `with_changes` is the RPC's strict half and
+  refuses an unknown key or word. `call_protocol_setting_key(port)` is the store key.
 
 ### `src/bin/server.rs`
 
@@ -790,6 +821,20 @@ code), **inferred** (neither).
   new values, emits `call_state`, and answers the effective protocol. Refusal words: "decides how
   this machine's calls speak to Teams". `call_status` (`:7392`, open) reports `protocol`.
   `start_calling` (`:14454`) journals the effective protocol once.
+  **As implemented (M3, IC3):** it takes `{mute?}` only (a `write_token` key is the lock's own),
+  checks, writes the store and sets the plane under ONE lock so two presses cannot leave the two
+  disagreeing, journals `[calling] calling protocol set: {…} — it applies from the next call`,
+  emits `call_state` and answers `{protocol}`. The plane reads the store at BOOT, before anything
+  serves, so the first `call_state` already states it; `CallingPlane::admit` is the one path a call
+  enters and stamps its copy. `call_state.protocol` is the backend's; `call.protocol` the call's.
+  Tests: `the_self_mute_publishes_endpoint_state_only_when_asked`,
+  `a_repeated_mute_is_published_again_only_while_the_last_one_is_unsure`,
+  `a_call_keeps_the_protocol_it_started_with`,
+  `a_mute_pressed_before_the_door_is_delivered_once_the_conversation_names_one`,
+  `a_conversation_update_replaces_the_doors_it_names` (the real handler),
+  `the_endpoint_state_publish_never_names_the_mute_link_and_refuses_read_only` and
+  `the_calling_protocol_is_per_backend_and_gated`; in calling.rs the leg, the gate, the body, the
+  protocol's reading and the page's and mock's words (`the_page_and_the_mock_know_the_mute_protocol_words`).
 - **New tests:**
   - `a_frame_acts_only_on_the_call_whose_callbacks_it_arrived_on`: another session's
     `conversationEnd` must not end the live call, and its roster must not fold.
@@ -1035,6 +1080,18 @@ declined.
 - **Mute:** "Measured (default)" or "Publish it the way Teams does".
 - Under the rows: "Applies to calls this window's backend starts from now on. Other windows on this
   machine keep their own." Each row clears the 44 px floor.
+- **As implemented (M3, IC3):** one row, Mute, inside Settings › This app, as a labelled group of
+  two 44 px pressed-or-not buttons (the app's own convention for one choice among a few; a radio
+  role would promise arrow keys) — "As before (default)" ("How this app has always told a call that
+  you muted.") and "Publish it the way Teams does" (…"Your microphone mutes the same either way.").
+  Not "Measured": that word is true of the Incoming row, whose answer is measured, and false of the
+  legacy mute, which never was.
+  The note reads "Applies to calls this backend starts from now on. Each teams-lite install on this
+  machine keeps its own." — "other windows" was wrong: two windows on one backend share it — and
+  a live call that keeps a different protocol adds "The call going now keeps the way it started
+  with until it ends." The checked option is the backend's word, a refusal is said under the row,
+  and no row is drawn where `enabled` is false or the backend states no protocol.
+  (`web/src/lib/calling-protocol.ts`, `web/src/components/calling-protocol-settings.tsx`.)
 
 **Mobile:**
 - The ringing card keeps its full-width bottom layout.
@@ -1138,6 +1195,19 @@ nobody_answers:true}`, which ends the next placed call as `CallEndReasonUnanswer
 `call_place` has answered. The `--call` capture gained
 `-notice-{answered-elsewhere,missed}-{light,card-light,card-dark}`; it is what found § 13 note 20.
 
+**As implemented (M3):** `web/e2e/calling-protocol.spec.ts` pins what the page owns: the row
+starts on this app's existing flow and keeps the backend's choice across a reload, every option clears
+44 px, a refused change is said at the row with the old choice standing, a live call that keeps a
+different protocol says so, and a window that does not call draws no row. The mock mirrors
+`call_protocol_set` (keys, words, the read-only gate's sentence), stamps each call's copy, states
+`protocol` in `call_status`, and adds `{kind:"call_protocol", refuse:true, hold_ms}` — the hold is
+the only way to look at the row while a press travels, and the spec reads it ONCE there, because a
+retrying assertion waits the hold out (a mutation found that); `call_invite {reset:true}` puts the
+legacy flow back. Which door a press then publishes on is the backend's
+decision and is pinned in Rust, not against the mock. `web/scripts/mute-digest.test.ts` pins the
+`--toggle-mute` reading (SEEN, HALF, NOT SEEN). The `--maintenance` capture gained
+`-calling-protocol-{light,dark}`.
+
 **Captures:**
 - `cd web && bun run preview -- --out /tmp/call --call` gains `-ring-group`, `-ring-meeting`,
   `-ring-unclaimable`, `-notice-answered-elsewhere`, `-notice-missed`, `-stage-elsewhere-{light,dark}`
@@ -1161,7 +1231,7 @@ re-stages from master by itself.
 | M0 | Regression on the verified paths, after M0 merges. | `cd web && bun run join-live -- --from-chat --hold 60` (the pinned meeting). `bun run call-live` only with the colleague's agreement for that session. | The agent runs them. | Connected, held, hung up cleanly. No `[calling] ignored a frame on` line is journaled while the call is up (the line names no session, so this is the check that can be run). Both calls end on the service's own end frame, as before. |
 | M1 | During one of the user's own calls, with the laptop (holding the microphone) and the phone on the same backend, press Mute on the PHONE, then Unmute on the laptop. | The user's own click. E2E specs 3–5 are the automated proof. | The user, with the colleague. | The colleague hears silence the moment the phone shows Muted. The laptop's Mute turns on by itself. The phone offers no Unmute. The laptop's Unmute is heard. |
 | M2 | Instrumentation: one `call-live` (outgoing) and one incoming call from the colleague. | `call-live` with agreement; the colleague places the incoming call. Journals are read with `journalctl --user -u teams-lite-backend.service`. | The agent; the colleague. | Shape lines: the invite's `conversationInvitation` keys and `evt`; `callKeepAliveInterval` from `callAcceptance` (outgoing) or the acceptance's inline acknowledgement (incoming legacy); whether `leave`/`updateEndpointState`/`notificationLinks`/`unmute` are in each conversation object. No behaviour changes. |
-| M3 | The user sets Mute = "Publish it the way Teams does" on 19442. Both installs join the pinned meeting; the sender mutes, then unmutes. | `cd web && bun run join-live -- --pair --toggle-mute` (19442 sends, 19440 watches). | The agent, after the USER has started both installs. | The receiver's digest shows the sender endpoint's `isMuted` going false → true → false in step. The sender's journal shows `published the mute on updateEndpointState → 200` twice, and no `mute`-link POST. |
+| M3 | The user sets Mute = "Publish it the way Teams does" on 19442. Both installs join the pinned meeting; the sender mutes, then unmutes. | `cd web && bun run join-live -- --pair --toggle-mute` (19442 sends, 19440 watches). | The agent, after the USER has started both installs. | The run ends on `VERDICT: SEEN — endpoint N's isMuted went false → true → false, in step with the presses`, judged against the receiver's roster read before the Mute, before the Unmute and after it (`muteRoundTrip`), so a colleague unmuting on their own cannot pass for it. The sender's backend log (`/tmp/teams-lite-server-19422.log`) shows `published the mute on updateEndpointState (isMuted=true, sequence 1) → accepted` and then `isMuted=false, sequence 2`, and no `the mute did not reach the service` line (the legacy door's). A run on the legacy flow is the baseline. |
 | M4a | The user sets Incoming = "Join the call's conversation when you answer" (and Mute as in M3) on 19442. The colleague calls the user from real Teams; the user answers on 19442, mutes, unmutes, then presses End. | The user's own click and the consenting colleague. No driver can RECEIVE a call. | The user and the colleague. | The journal shows `attached (WV) → links=[…acceptance…]; joined the conversation: links=[…leave…updateEndpointState…]`, then `accepted`, then `endpoint state isMuted=true → 200`, and finally `left the conversation → 200`. The colleague sees the user muted, then not, and their call ENDS when End is pressed. That closes § 8a "HANGING UP MAY NOT REACH THE CALLER". A decline on the legacy flow is pressed once too, and its answer journaled. |
 | M4b | The user sets Incoming = "Claim the call when it starts ringing", one-to-one only, on 19442; 19420 stays measured. The colleague calls the user from real Teams. Cases: **(a)** answer on 19442, talk, End; **(b)** Decline on 19442; **(c)** answer on the Teams phone app while 19440 and 19442 both ring; **(d)** the colleague hangs up before anyone answers; **(e)** after (b) and (d), the agent runs `join-live --from-chat --hold 120`; **(f)** optional: during (c)'s phone call the agent runs `join-live --from-chat --hold 120` and the user hangs up the phone call meanwhile; **(g)** optional, the user's own setup: Teams quit on the phone and 19420 stopped, for one ring; **(h)** the colleague watches their own client during every ring. | The user's own click and the colleague; `join-live` for (e) and (f). | The user, the colleague, the agent for `join-live`. | **(a)** `attached at ring time … joined: links=[…]` BEFORE Answer, then `accepted`, then `left → 200`; the colleague's call ends on End. **(b)** `declined on the leg (DELETE) → 2xx`; the colleague's ring stops at once. **(c)** 19442's card vanishes within about 2 s with "You answered on another device."; 19440 rings to its 60 s backstop: the A/B in one call. **(d)** 19442's card vanishes within about 2 s with "Missed call from {Name}."; 19440 at 60 s. **(e)/(f)** the meeting is untouched; any frame from the earlier ring's conversation is journaled as `ignored`. **(g)** the caller's client says "Ringing" (not "Calling…"), or callProgress is revisited. **(h)** the colleague sees nothing unusual during the ring: no "joined", ringing as always. |
 | M5 | Promotion: repeat M4a on the default flow after `join-at-answer` becomes the default. Promote ring-time for 1:1 only after the user's decision (§ 12), then repeat (a)–(d). | The user's own click. | The user and the colleague. | The same signals with no setting changed, and `call-live` still rings, connects and hangs up for both sides. |
@@ -1394,6 +1464,43 @@ Each milestone ships alone.
     are reordered so a different sentence stands between them. Refused: canonicalising the
     acceptedElsewhereBy id before the store lookup (the app looks every frame's mri up as
     spelled, and nothing measured a different spelling).
+22. **Implementing M3 took four decisions the design left open.** (a) The protocol holds `mute`
+    alone: an Incoming or Keep-alive row before M4a and M6 would be a choice that changes nothing.
+    (b) A repeat of a state whose newest publish FAILED is sent again. The client sets
+    `latestEndpointState` before the POST and never clears it on failure, so its next press of the
+    same state is "nothing new to send" and the meeting keeps the old state until the user changes
+    it; teams-lite tracks whether the newest request failed instead. It never sends a state nobody
+    asked for. (c) A press made before any door exists is owed and delivered when one appears —
+    on the answer or on a `conversationUpdate` — where the client queues it only until the
+    start/join response; a door arriving later on a frame is the same press with somewhere to go.
+    (d) The settings note said "other windows keep their own"; a window is not a backend, so it
+    says each INSTALL does. The live driver's reading moved into `web/scripts/mute-digest.ts`
+    because the automation guard rightly refuses to run a test that imports the driver itself.
+23. **An independent review of the M3 implementation (three reviewers, a skeptic per
+    dimension) confirmed six findings; all are fixed.** The one that changed the protocol: § 4.7's
+    body note — "E is `latestEndpointState`, which the start body never sets", so the join's
+    `endpointProperties` were dropped — is wrong. `startOrJoinCall` does
+    `e.endpointState&&(this.latestEndpointState=e.endpointState)` (@1375434), and both start shapes
+    build those options with `configureEndpointStateForStartOrJoin` (@1252073), which returns
+    `{endpointStateSequenceNumber, endpointProperties:{additionalEndpointProperties}}`; teams-lite's
+    own place and join bodies carry exactly that. So the client's first mute publish re-sends the
+    `endpointProperties`, and a first publish over an empty state could have erased the report
+    mode the join declared. A call this app places or joins is now seeded with the start body's
+    `endpointState`; an answered incoming call, which never goes through `startOrJoinCall`, is not.
+    The rest: the default option was labelled "Measured" over a flow that never was; the row was a
+    `role="radio"` group with no arrow keys (now pressed buttons, the app's convention); the
+    `--toggle-mute` verdict passed on ANY endpoint unmuting at ANY moment, a colleague included
+    (now judged against the moments of the presses, and never after a press that did not land); a
+    test's doc comment sat on the wrong test; and AGENTS.md sent the reader to the released build's
+    journal for a line its launcher writes to `/tmp/teams-lite-server-19422.log`. Taken although
+    refuted as defects: `call_protocol_set` no longer holds the calling plane's lock across the
+    store write (a dedicated turn, `CALL_PROTOCOL_WRITE`, keeps the store and the plane in step
+    instead), and the source scan now reads `endpoint_state_door`, the function that picks the door.
+    Refuted and left: re-sending a failed publish from the owed path — a failed publish is mended by
+    the user's next press, as in the client, and the doc of `owed_endpoint_state` now says so.
+    A mutation pass (35 deliberate breakages of the rules above) found two test gaps, both closed:
+    an OLDER publish failing after the newest succeeded was never tested in that order, and the
+    row drawing its own memory of a press passed because a retrying assertion waited the press out.
 
 **What was rejected or changed, and why:**
 - **Hard-coding a target in every calling example.** Rejected: the sanctioned

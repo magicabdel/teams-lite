@@ -15,6 +15,7 @@ import { cn } from "~/lib/utils";
 import { Button } from "./ui/button";
 import { useAppState, useController } from "./controller-context";
 import { FadeArc } from "./loading-ui/fade-arc";
+import { CallingProtocolSettings } from "./calling-protocol-settings";
 
 /**
  * The two things the user can do to the app itself: ask whether a newer build exists, and
@@ -56,13 +57,15 @@ export function MaintenanceSettings() {
           <h3 className="text-[15px] font-medium text-foreground">This app</h3>
           <p className="text-[13px] text-text-faint">
             The app itself, rather than your Teams account: whether a newer build has been
-            published, and the backend this page talks to.
+            published, the backend this page talks to, and how that backend's calls speak to
+            Teams.
           </p>
         </div>
       </div>
 
       <UpdateCheckRow />
       <RestartRow />
+      <CallingProtocolSettings />
     </section>
   );
 }

@@ -154,6 +154,7 @@ import {
   type CallHangupIntent,
   type CallMediaSignal,
   type CallMicrophone,
+  type CallProtocol,
   type CallStatus,
   type MeetingAddress,
   type PendingMute,
@@ -7607,6 +7608,20 @@ export class TeamsController {
   async restartBackend(force: boolean): Promise<BackendRestartResult> {
     try {
       return await this.backend.restartBackend(force);
+    } catch (e) {
+      playCue("error");
+      throw e;
+    }
+  }
+
+  /** Choose how this backend's calls speak to Teams — Settings › This app › Calling protocol.
+   *
+   *  Nothing is set on the store: the backend tells every page through `call_state`, which is
+   *  where the row reads the choice from, so two open windows agree and a refusal leaves the
+   *  old choice on screen. A refused request sounds, like every other refused setting. */
+  async setCallProtocol(changes: Partial<CallProtocol>): Promise<CallProtocol> {
+    try {
+      return (await this.backend.callProtocolSet(changes)).protocol;
     } catch (e) {
       playCue("error");
       throw e;

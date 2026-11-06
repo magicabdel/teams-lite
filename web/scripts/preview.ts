@@ -5843,8 +5843,22 @@ if (import.meta.main) {
         await shot(`${out}-armed-dark.png`, element ?? section);
         await setTheme("light");
         await emit({ kind: "maintenance", reset: true });
+
+        // The calling PROTOCOL row (calling-protocol-settings.tsx), with the experimental choice
+        // made, so the checked state the eye has to find is on the option that is not the
+        // default. Put back afterwards: one mock process serves the whole run.
+        const protocol = '[data-testid="calling-protocol"]';
+        await page.locator(protocol).scrollIntoViewIfNeeded();
+        await page.locator('[data-testid="calling-protocol-mute-endpoint-state"]').click();
+        await page.waitForSelector('[data-testid="calling-protocol-mute"][data-value="endpoint-state"]');
+        await shot(`${out}-calling-protocol-light.png`, element ?? protocol);
+        await setTheme("dark");
+        await shot(`${out}-calling-protocol-dark.png`, element ?? protocol);
+        await setTheme("light");
+        await emit({ kind: "call_invite", reset: true });
         console.log(
-          `[preview] wrote ${out}-{light,dark,checked-light,armed-light,armed-dark}.png`,
+          `[preview] wrote ${out}-{light,dark,checked-light,armed-light,armed-dark,` +
+            `calling-protocol-light,calling-protocol-dark}.png`,
         );
       },
       { deviceScaleFactor: dpr },

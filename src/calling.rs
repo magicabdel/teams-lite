@@ -444,6 +444,49 @@ impl Links {
         self.get(&["unmute"])
     }
 
+    /// Where the user's own endpoint state — whether they are muted — is published, the way
+    /// the client publishes it (see [`endpoint_state_payload`]). A CONVERSATION door: it is
+    /// read off [`ConversationLeg`] first, and off this merged table only where no conversation
+    /// was read.
+    pub fn update_endpoint_state(&self) -> Option<&str> {
+        self.get(&["updateEndpointState"])
+    }
+
+    /// The links of ONE object — its own top-level `links` and nothing nested under it —
+    /// with the same URL-only filter [`Links::collect`] applies.
+    ///
+    /// It is what a conversation's doors are read with, because the client reads them so
+    /// (`this.links[I.LINKS.LEAVE]=e.links.leave`, one level): a `leave` nested under the
+    /// call leg or a sharing session is a different door with the same name, and
+    /// [`Links::collect`], which lets the deepest one win, would hand it over.
+    pub fn top_level(object: &Value) -> Self {
+        let mut map = BTreeMap::new();
+        if let Some(links) = object.get("links").and_then(Value::as_object) {
+            for (name, url) in links {
+                if let Some(url) = url.as_str()
+                    && url.starts_with("http")
+                {
+                    map.insert(name.clone(), url.to_string());
+                }
+            }
+        }
+        Self(map)
+    }
+
+    /// These links minus every one whose URL starts with `prefix` — this call's own callback
+    /// surl.
+    ///
+    /// The service echoes the callbacks this app published back inside the objects it
+    /// answers with (`conversationRequest.links` carries `conversationUpdate`, and so on), and
+    /// a door is somewhere this app POSTs to: posting a mute to our own trouter address would
+    /// send it to ourselves and tell the meeting nothing. An empty prefix filters nothing.
+    pub fn without_prefix(&self, prefix: &str) -> Self {
+        if prefix.is_empty() {
+            return self.clone();
+        }
+        Self(self.0.iter().filter(|(_, url)| !url.starts_with(prefix)).map(|(k, v)| (k.clone(), v.clone())).collect())
+    }
+
     /// Merge newer links over these. Every frame may refresh them, and a link the
     /// new frame does not mention stays valid.
     pub fn merge(&mut self, other: &Links) {
@@ -1558,6 +1601,24 @@ impl ConversationDoors {
 /// Read the [`ConversationDoors`] of an answer or a frame, or `None` when it holds no
 /// conversation object with links.
 pub fn conversation_doors(body: &Value) -> Option<ConversationDoors> {
+    let (source, object) = conversation_object(body)?;
+    let links = object.get("links")?.as_object()?;
+    Some(ConversationDoors { source, links: sorted_keys(links) })
+}
+
+/// The CONVERSATION object an answer or a frame carries, and where it was found — the one
+/// place that says where to look, read by the journal ([`conversation_doors`]) and by the doors
+/// a call posts to ([`ConversationLeg::from_response`]) alike, so the two cannot disagree about
+/// which object a body's doors are.
+///
+/// Three places, first match wins: a `conversationUpdate` key (a frame wrapped the way the
+/// trouter wraps one), an attach answer's `/additionalActionResponses/0/output` (the join that
+/// rides an attach, docs/calling-roadmap/incoming-and-conversation.md § 4.3), and the body
+/// itself — which is what the place and join answers are, and what the client reads a
+/// `conversationUpdate` frame as (`handleConversationUpdate`: `const t=e.body`). An object
+/// counts only when it carries a top-level `links` OBJECT: the client reads `e.links.leave`
+/// unguarded, so a conversation object without one is not a shape it handles.
+fn conversation_object(body: &Value) -> Option<(&'static str, &Value)> {
     let decoded = body.get("_decoded").unwrap_or(body);
     let candidates: [(&'static str, Option<&Value>); 3] = [
         ("conversationUpdate", decoded.get("conversationUpdate")),
@@ -1565,8 +1626,266 @@ pub fn conversation_doors(body: &Value) -> Option<ConversationDoors> {
         ("conversation", Some(decoded)),
     ];
     candidates.into_iter().find_map(|(source, object)| {
-        let links = object?.get("links")?.as_object()?;
-        Some(ConversationDoors { source, links: sorted_keys(links) })
+        let object = object?;
+        object.get("links")?.as_object()?;
+        Some((source, object))
+    })
+}
+
+/// The CONVERSATION leg of a call: the doors its conversation object names, and how new that
+/// object was.
+///
+/// The client keeps these apart from the call leg's, and REPLACES them wholesale on every
+/// conversation object it applies (`processConversationServiceUpdate`:
+/// `this.links[I.LINKS.UNMUTE]=e.links.unmute||null`, and so on for every door) — which is how a
+/// withdrawn door stops being offered. `CallSession.links` cannot do that: it MERGES, and a link
+/// it once held stays for the life of the call. So this is a second table, built from the
+/// object's TOP-LEVEL `links` only and replaced whole, and the doors that belong to the
+/// conversation are read off it: `updateEndpointState` (where the mute is published),
+/// `leave`, `mute` and `unmute`.
+///
+/// It is the structure docs/calling-roadmap/meeting-awareness.md § 4.1 rule 4 calls
+/// `conversation_links`, and it is learned for EVERY call kind: an incoming 1:1 needs its
+/// `leave` as much as a meeting needs its `unmute`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationLeg {
+    /// The conversation's own URL, when the object named one.
+    pub controller: Option<String>,
+    /// The object's top-level doors, minus anything on this call's own callback surl.
+    pub links: Links,
+    /// The object's `sequenceNumber`, or -1 when it carried none — the client's own reading
+    /// (`a=e.sequenceNumber>=0?e.sequenceNumber:-1`).
+    pub sequence_number: i64,
+    /// What the service says the conversation is (`state`), as sent; `Null` when absent.
+    pub state: Value,
+}
+
+impl ConversationLeg {
+    /// Read the conversation leg out of an answer or a frame, or `None` when it carries no
+    /// conversation object (see [`conversation_object`]). `own_surl` is this call's callback
+    /// surl: a link on it is one of ours echoed back, never a door (see
+    /// [`Links::without_prefix`]).
+    pub fn from_response(body: &Value, own_surl: &str) -> Option<Self> {
+        let (_, object) = conversation_object(body)?;
+        let sequence_number = object
+            .get("sequenceNumber")
+            .and_then(|n| n.as_i64().or_else(|| n.as_str().and_then(|s| s.trim().parse().ok())))
+            .filter(|n| *n >= 0)
+            .unwrap_or(-1);
+        Some(Self {
+            controller: object.get("conversationController").and_then(Value::as_str).map(String::from),
+            links: Links::top_level(object).without_prefix(own_surl),
+            sequence_number,
+            state: object.get("state").cloned().unwrap_or(Value::Null),
+        })
+    }
+
+    /// Apply a newer object over this one, under the client's sequence gate: an object whose
+    /// sequence is BELOW the last one applied is ignored, and anything else replaces this leg
+    /// whole — doors and all. Returns whether it was applied.
+    ///
+    /// Equal is applied, and an object with no number reads as -1, exactly as the client reads
+    /// them (`if(s&&a<this.updateSequenceNumber)…return`): so a frame with no number is ignored
+    /// once a numbered one has been applied, and two unnumbered ones apply in arrival order.
+    pub fn apply(&mut self, newer: ConversationLeg) -> bool {
+        if newer.sequence_number < self.sequence_number {
+            return false;
+        }
+        *self = newer;
+        true
+    }
+
+    /// Where the user's own mute is published (see [`endpoint_state_payload`]).
+    pub fn update_endpoint_state(&self) -> Option<&str> {
+        self.links.update_endpoint_state()
+    }
+
+    /// Where this participant LEAVES the conversation — the door an answered incoming call is
+    /// ended on so the caller is told (docs/calling-roadmap/incoming-and-conversation.md § 4.6).
+    pub fn leave(&self) -> Option<&str> {
+        self.links.get(&["leave"])
+    }
+
+    /// A SERVER mute of the participants it names — never the user's own toggle.
+    pub fn mute(&self) -> Option<&str> {
+        self.links.mute()
+    }
+
+    /// Where a participant the organizer muted asks to be heard again (§ 4.9).
+    pub fn unmute(&self) -> Option<&str> {
+        self.links.unmute()
+    }
+}
+
+/// The settings key a backend keeps its [`CallProtocol`] under: one per PORT, because the two
+/// send-capable installs on one machine share one store, and the whole point of a per-backend
+/// setting is that the released build can try a protocol while the staged one keeps this app's
+/// existing flow (docs/calling-roadmap/incoming-and-conversation.md § 6).
+pub fn call_protocol_setting_key(port: u16) -> String {
+    format!("calling_protocol:{port}")
+}
+
+/// How this machine's calls speak to Teams, where it has a choice between the flow this app has
+/// always used and the one the Teams web client uses.
+///
+/// Every protocol change in docs/calling-roadmap/incoming-and-conversation.md sits behind a
+/// field here, OFF by default, flipped by the user in Settings (`call_protocol_set`, a
+/// write-token method) — never by an environment variable, which tooling could set. A call
+/// keeps the protocol it started with, so a change applies from the next call.
+///
+/// It holds one field today. The others the roadmap names (`incoming`, `keepalive`, and
+/// meeting-awareness's `server_mute`) join it in the milestone that gives them something to
+/// switch: a choice that changes nothing reads as a bug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CallProtocol {
+    /// How the user's own mute is published to the call.
+    pub mute: MuteProtocol,
+}
+
+/// Where the user's own mute is published.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MuteProtocol {
+    /// `{muteUnmute: {…, scope: "Myself"}}` to the call's `mute` / `unmute` link — what this app
+    /// has always sent. Unmeasured, and not the client's toggle; kept as the default because it
+    /// is what every install runs today.
+    #[default]
+    Legacy,
+    /// The client's own toggle: `{from, endpointState: {state: {isMuted}, …}}` to the
+    /// conversation's `updateEndpointState` (see [`endpoint_state_payload`]), and never the
+    /// `mute` link, which is a SERVER mute of the participants it names.
+    EndpointState,
+}
+
+impl MuteProtocol {
+    /// Every word the setting takes, in the order the page offers them.
+    pub const WORDS: [&'static str; 2] = ["legacy", "endpoint-state"];
+
+    pub fn word(self) -> &'static str {
+        match self {
+            MuteProtocol::Legacy => "legacy",
+            MuteProtocol::EndpointState => "endpoint-state",
+        }
+    }
+
+    pub fn from_word(word: &str) -> Option<Self> {
+        match word {
+            "legacy" => Some(MuteProtocol::Legacy),
+            "endpoint-state" => Some(MuteProtocol::EndpointState),
+            _ => None,
+        }
+    }
+}
+
+impl CallProtocol {
+    /// Read the stored value. Absent, unreadable, or a word this build does not know — each
+    /// field on its own — reads as that field's default: this app's existing flow is what
+    /// an unrecognised value falls back to, and a key a NEWER build stored is ignored rather than
+    /// fatal, because the two installs on one machine may be different builds.
+    pub fn from_stored(raw: Option<&str>) -> Self {
+        let stored: Value = raw.and_then(|raw| serde_json::from_str(raw).ok()).unwrap_or(Value::Null);
+        Self {
+            mute: stored
+                .get("mute")
+                .and_then(Value::as_str)
+                .and_then(MuteProtocol::from_word)
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The shape it is stored in and stated in: `{"mute": "legacy"}`.
+    pub fn json(self) -> Value {
+        json!({ "mute": self.mute.word() })
+    }
+
+    /// This protocol with the changes an RPC asked for. Every key must be one this build knows
+    /// and every value one of that key's words — a typo that silently changed nothing would
+    /// leave the user believing a protocol is in force that is not. `write_token` is the write
+    /// lock's own and is ignored.
+    pub fn with_changes(self, params: &Value) -> Result<Self> {
+        let mut next = self;
+        let Some(params) = params.as_object() else {
+            return Ok(next);
+        };
+        for (key, value) in params {
+            match key.as_str() {
+                "write_token" => {}
+                "mute" => {
+                    let word = value.as_str().unwrap_or_default();
+                    next.mute = MuteProtocol::from_word(word).with_context(|| {
+                        format!(
+                            "call_protocol_set: `mute` must be one of {:?}",
+                            MuteProtocol::WORDS
+                        )
+                    })?;
+                }
+                other => anyhow::bail!("call_protocol_set: this backend does not know `{other}`"),
+            }
+        }
+        Ok(next)
+    }
+}
+
+/// The `endpointState` a call this app STARTS — places, or joins — declares in its start body:
+/// sequence 0, and how much of itself the endpoint shows in a report.
+///
+/// Spelled once, because it is read twice: the place and join bodies send it, and it is what a
+/// call they start publishes its mute ON TOP OF. The client's `startOrJoinCall` stores the
+/// options' `endpointState` as `latestEndpointState`
+/// (`e.endpointState&&(this.latestEndpointState=e.endpointState)`), and both start shapes build
+/// those options with `configureEndpointStateForStartOrJoin`, which returns this object whenever
+/// `additionalEndpointProperties` is given — so the client's first mute publish re-sends the
+/// `endpointProperties` too. An answered INCOMING call never goes through `startOrJoinCall` and
+/// starts from nothing. The captured value is the only one this app has seen a service accept.
+pub fn start_endpoint_state() -> Value {
+    json!({
+        "endpointStateSequenceNumber": 0,
+        "endpointProperties": {
+            "additionalEndpointProperties": { "infoShownInReportMode": "FullInformation" }
+        }
+    })
+}
+
+/// The `endpointState` the next mute publish carries: the last one this leg published, its mute
+/// replaced, and the next sequence number.
+///
+/// It is the client's own `m={...E,...a,endpointStateSequenceNumber:++this.endpointStateSequenceNumber}`
+/// (`updateEndpointState`), where `E` is `latestEndpointState`: for a call this app placed or
+/// joined, the start body's own [`start_endpoint_state`], and for an answered incoming call
+/// nothing. The spread is SHALLOW: `state` is replaced whole by `{isMuted}`, and every other key
+/// the last publish held — the start body's `endpointProperties` included — travels again.
+pub fn next_endpoint_state(
+    previous: &serde_json::Map<String, Value>,
+    muted: bool,
+    sequence: u64,
+) -> serde_json::Map<String, Value> {
+    let mut next = previous.clone();
+    next.insert("state".into(), json!({ "isMuted": muted }));
+    next.insert("endpointStateSequenceNumber".into(), json!(sequence));
+    next
+}
+
+/// Whether an `endpointState` says muted — the client's own reading
+/// (`shouldUpdateEndpointState`: `o.state&&o.state.isMuted?1:0`), so an endpoint state that says
+/// nothing about it reads as NOT muted. That is what makes the first Unmute of a call, before
+/// any Mute, "nothing new to send".
+pub fn endpoint_state_is_muted(state: &serde_json::Map<String, Value>) -> bool {
+    state.get("state").and_then(|s| s.get("isMuted")).is_some_and(|m| m.as_bool().unwrap_or(false))
+}
+
+/// Build the body that publishes the user's own mute: the client's `uG` for a mute, which is
+/// `{from, endpointState}` and nothing else (no `captchaContent`, no `publishedStates`, no async
+/// links — each of those is a different request the client folds into the same builder).
+///
+/// It goes to the conversation's `updateEndpointState` (see [`ConversationLeg`]). It publishes
+/// the one fact the user's own press decided — whether they can be heard — and the meeting draws
+/// it as the crossed-out microphone beside their name.
+pub fn endpoint_state_payload(
+    local: &LocalParticipant,
+    endpoint_state: &serde_json::Map<String, Value>,
+) -> Value {
+    json!({
+        "from": local.json(),
+        "endpointState": endpoint_state,
     })
 }
 
@@ -1669,12 +1988,7 @@ pub fn invitation_payload(
         "endpointCapabilities": CAPTURED_ENDPOINT_CAPABILITIES,
         "clientEndpointCapabilities": CAPTURED_CLIENT_CAPABILITIES,
         "endpointMetadata": { "holographicCapabilities": 3 },
-        "endpointState": {
-            "endpointStateSequenceNumber": 0,
-            "endpointProperties": {
-                "additionalEndpointProperties": { "infoShownInReportMode": "FullInformation" }
-            }
-        },
+        "endpointState": start_endpoint_state(),
         "debugContent": { "causeId": callbacks.cause_id },
         // The thread the call belongs to. Without it the call exists but belongs
         // to no conversation, and nobody in the thread sees that it happened.
@@ -2199,12 +2513,7 @@ pub fn join_payload(
         "endpointMetadata": { "holographicCapabilities": 3 },
         // The client states how much of itself it shows in a report; the captured value
         // is the only one this app has seen a service accept.
-        "endpointState": {
-            "endpointStateSequenceNumber": 0,
-            "endpointProperties": {
-                "additionalEndpointProperties": { "infoShownInReportMode": "FullInformation" }
-            }
-        },
+        "endpointState": start_endpoint_state(),
         "debugContent": { "causeId": callbacks.cause_id },
     });
     // How the meeting is addressed, and it is one of two ways: a long link names the
@@ -2255,6 +2564,9 @@ pub struct JoinedConversation {
     /// What the service says this conversation is: `"scheduledMeeting"`, hostless or
     /// not, multi-party or not.
     pub state: Value,
+    /// The conversation's own doors, replaced rather than merged (see [`ConversationLeg`]).
+    /// `links` above is the merged table and is unchanged by it.
+    pub conversation: Option<ConversationLeg>,
     /// The whole answer, for the journal while the schema is still young.
     pub raw: Value,
 }
@@ -2281,6 +2593,7 @@ pub async fn join_meeting(
         controller: raw.get("conversationController").and_then(Value::as_str).map(String::from),
         links: Links::collect(&raw),
         state: raw.get("state").cloned().unwrap_or(Value::Null),
+        conversation: ConversationLeg::from_response(&raw, &callbacks.surl),
         raw,
     })
 }
@@ -2576,6 +2889,8 @@ pub struct PlacedCall {
     pub links: Links,
     /// The conversation the service created for this call, when it named one.
     pub conversation_url: Option<String>,
+    /// That conversation's own doors, replaced rather than merged (see [`ConversationLeg`]).
+    pub conversation: Option<ConversationLeg>,
     /// The whole response, for the journal while the schema is still young.
     pub raw: Value,
 }
@@ -2704,6 +3019,7 @@ pub async fn place_call(
             .iter()
             .find_map(|p| raw.pointer(p).and_then(Value::as_str))
             .map(String::from),
+        conversation: ConversationLeg::from_response(&raw, &callbacks.surl),
         raw,
     })
 }
@@ -3308,6 +3624,200 @@ mod tests {
         assert_eq!(conversation_doors(&json!({ "callInvitation": {} })), None);
     }
 
+    /// A conversation's doors are its OWN top-level `links`: a `leave` nested under the call leg
+    /// or a sharing session is a different door with the same name, and a link on this call's
+    /// own callback surl is one of ours echoed back. The sequence is the client's reading of it —
+    /// a number, a numeric string, or -1 for none or a negative one.
+    #[test]
+    fn a_conversation_leg_is_read_off_its_own_top_level_doors() {
+        let surl = callbacks().surl;
+        let answer = json!({
+            "conversationController": "https://cc/conv",
+            "sequenceNumber": 7,
+            "state": { "isMultiParty": true },
+            "links": {
+                "leave": "https://cc/conv/leave",
+                "updateEndpointState": "https://cc/conv/ues",
+                // Ours, echoed back: never a door.
+                "conversationUpdate": callbacks().link(paths::CONVERSATION_UPDATE),
+                // A flag, not a URL: never a door either.
+                "notificationLinks": { "x": 1 },
+            },
+            "callInvitation": { "links": { "leave": "https://cc/leg/leave" } },
+        });
+        let leg = ConversationLeg::from_response(&answer, &surl).expect("a conversation");
+        assert_eq!(leg.leave(), Some("https://cc/conv/leave"), "the call leg's leave leaked in");
+        assert_eq!(leg.update_endpoint_state(), Some("https://cc/conv/ues"));
+        assert_eq!(leg.links.names(), vec!["leave", "updateEndpointState"]);
+        assert_eq!(leg.sequence_number, 7);
+        assert_eq!(leg.controller.as_deref(), Some("https://cc/conv"));
+        assert_eq!(leg.state, json!({ "isMultiParty": true }));
+
+        for (sequence, read) in [(json!("12"), 12), (json!(-3), -1), (json!("soon"), -1), (Value::Null, -1)] {
+            let body = json!({ "sequenceNumber": sequence, "links": {} });
+            assert_eq!(ConversationLeg::from_response(&body, &surl).unwrap().sequence_number, read);
+        }
+
+        // Where it is looked for is where the journal looks: one rule, two readers.
+        let wrapped = json!({ "_decoded": { "conversationUpdate": { "links": { "unmute": "https://cc/u" } } } });
+        assert_eq!(ConversationLeg::from_response(&wrapped, &surl).unwrap().unmute(), Some("https://cc/u"));
+        let attach = json!({ "additionalActionResponses": [ { "output": { "links": { "leave": "https://cc/o" } } } ] });
+        assert_eq!(ConversationLeg::from_response(&attach, &surl).unwrap().leave(), Some("https://cc/o"));
+        // No top-level `links` object is no conversation, whatever is nested deeper.
+        assert_eq!(ConversationLeg::from_response(&json!({ "callAcceptance": { "links": { "leave": "https://x" } } }), &surl), None);
+        assert_eq!(ConversationLeg::from_response(&json!({ "links": "https://x" }), &surl), None);
+    }
+
+    /// The client REPLACES a conversation's doors on every object it applies, and ignores one
+    /// whose sequence is below the last applied — which is how a withdrawn `unmute` stops being
+    /// offered, and how an update that arrives late cannot bring it back.
+    #[test]
+    fn a_conversation_leg_is_replaced_whole_under_the_sequence_gate() {
+        let surl = callbacks().surl;
+        let leg = |sequence: Value, links: Value| {
+            ConversationLeg::from_response(&json!({ "sequenceNumber": sequence, "links": links }), &surl).unwrap()
+        };
+        let mut known = leg(json!(5), json!({ "unmute": "https://cc/unmute", "updateEndpointState": "https://cc/ues" }));
+
+        // Newer and without `unmute`: the door is withdrawn, not kept from the merge.
+        assert!(known.apply(leg(json!(6), json!({ "updateEndpointState": "https://cc/ues2" }))));
+        assert_eq!(known.unmute(), None, "a withdrawn door survived the update");
+        assert_eq!(known.update_endpoint_state(), Some("https://cc/ues2"));
+
+        // Older: ignored whole.
+        assert!(!known.apply(leg(json!(4), json!({ "unmute": "https://cc/old" }))));
+        assert_eq!((known.unmute(), known.sequence_number), (None, 6));
+        // Unnumbered, once a numbered one was applied: ignored, as the client reads it.
+        assert!(!known.apply(leg(Value::Null, json!({ "unmute": "https://cc/old" }))));
+        // Equal: applied.
+        assert!(known.apply(leg(json!(6), json!({ "leave": "https://cc/leave" }))));
+        assert_eq!(known.links.names(), vec!["leave"]);
+
+        // Two unnumbered objects apply in the order they arrive.
+        let mut unnumbered = leg(Value::Null, json!({ "leave": "https://cc/a" }));
+        assert!(unnumbered.apply(leg(Value::Null, json!({ "leave": "https://cc/b" }))));
+        assert_eq!(unnumbered.leave(), Some("https://cc/b"));
+    }
+
+    /// The mute is published as the client's own `updateEndpointState`: `{from, endpointState}`
+    /// with nothing else, the endpoint state being the last one published with its `state`
+    /// replaced and the next sequence — 1 on the first publish, because the start body never
+    /// sets it.
+    #[test]
+    fn the_mute_is_published_as_the_clients_own_endpoint_state() {
+        let first = next_endpoint_state(&serde_json::Map::new(), true, 1);
+        assert_eq!(
+            Value::Object(first.clone()),
+            json!({ "state": { "isMuted": true }, "endpointStateSequenceNumber": 1 })
+        );
+        let body = endpoint_state_payload(&local(), &first);
+        assert_eq!(
+            body,
+            json!({
+                "from": {
+                    "id": "8:orgid:me", "displayName": "Me", "endpointId": "endpoint-1",
+                    "participantId": "participant-1", "languageId": "en-us",
+                },
+                "endpointState": { "state": { "isMuted": true }, "endpointStateSequenceNumber": 1 },
+            })
+        );
+
+        // The spread is SHALLOW: every other key the last publish held travels again, `state` is
+        // replaced whole, and the sequence is the new one.
+        let mut held = first.clone();
+        held.insert("endpointProperties".into(), json!({ "preheatProperties": 0 }));
+        held.insert("state".into(), json!({ "isMuted": true, "other": 1 }));
+        let second = next_endpoint_state(&held, false, 2);
+        assert_eq!(
+            Value::Object(second),
+            json!({
+                "endpointProperties": { "preheatProperties": 0 },
+                "state": { "isMuted": false },
+                "endpointStateSequenceNumber": 2,
+            })
+        );
+    }
+
+    /// A call this app STARTS publishes its mute on top of the endpoint state its start body
+    /// declared, as the client's `startOrJoinCall` seeds `latestEndpointState` — so the first
+    /// publish re-sends the `endpointProperties`, at sequence 1. The place and join bodies send
+    /// that very object, spelled once.
+    #[test]
+    fn a_started_calls_first_mute_carries_what_its_start_body_declared() {
+        let seed = start_endpoint_state();
+        let first = next_endpoint_state(seed.as_object().unwrap(), true, 1);
+        assert_eq!(
+            Value::Object(first),
+            json!({
+                "endpointStateSequenceNumber": 1,
+                "endpointProperties": {
+                    "additionalEndpointProperties": { "infoShownInReportMode": "FullInformation" }
+                },
+                "state": { "isMuted": true },
+            })
+        );
+        assert!(!endpoint_state_is_muted(seed.as_object().unwrap()), "the seed reads as unmuted");
+        let meeting = MeetingJoin::from_join_url(
+            "https://teams.microsoft.com/l/meetup-join/19%3ameeting_x%40thread.v2/0",
+        )
+        .unwrap();
+        let offer = MediaContent::sdp("v=0\r\n");
+        assert_eq!(join_payload(&local(), &meeting, &callbacks(), Some(&offer))["endpointState"], seed);
+        assert_eq!(
+            invitation_payload(&local(), &["8:orgid:her".into()], None, &offer, &callbacks())["endpointState"],
+            seed
+        );
+    }
+
+    /// The client reads `state.isMuted` loosely: an endpoint state that says nothing about it
+    /// is NOT muted, which is what makes a first Unmute "nothing new to send".
+    #[test]
+    fn an_endpoint_state_that_says_nothing_reads_as_not_muted() {
+        let read = |v: Value| endpoint_state_is_muted(v.as_object().unwrap());
+        assert!(!read(json!({})));
+        assert!(!read(json!({ "state": {} })));
+        assert!(!read(json!({ "state": { "isMuted": "yes" } })));
+        assert!(!read(json!({ "state": { "isMuted": false } })));
+        assert!(read(json!({ "state": { "isMuted": true } })));
+    }
+
+    /// The protocol is this app's EXISTING flow unless the user said otherwise: absent, unreadable, or a
+    /// word this build does not know reads as the default, field by field, and a key a newer build
+    /// stored is ignored. The RPC is stricter, because a typo that changed nothing would leave the
+    /// user believing a protocol is in force that is not.
+    #[test]
+    fn the_calling_protocol_reads_as_measured_unless_told_otherwise() {
+        for stored in [None, Some(""), Some("not json"), Some("[]"), Some(r#"{"mute":"loud"}"#), Some(r#"{"mute":1}"#)] {
+            assert_eq!(CallProtocol::from_stored(stored), CallProtocol::default(), "{stored:?}");
+        }
+        assert_eq!(CallProtocol::default().mute, MuteProtocol::Legacy);
+        let stored = CallProtocol::from_stored(Some(r#"{"mute":"endpoint-state","incoming":"ring"}"#));
+        assert_eq!(stored.mute, MuteProtocol::EndpointState);
+        assert_eq!(stored.json(), json!({ "mute": "endpoint-state" }));
+        assert_eq!(CallProtocol::from_stored(Some(&stored.json().to_string())), stored);
+        for word in MuteProtocol::WORDS {
+            assert_eq!(MuteProtocol::from_word(word).unwrap().word(), word);
+        }
+
+        let base = CallProtocol::default();
+        let set = |params: Value| base.with_changes(&params);
+        assert_eq!(set(json!({})).unwrap(), base);
+        assert_eq!(set(json!({ "write_token": "t", "mute": "endpoint-state" })).unwrap().mute, MuteProtocol::EndpointState);
+        let refused = format!("{:#}", set(json!({ "mute": "loud" })).unwrap_err());
+        assert!(refused.contains("`mute` must be one of"), "{refused}");
+        let refused = format!("{:#}", set(json!({ "incoming": "ring" })).unwrap_err());
+        assert!(refused.contains("does not know `incoming`"), "{refused}");
+        assert_eq!(format!("{:#}", set(json!({ "mute": true })).unwrap_err()).contains("must be one of"), true);
+    }
+
+    /// The setting is one per BACKEND, keyed by its port, so the released build may try a
+    /// protocol while the staged one keeps the existing one on one shared store.
+    #[test]
+    fn the_calling_protocol_is_kept_per_port() {
+        assert_eq!(call_protocol_setting_key(19422), "calling_protocol:19422");
+        assert_ne!(call_protocol_setting_key(19420), call_protocol_setting_key(19422));
+    }
+
     #[test]
     fn a_frame_nothing_acts_on_is_named_by_its_keys() {
         assert_eq!(
@@ -3378,6 +3888,37 @@ mod tests {
             "web/src/lib/call.ts must name {END_REASON_LEFT_RINGING}, or a ring the user let go \
              is reported as \"The call ended.\""
         );
+    }
+
+    /// The page's type, the mock's refusal list and the Settings row's options name exactly the
+    /// backend's `MuteProtocol` words, in its order: a word the page does not know is a protocol
+    /// it cannot show, and a word the mock accepts that the backend refuses is a test that passes
+    /// over a refusal the user would meet.
+    #[test]
+    fn the_page_and_the_mock_know_the_mute_protocol_words() {
+        // The page's TYPE, and only the type: the words are quoted in doc comments too, so a
+        // scan of the whole file would pass with a word dropped from the one place that decides
+        // what the page accepts.
+        let members = |source: &str, declaration: &str, end: char| -> Vec<String> {
+            let start = source.find(declaration).unwrap_or_else(|| panic!("{declaration}"));
+            let body = &source[start + declaration.len()..];
+            let body = &body[..body.find(end).expect("the declaration ends")];
+            body.split(['|', ','])
+                .map(|m| m.trim().trim_matches('"').to_string())
+                .filter(|m| !m.is_empty() && !m.starts_with('['))
+                .collect()
+        };
+        let words: Vec<String> = MuteProtocol::WORDS.iter().map(|w| w.to_string()).collect();
+        let page = include_str!("../web/src/lib/call.ts");
+        assert_eq!(members(page, "export type MuteProtocol =", ';'), words, "web/src/lib/call.ts");
+        let mock = include_str!("../web/mock/server.ts");
+        let mock_words = members(mock, "const MOCK_MUTE_PROTOCOLS = [", ']');
+        assert_eq!(mock_words, words, "web/mock/server.ts must refuse exactly what the backend refuses");
+        // And the row offers every word, in the backend's order.
+        let row = include_str!("../web/src/lib/calling-protocol.ts");
+        let offered: Vec<usize> =
+            words.iter().map(|w| row.find(&format!("value: \"{w}\"")).expect(w)).collect();
+        assert!(offered.windows(2).all(|pair| pair[0] < pair[1]), "the row's order is not the backend's");
     }
 
     /// The same contract for every ending a RING can have and for one nobody answered: each
@@ -4080,7 +4621,9 @@ mod tests {
         // And every body builder really has the shape the guard matches it by: a public function
         // that answers a bare `Value` is a body, so it ends in `_payload` — or it is a FRAGMENT
         // that only ever travels inside one, which reaches nobody on its own.
-        const FRAGMENTS: &[&str] = &["media_controller_content"];
+        // `start_endpoint_state` is the `endpointState` the place and join bodies carry, and the
+        // seed a call they start publishes its mute over — it never travels on its own.
+        const FRAGMENTS: &[&str] = &["media_controller_content", "start_endpoint_state"];
         let mut bodies = 0;
         for at in code.match_indices("\npub fn ").map(|(at, _)| at + "\npub fn ".len()) {
             let signature = code[at..].split('{').next().unwrap_or_default();
@@ -4125,6 +4668,7 @@ mod tests {
             ("hangup", hangup_payload(&local())),
             ("rejection", rejection_payload(&local())),
             ("mute", mute_payload(&local(), true)),
+            ("endpoint state", endpoint_state_payload(&local(), &next_endpoint_state(&serde_json::Map::new(), true, 1))),
         ];
         for (what, body) in bodies {
             assert!(

@@ -121,6 +121,11 @@ code), **inferred** (neither).
      passes the gate, and it replaces the previous set wholesale. That is how the client makes a
      withdrawn `unmute` take effect. `CallSession.links` (the merged table everything POSTs from)
      is left exactly as it is. `conversation_links` is read only by § 4.6.
+     **As implemented** by incoming-and-conversation M3 (whoever landed first built it):
+     `calling::ConversationLeg` — `from_response`, the sequence-gated `apply`, and the `unmute()`
+     accessor § 4.6 reads — kept on the call as `CallSession.conversation.leg` and learned for
+     every call kind off the place and join answers and every `conversationUpdate` frame. This
+     workstream's "meetings only" rule keeps applying to the chat-thread and history fields.
 - **Bundle evidence (calling-pluginless.js):**
 
 ```text

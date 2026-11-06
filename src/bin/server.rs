@@ -456,6 +456,13 @@ const OUTWARD_METHODS: [&str; 23] = [
 /// `call_subscribe` ASKS the meeting's media server for somebody's stream and publishes
 /// nothing at all about the user — so it is not outward, and it is not open either: it acts
 /// on the one call this machine holds.
+/// `call_protocol_set` decides how this machine's calls speak to Teams — which door the
+/// user's mute is published on, and in later milestones how an incoming call is taken and
+/// whether a long call is kept alive (docs/calling-roadmap/incoming-and-conversation.md § 6).
+/// It posts nothing itself, but every later call publishes through what it chose, so a client
+/// that merely found this socket must not choose it. It replaces the environment switches
+/// round 1 of that design used: tooling cannot write a stored setting, and an auto-update's
+/// restart would have picked a unit drop-in up with nobody's step.
 ///
 /// `restart_backend` takes THIS process down and lets whatever runs it start it again (see
 /// [`teams_lite::restart`], and Settings › This app). It is the sibling of `update_apply`
@@ -495,7 +502,7 @@ const OUTWARD_METHODS: [&str; 23] = [
 /// four methods above serve that window — so it is gated as a sign-in is, and more than one: an
 /// enrollment registers a DEVICE in the user's organization, made as them, and nothing in this
 /// app takes a registration back.
-const MACHINE_METHODS: [&str; 46] = [
+const MACHINE_METHODS: [&str; 47] = [
     "repair_broker",
     "signin_start",
     "signin_frame",
@@ -518,6 +525,7 @@ const MACHINE_METHODS: [&str; 46] = [
     "chess_sound_forget",
     "call_prepare",
     "call_subscribe",
+    "call_protocol_set",
     "push_subscribe",
     "push_unsubscribe",
     "push_test",
@@ -715,6 +723,7 @@ fn machine_effect(method: &str) -> &'static str {
             "asks the meeting's media server to send this machine somebody's camera or \
              shared screen"
         }
+        "call_protocol_set" => "decides how this machine's calls speak to Teams",
         // Unreachable while the two lists agree; the test below pins that they do.
         _ => "changes this machine",
     }
@@ -2181,6 +2190,11 @@ struct CallingPlane {
     registration: Registration,
     /// Which frames the routing has already said something about (see [`FrameNotes`]).
     frame_notes: FrameNotes,
+    /// How this backend's calls speak to Teams, as the user set it in Settings
+    /// (`call_protocol_set`, stored per port — see [`calling::call_protocol_setting_key`]). Read
+    /// from the store at boot, and every call takes a copy when it enters the plane
+    /// ([`CallingPlane::admit`]).
+    protocol: calling::CallProtocol,
 }
 
 /// The kinds of frame the routing in `handle_call_frame` has already journaled, so the journal
@@ -2244,9 +2258,25 @@ impl CallingPlane {
         }
     }
 
+    /// Put `call` into the plane as THE call, with the protocol this backend is set to now.
+    ///
+    /// The one place a call enters, so "a call keeps the protocol it started with" is a fact
+    /// about every call rather than about the constructors that remembered it. Whether the slot
+    /// is free is the caller's to decide first: each path says no in its own words.
+    fn admit(&mut self, mut call: CallSession) {
+        call.conversation.protocol = self.protocol;
+        self.call = Some(call);
+    }
+
     /// Record one mute press on call `call_id`: the state every page reads, and the sequence
     /// that says which press it reflects. Returns what the press is published with — our own
-    /// participant, the door for this direction (when the call has one), and the new sequence.
+    /// participant, what to publish by the protocol the call started with, and the new sequence.
+    ///
+    /// Under the legacy protocol the publish is the call's own `mute` / `unmute` link. Under
+    /// `endpoint-state` it is the conversation's `updateEndpointState`, planned HERE — in the same
+    /// lock as the state — because the publish takes a sequence number, and two presses inside one
+    /// round trip must take theirs in the order they were pressed. Under it the `mute` link is
+    /// never named: that is a SERVER mute of the participants it lists, a different operation.
     ///
     /// The state moves whatever the service then answers: the window holding the microphone
     /// has already closed it for a mute, and the UI must never claim the user is live when they
@@ -2266,7 +2296,7 @@ impl CallingPlane {
         call_id: &str,
         muted: bool,
         if_seq: Option<u64>,
-    ) -> Result<(calling::LocalParticipant, Option<String>, u64)> {
+    ) -> Result<(calling::LocalParticipant, MutePublish, u64)> {
         let call = self
             .call
             .as_mut()
@@ -2280,8 +2310,74 @@ impl CallingPlane {
         }
         call.muted = muted;
         call.mute_seq += 1;
-        let url = if muted { call.links.mute() } else { call.links.unmute() };
-        Ok((call.local.clone(), url.map(str::to_string), call.mute_seq))
+        let publish = match call.conversation.protocol.mute {
+            calling::MuteProtocol::Legacy => {
+                let url = if muted { call.links.mute() } else { call.links.unmute() };
+                MutePublish::Legacy(url.map(str::to_string))
+            }
+            calling::MuteProtocol::EndpointState => {
+                let door = call.conversation.endpoint_state_door(&call.links, &call.callbacks.surl);
+                MutePublish::EndpointState(call.conversation.plan(muted, door, &call.local, true))
+            }
+        };
+        Ok((call.local.clone(), publish, call.mute_seq))
+    }
+
+    /// The mute publish call `call_id` OWES: a press made before its conversation named an
+    /// `updateEndpointState` door, now that one may be there — `None` when nothing is owed.
+    ///
+    /// The client queues a state asked for while connecting and sends it once the join is
+    /// answered (`handlePendingEndpointState`); this is that, for the answer or the
+    /// `conversationUpdate` that first names the door. It delivers the user's own press and
+    /// decides nothing: it sends only when the state last REQUESTED differs from the one the user
+    /// asked for — a press that found no door — and never for a call on the legacy protocol, which
+    /// has no such queue. A publish that was sent and failed is not re-sent from here: like the
+    /// client's, it is mended by the user's next press (see [`CallConversation::plan`]).
+    fn owed_endpoint_state(&mut self, call_id: &str) -> Option<(String, Value, u64)> {
+        let call = self.call.as_mut().filter(|c| c.id == call_id && !c.ended())?;
+        if call.conversation.protocol.mute != calling::MuteProtocol::EndpointState {
+            return None;
+        }
+        let door = call.conversation.endpoint_state_door(&call.links, &call.callbacks.surl);
+        match call.conversation.plan(call.muted, door, &call.local, false) {
+            EndpointStatePlan::Send { url, body, sequence } => Some((url, body, sequence)),
+            EndpointStatePlan::NoDoor | EndpointStatePlan::Holds => None,
+        }
+    }
+
+    /// One endpoint-state publish of call `call_id` came back — see [`CallConversation::settle`].
+    /// A call that has gone since settles nothing.
+    fn settle_endpoint_state(&mut self, call_id: &str, sequence: u64, accepted: bool) {
+        if let Some(call) = self.call.as_mut().filter(|c| c.id == call_id) {
+            call.conversation.settle(sequence, accepted);
+        }
+    }
+
+    /// Learn the conversation object `leg` for call `call_id`, under the client's sequence gate:
+    /// the first one is taken, and a later one replaces it only when it is not OLDER (see
+    /// [`calling::ConversationLeg::apply`]). Returns whether it was applied. A call that has ended
+    /// learns nothing.
+    fn learn_conversation(&mut self, call_id: &str, leg: calling::ConversationLeg) -> bool {
+        let Some(call) = self.call.as_mut().filter(|c| c.id == call_id && !c.ended()) else {
+            return false;
+        };
+        match call.conversation.leg.as_mut() {
+            None => {
+                call.conversation.leg = Some(leg);
+                true
+            }
+            Some(known) => {
+                let (older, newest) = (leg.sequence_number, known.sequence_number);
+                let applied = known.apply(leg);
+                if !applied {
+                    eprintln!(
+                        "[calling] a conversation object older than the one applied (sequence \
+                         {older} < {newest}) was ignored for its doors"
+                    );
+                }
+                applied
+            }
+        }
     }
 
     /// The channel a call may be built on RIGHT NOW: registered, and the socket up.
@@ -2423,6 +2519,22 @@ impl PlaneFacts {
     }
 }
 
+/// Serializes `call_protocol_set`: the one writer of `CallingPlane::protocol` after boot, so taking
+/// its presses one at a time is what keeps the stored value and the plane's in step without holding
+/// the plane's lock across a store write.
+static CALL_PROTOCOL_WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The [`calling::CallProtocol`] this backend's store holds for `port`, or the default — this
+/// app's existing flow — when there is none or the store cannot be read. A store that cannot be read
+/// is not a reason to speak a protocol nobody chose.
+fn stored_call_protocol(ctx: &Ctx, port: u16) -> calling::CallProtocol {
+    let raw = ctx
+        .store()
+        .ok()
+        .and_then(|store| store.get_setting(&calling::call_protocol_setting_key(port)).ok().flatten());
+    calling::CallProtocol::from_stored(raw.as_deref())
+}
+
 /// The `call_state` event and the `call_status` answer for one plane — pure, so its shape
 /// is pinned by a test rather than by a running backend.
 ///
@@ -2439,6 +2551,9 @@ fn call_state_json(plane: &CallingPlane, facts: PlaneFacts) -> Value {
         "call": plane.call.as_ref().map(CallSession::json),
         "registration": facts.available.then(|| plane.registration.json()),
         "backend_started_ms": facts.backend_started_ms,
+        // How a call this backend starts from now on speaks to Teams (Settings › This app ›
+        // Calling protocol). The call in flight states its own, which it kept from its start.
+        "protocol": plane.protocol.json(),
     })
 }
 
@@ -2623,6 +2738,122 @@ struct CallSession {
     /// presenter (measured 2026-08-06). It is `None` until the user shares, and it carries the
     /// way OUT, because a share that could not be given up is not a share this app would make.
     sharing: Option<calling::ContentSharing>,
+    /// The conversation leg's doors, the protocol this call started with, and what the last mute
+    /// publish on that leg said (see [`CallConversation`]).
+    conversation: CallConversation,
+}
+
+/// What a call publishes about the user on its CONVERSATION leg, and under which protocol.
+///
+/// Kept together because each half is read with the other: the protocol says whether the mute
+/// goes to the conversation's `updateEndpointState` at all, the leg says where that door is, and
+/// the endpoint state is what the last publish on it said.
+#[derive(Debug, Default)]
+struct CallConversation {
+    /// How this call speaks to Teams — the backend's setting at the moment the call entered the
+    /// plane ([`CallingPlane::admit`]). A call keeps the protocol it started with: a setting
+    /// changed mid-call applies from the next one, so one call never mixes two mute doors.
+    protocol: calling::CallProtocol,
+    /// The conversation's own doors, replaced under the sequence gate rather than merged (see
+    /// [`calling::ConversationLeg`]). `None` until an answer or a `conversationUpdate` names one.
+    leg: Option<calling::ConversationLeg>,
+    /// The `endpointState` the newest publish carried — the client's `latestEndpointState`, set
+    /// when a publish is SENT rather than when it is answered, exactly as the client sets it.
+    /// Before the first publish it is what the call's START body declared: the
+    /// [`calling::start_endpoint_state`] for a call this app placed or joined (see
+    /// [`CallConversation::started_here`]), nothing for an answered incoming one.
+    endpoint_state: serde_json::Map<String, Value>,
+    /// The client's `endpointStateSequenceNumber`: 0 in the start body, 1 on the first publish.
+    endpoint_state_sequence: u64,
+    /// Publishes sent and not yet answered. While one is out, a press that repeats the state it
+    /// carries is sent anyway — the client's `hasPendingRequest` exception — because the one in
+    /// flight may yet fail.
+    endpoint_state_in_flight: u32,
+    /// Whether the NEWEST publish (sequence == [`Self::endpoint_state_sequence`]) was refused or
+    /// lost. The service then holds an older state, so a press that repeats the newest one is
+    /// sent again rather than skipped — a press the client would skip, and the one place this
+    /// differs from it: there, a failed publish is only mended by the NEXT change.
+    endpoint_state_failed: bool,
+}
+
+impl CallConversation {
+    /// The conversation leg of a call this app STARTS — places, or joins. Its endpoint state
+    /// begins as the one the start body declared, because the client's `startOrJoinCall` seeds
+    /// `latestEndpointState` with it and its first mute publish re-sends every key of it
+    /// (docs/calling-roadmap/incoming-and-conversation.md § 13 note 23). Publishing on top of an
+    /// empty one would drop the `endpointProperties` the join declared.
+    fn started_here() -> Self {
+        let endpoint_state = match calling::start_endpoint_state() {
+            Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        Self { endpoint_state, ..Self::default() }
+    }
+
+    /// Where the mute is published: the conversation's door, or the merged table's where no
+    /// conversation was read — filtered of our own callbacks either way.
+    fn endpoint_state_door(&self, merged: &calling::Links, own_surl: &str) -> Option<String> {
+        match &self.leg {
+            Some(leg) => leg.update_endpoint_state().map(str::to_string),
+            None => merged.without_prefix(own_surl).update_endpoint_state().map(str::to_string),
+        }
+    }
+
+    /// Plan the publish of `muted`, and take its sequence when one is sent.
+    ///
+    /// `pressed` is a press of the user's own: it is answered even when nothing has to be sent.
+    /// Without it this is the OWED publish — a mute pressed before the conversation named a door,
+    /// delivered once it does (the client's `handlePendingEndpointState`) — which sends only when
+    /// the state the service holds differs from the one the user asked for.
+    fn plan(&mut self, muted: bool, door: Option<String>, local: &calling::LocalParticipant, pressed: bool) -> EndpointStatePlan {
+        let Some(url) = door else {
+            return EndpointStatePlan::NoDoor;
+        };
+        let holds = calling::endpoint_state_is_muted(&self.endpoint_state) == muted;
+        if holds && (!pressed || (self.endpoint_state_in_flight == 0 && !self.endpoint_state_failed)) {
+            // The service holds this state already, and nothing on its way may change that.
+            return EndpointStatePlan::Holds;
+        }
+        self.endpoint_state_sequence += 1;
+        self.endpoint_state =
+            calling::next_endpoint_state(&self.endpoint_state, muted, self.endpoint_state_sequence);
+        self.endpoint_state_in_flight += 1;
+        EndpointStatePlan::Send {
+            url,
+            body: calling::endpoint_state_payload(local, &self.endpoint_state),
+            sequence: self.endpoint_state_sequence,
+        }
+    }
+
+    /// One publish came back. Only the NEWEST one's outcome decides whether a repeat must be
+    /// sent again: an older one is superseded at the service by the higher sequence after it.
+    fn settle(&mut self, sequence: u64, accepted: bool) {
+        self.endpoint_state_in_flight = self.endpoint_state_in_flight.saturating_sub(1);
+        if sequence == self.endpoint_state_sequence {
+            self.endpoint_state_failed = !accepted;
+        }
+    }
+}
+
+/// What a mute press, or an owed publish, does on the conversation leg.
+#[derive(Debug, Clone, PartialEq)]
+enum EndpointStatePlan {
+    /// The call has no `updateEndpointState` yet. Nothing is posted; the state is owed, and is
+    /// published the moment an answer or a frame names the door.
+    NoDoor,
+    /// The service holds this state already (or will, from a publish still on its way).
+    Holds,
+    /// POST `body` to `url`; `sequence` settles it.
+    Send { url: String, body: Value, sequence: u64 },
+}
+
+/// What one accepted mute press publishes, by the protocol its call started with.
+#[derive(Debug, Clone, PartialEq)]
+enum MutePublish {
+    /// The legacy body to the call's own `mute` / `unmute` link, when it has one.
+    Legacy(Option<String>),
+    /// The client's toggle on the conversation's `updateEndpointState`.
+    EndpointState(EndpointStatePlan),
 }
 
 /// Who took a ring this machine was offered (see [`CallSession::ended_elsewhere`]).
@@ -2734,6 +2965,9 @@ impl CallSession {
             // Decided here because only this side knows whether the link exists.
             "can_send_media": self.phase == CallPhase::Connected
                 && self.links.media_renegotiation().is_some(),
+            // The protocol this call kept from its start, which a setting changed since does
+            // not move.
+            "protocol": self.conversation.protocol.json(),
         })
     }
 }
@@ -5228,6 +5462,9 @@ async fn serve() -> Result<()> {
         agent_runs_inflight: Arc::new(Mutex::new(std::collections::HashMap::new())),
         channel_layouts: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
+    // How this backend's calls speak to Teams, as the user last set it. Read once, before
+    // anything serves, so the first `call_state` a page reads already states it.
+    ctx.calling.lock().unwrap().protocol = stored_call_protocol(&ctx, own_port());
 
     // Watch the broker, and react once per CHANGE of state (see `observe_broker`).
     //
@@ -7757,6 +7994,30 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
         // it returns no SDP and no credentials — only what the UI has to draw.
         "call_status" => Ok(ctx.call_state_payload()),
 
+        // Decide how this backend's calls speak to Teams — Settings › This app › Calling
+        // protocol (docs/calling-roadmap/incoming-and-conversation.md § 6). A MACHINE method: it
+        // posts nothing, but every call this backend starts from now on publishes through what it
+        // chose. Stored per PORT, so the two installs on one machine keep their own, and applied
+        // from the NEXT call: a call keeps the protocol it started with (`CallingPlane::admit`).
+        //
+        // Two presses in flight together are taken ONE AT A TIME (`CALL_PROTOCOL_WRITE`), so they
+        // cannot leave the store saying one protocol and the plane another — and the calling
+        // plane's own lock is held for the read and for the assignment only, never across the
+        // store write: that lock is what every frame of a live call waits on, and a store busy
+        // with the other install's writes would stall the call for as long as it took.
+        "call_protocol_set" => {
+            let _turn = CALL_PROTOCOL_WRITE.lock().await;
+            let next = ctx.calling.lock().unwrap().protocol.with_changes(params)?;
+            ctx.store()?.set_setting(
+                &calling::call_protocol_setting_key(own_port()),
+                &next.json().to_string(),
+            )?;
+            ctx.calling.lock().unwrap().protocol = next;
+            eprintln!("[calling] calling protocol set: {} — it applies from the next call", next.json());
+            ctx.emit_call_state();
+            Ok(json!({ "protocol": next.json() }))
+        }
+
         // Everything the page needs to build one `RTCPeerConnection`, and the
         // reservation of the single call this machine holds.
         //
@@ -7834,6 +8095,7 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
                     source_request_sequence: 0,
                     sending: Vec::new(),
                     sharing: None,
+                    conversation: CallConversation::started_here(),
                 };
                 {
                     let mut plane = ctx.calling.lock().unwrap();
@@ -7842,7 +8104,7 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
                             "call_prepare: this machine is already in a call — leave it first"
                         );
                     }
-                    plane.call = Some(call);
+                    plane.admit(call);
                 }
                 ctx.emit_call_state();
                 return Ok(json!({
@@ -7989,6 +8251,7 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
                         source_request_sequence: 0,
                         sending: Vec::new(),
                         sharing: None,
+                        conversation: CallConversation::started_here(),
                     };
                     {
                         let mut plane = ctx.calling.lock().unwrap();
@@ -7997,7 +8260,7 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
                                 "call_prepare: this machine is already in a call — hang up first"
                             );
                         }
-                        plane.call = Some(call);
+                        plane.admit(call);
                     }
                     // The UI shows "calling…" from here, before the offer exists: the
                     // microphone prompt happens next and the user must see why.
@@ -8077,6 +8340,12 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
                         // to take it back.
                         ctx.hang_up_orphan("call_place", &local, &placed.links).await;
                         return Ok(json!({ "call_id": call_id, "cancelled": true }));
+                    }
+                    // The conversation the call was placed in, and its doors — after the call
+                    // is known to be held, so a mute pressed while the invite travelled is
+                    // published on the door the answer names.
+                    if let Some(leg) = placed.conversation.clone() {
+                        ctx.adopt_conversation(&call_id, leg);
                     }
                     ctx.emit_call_state();
                     Ok(json!({ "call_id": call_id, "links": placed.links.names() }))
@@ -8158,6 +8427,10 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
                 // carried (see `call_place`).
                 ctx.hang_up_orphan("call_join", &local, &joined.links).await;
                 return Ok(json!({ "call_id": call_id, "cancelled": true }));
+            }
+            // The meeting's own doors, replaced rather than merged (see `call_place`).
+            if let Some(leg) = joined.conversation.clone() {
+                ctx.adopt_conversation(&call_id, leg);
             }
             ctx.emit_call_state();
             // What the answer granted. `activeModalities.call` is the audio leg, and it
@@ -8824,16 +9097,39 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
             // The state and its sequence move in ONE lock, before the service is asked, and
             // every page is told at once: a mute pressed in one window is what closes the
             // microphone another window holds (see `CallingPlane::record_mute`).
-            let (local, url, mute_seq) =
+            //
+            // WHERE it is published is the protocol the call started with (see `MutePublish`):
+            // the legacy body to the call's own `mute` / `unmute` link, or the client's toggle on
+            // the conversation's `updateEndpointState`. Either way the microphone has already
+            // followed the press — a publish that fails changes nothing about who can hear the
+            // user, only what the meeting draws beside their name.
+            let (local, publish, mute_seq) =
                 ctx.calling.lock().unwrap().record_mute(&call_id, muted, if_seq)?;
             ctx.emit_call_state();
-            let told = match url {
-                Some(url) => ctx
+            let told = match publish {
+                MutePublish::Legacy(Some(url)) => ctx
                     .post_call_signal(&url, &calling::mute_payload(&local, muted))
                     .await
                     .inspect_err(|e| eprintln!("[calling] the mute did not reach the service: {e:#}"))
                     .is_ok(),
-                None => false,
+                MutePublish::Legacy(None) => false,
+                MutePublish::EndpointState(EndpointStatePlan::NoDoor) => {
+                    eprintln!(
+                        "[calling] the mute is owed: the conversation names no \
+                         updateEndpointState yet, so it is published once it does"
+                    );
+                    false
+                }
+                MutePublish::EndpointState(EndpointStatePlan::Holds) => {
+                    eprintln!(
+                        "[calling] the mute needs no publish: the conversation already holds \
+                         isMuted={muted}"
+                    );
+                    true
+                }
+                MutePublish::EndpointState(EndpointStatePlan::Send { url, body, sequence }) => {
+                    ctx.post_endpoint_state(&call_id, &url, &body, sequence).await
+                }
             };
             Ok(json!({ "call_id": call_id, "muted": muted, "mute_seq": mute_seq, "told_service": told }))
         }
@@ -15003,6 +15299,9 @@ impl Ctx {
             "[calling] registering as {} on {} (epid {epid})",
             endpoint.template_key, endpoint.allocate
         );
+        // Which protocol this backend's calls speak, once: it is per backend, so two installs
+        // on one machine may differ, and the journal is where a reader tells them apart.
+        eprintln!("[calling] calling protocol: {}", self.calling.lock().unwrap().protocol.json());
         // Before the connection exists, so nothing it reports can be overwritten by this.
         self.change_calling_plane(|plane| plane.registration = Registration::Connecting);
 
@@ -15164,16 +15463,20 @@ impl Ctx {
         //    6. sharing granted — likewise, and it returns before the merge: the session's own
         //       `leave` must never overwrite the one a hangup posts to.
         //    7. merge — the frame's links join the live call's; a call that has ended takes none.
-        //    8. invite failed — the cause of an ending, which arrives a beat before it.
-        //    9. end — after the cause it prefers.
-        //   10. roster
-        //   11. lobby
-        //   12. acknowledgement — before the phase and the answer, because its clock is the
+        //    8. conversation — a `conversationUpdate` REPLACES the call's conversation doors under
+        //       the sequence gate, and the mute owed to them is delivered. It returns nothing,
+        //       because the same frame may carry the roster; it is below the merge for the merge's
+        //       reason: a call that has ended learns nothing.
+        //    9. invite failed — the cause of an ending, which arrives a beat before it.
+        //   10. end — after the cause it prefers.
+        //   11. roster
+        //   12. lobby
+        //   13. acknowledgement — before the phase and the answer, because its clock is the
         //       service's.
-        //   13. accepted
-        //   14. renegotiation — before the answer: an offer and an answer share one pointer, and
+        //   14. accepted
+        //   15. renegotiation — before the answer: an offer and an answer share one pointer, and
         //       read the other way round an offer is handed to the page as an answer.
-        //   15. answer
+        //   16. answer
         record_call_frame(&frame);
         // The raw frame still goes to the UI console: the schema is young, and a
         // capture of what really arrived is what corrects it.
@@ -15275,18 +15578,25 @@ impl Ctx {
         // Everything below is about the call we are already in — the routing above has dropped
         // a frame addressed to any other — and a call that has ended takes nothing more.
         let links = calling::Links::collect(&frame.body);
-        let mine = {
+        let live = {
             let mut plane = self.calling.lock().unwrap();
             match plane.call.as_mut() {
                 Some(call) if call.phase != CallPhase::Ended => {
                     call.links.merge(&links);
-                    true
+                    Some(call.id.clone())
                 }
-                _ => false,
+                _ => None,
             }
         };
-        if !mine {
+        let Some(live) = live else {
             return;
+        };
+
+        // The conversation's own doors, REPLACED under the client's sequence gate rather than
+        // merged (see `calling::ConversationLeg`) — and the mute owed to it, delivered once it
+        // names the door. Returns nothing: the same frame may carry the roster below.
+        if frame.url.contains(calling::paths::CONVERSATION_UPDATE) {
+            self.learn_conversation(&live, &frame.body);
         }
 
         // The invitation reached NOBODY. It is the only frame that says so, it arrives a beat
@@ -15664,6 +15974,7 @@ impl Ctx {
             source_request_sequence: 0,
             sending: Vec::new(),
             sharing: None,
+            conversation: CallConversation::default(),
         };
 
         {
@@ -15674,7 +15985,7 @@ impl Ctx {
                 );
                 return;
             }
-            plane.call = Some(call);
+            plane.admit(call);
         }
         eprintln!("[calling] ringing: a call from {}", invite.caller_mri);
         self.emit_call_state();
@@ -15755,6 +16066,81 @@ impl Ctx {
         };
         for line in fresh {
             eprintln!("{line}");
+        }
+    }
+
+    /// POST one endpoint-state publish of call `call_id` and settle it — the client's own mute
+    /// toggle (see [`calling::endpoint_state_payload`]). Returns whether the service accepted it.
+    ///
+    /// The journal says where it went by the door's NAME, what it said and its sequence, never
+    /// the URL. A read-only backend posts nothing, before the network: it never holds a call,
+    /// and this is also the path an OWED publish takes, which no click of this moment triggered.
+    async fn post_endpoint_state(&self, call_id: &str, url: &str, body: &Value, sequence: u64) -> bool {
+        let muted = body.pointer("/endpointState/state/isMuted").and_then(Value::as_bool);
+        let accepted = if read_only() {
+            false
+        } else {
+            match self.post_call_signal(url, body).await {
+                Ok(_) => {
+                    eprintln!(
+                        "[calling] published the mute on updateEndpointState (isMuted={}, \
+                         sequence {sequence}) → accepted",
+                        muted.unwrap_or_default()
+                    );
+                    true
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[calling] the mute publish on updateEndpointState (isMuted={}, sequence \
+                         {sequence}) did not reach the service: {e:#}",
+                        muted.unwrap_or_default()
+                    );
+                    false
+                }
+            }
+        };
+        self.calling.lock().unwrap().settle_endpoint_state(call_id, sequence, accepted);
+        accepted
+    }
+
+    /// Learn the conversation object `body` carries for call `call_id`, and deliver the mute it
+    /// owes once that object names the door (see [`CallingPlane::owed_endpoint_state`]).
+    ///
+    /// The delivery is SPAWNED: this runs from the frame handler and from the place and join
+    /// answers, and neither may wait on a POST to the service. It is the user's own press, made
+    /// while there was nowhere to publish it, and nothing else.
+    fn learn_conversation(&self, call_id: &str, body: &Value) {
+        let surl = {
+            let plane = self.calling.lock().unwrap();
+            let Some(call) = plane.call.as_ref().filter(|c| c.id == call_id) else {
+                return;
+            };
+            call.callbacks.surl.clone()
+        };
+        let Some(leg) = calling::ConversationLeg::from_response(body, &surl) else {
+            return;
+        };
+        self.adopt_conversation(call_id, leg);
+    }
+
+    /// Adopt an already-read conversation leg for call `call_id` — the half of
+    /// [`Ctx::learn_conversation`] the place and join answers use, since they read it with the
+    /// answer itself.
+    fn adopt_conversation(&self, call_id: &str, leg: calling::ConversationLeg) {
+        let owed = {
+            let mut plane = self.calling.lock().unwrap();
+            if !plane.learn_conversation(call_id, leg) {
+                return;
+            }
+            plane.owed_endpoint_state(call_id)
+        };
+        if let Some((url, body, sequence)) = owed {
+            let ctx = self.clone();
+            let call_id = call_id.to_string();
+            tokio::spawn(async move {
+                eprintln!("[calling] the conversation named its updateEndpointState: publishing the owed mute");
+                ctx.post_endpoint_state(&call_id, &url, &body, sequence).await;
+            });
         }
     }
 
@@ -18112,6 +18498,7 @@ mod tests {
             source_request_sequence: 0,
             sending: Vec::new(),
             sharing: None,
+            conversation: CallConversation::default(),
         };
         let json = call.json();
         assert_eq!(json["phase"], "ringing");
@@ -18169,6 +18556,7 @@ mod tests {
             source_request_sequence: 0,
             sending: Vec::new(),
             sharing: None,
+            conversation: CallConversation::default(),
         };
         assert_eq!(call.json()["can_accept"], false);
         // And a call that is over offers nothing at all.
@@ -18223,6 +18611,7 @@ mod tests {
                 session_id: None,
                 leave: Some("https://cc/live/sharing/leave".into()),
             }),
+            conversation: CallConversation::default(),
         }
     }
 
@@ -18242,12 +18631,12 @@ mod tests {
         assert_eq!(plane.call.as_ref().unwrap().json()["mute_seq"], 0);
 
         let (local, url, seq) = plane.record_mute("call-1", true, None).unwrap();
-        assert_eq!((url.as_deref(), seq), (Some("https://cc/live/mute"), 1));
+        assert_eq!((url, seq), (MutePublish::Legacy(Some("https://cc/live/mute".into())), 1));
         assert_eq!(local.id, "8:orgid:me");
         // The same state pressed again is still a press: it orders presses, not changes.
         assert_eq!(plane.record_mute("call-1", true, None).unwrap().2, 2);
         let (_, url, seq) = plane.record_mute("call-1", false, None).unwrap();
-        assert_eq!((url.as_deref(), seq), (Some("https://cc/live/unmute"), 3));
+        assert_eq!((url, seq), (MutePublish::Legacy(Some("https://cc/live/unmute".into())), 3));
 
         let refused = plane.record_mute("another-call", true, None).unwrap_err();
         assert!(format!("{refused:#}").contains("no such call"), "{refused:#}");
@@ -18258,8 +18647,306 @@ mod tests {
         // No door is not a refusal: the state still moves, the service is simply not told.
         plane.call.as_mut().unwrap().links = calling::Links::default();
         let (_, url, seq) = plane.record_mute("call-1", true, None).unwrap();
-        assert_eq!((url, seq), (None, 4));
+        assert_eq!((url, seq), (MutePublish::Legacy(None), 4));
         assert_eq!(plane.call.as_ref().unwrap().json()["muted"], true);
+    }
+
+    /// A call on the `endpoint-state` mute protocol (docs/calling-roadmap/incoming-and-conversation.md
+    /// § 4.7), with both mute doors in its merged links and the conversation's own
+    /// `updateEndpointState` read off its conversation object.
+    fn endpoint_state_call() -> CallSession {
+        let mut call = call_on_session("live");
+        call.links = calling::Links::collect(&json!({ "links": {
+            "mute": "https://cc/live/mute",
+            "unmute": "https://cc/live/unmute",
+            "updateEndpointState": "https://cc/live/merged-ues",
+        } }));
+        call.conversation.protocol.mute = calling::MuteProtocol::EndpointState;
+        call.conversation.leg = calling::ConversationLeg::from_response(
+            &json!({ "links": { "updateEndpointState": "https://cc/conv/ues" } }),
+            &call.callbacks.surl,
+        );
+        call
+    }
+
+    /// The SELF mute is published as the client's `updateEndpointState` only where the user asked
+    /// for it: the legacy protocol keeps the call's own `mute` / `unmute` link, and under
+    /// `endpoint-state` the conversation's door is the one taken — never the `mute` link, which is
+    /// a server mute of the people it names. The first publish carries sequence 1.
+    #[test]
+    fn the_self_mute_publishes_endpoint_state_only_when_asked() {
+        let mut plane = CallingPlane::default();
+        let mut legacy = endpoint_state_call();
+        legacy.conversation.protocol = calling::CallProtocol::default();
+        plane.call = Some(legacy);
+        let (_, publish, _) = plane.record_mute("call-1", true, None).unwrap();
+        assert_eq!(publish, MutePublish::Legacy(Some("https://cc/live/mute".into())));
+
+        plane.call = Some(endpoint_state_call());
+        let (_, publish, _) = plane.record_mute("call-1", true, None).unwrap();
+        let MutePublish::EndpointState(EndpointStatePlan::Send { url, body, sequence }) = publish else {
+            panic!("an endpoint-state call published {publish:?}");
+        };
+        assert_eq!((url.as_str(), sequence), ("https://cc/conv/ues", 1), "not the conversation's own door");
+        assert_eq!(body["endpointState"], json!({ "state": { "isMuted": true }, "endpointStateSequenceNumber": 1 }));
+        assert_eq!(body["from"]["id"], "8:orgid:me");
+        assert_eq!(body.as_object().unwrap().len(), 2, "{body}");
+
+        // No conversation read: the merged table's door, still never `mute`.
+        plane.call.as_mut().unwrap().conversation.leg = None;
+        let (_, publish, _) = plane.record_mute("call-1", false, None).unwrap();
+        assert!(
+            matches!(&publish, MutePublish::EndpointState(EndpointStatePlan::Send { url, .. }) if url == "https://cc/live/merged-ues"),
+            "{publish:?}"
+        );
+        // A door on our OWN callbacks is no door.
+        let own = format!("{}callAgent/x/y/conversation/ues", plane.call.as_ref().unwrap().callbacks.surl);
+        plane.call.as_mut().unwrap().links =
+            calling::Links::collect(&json!({ "links": { "updateEndpointState": own, "mute": "https://cc/m" } }));
+        let (_, publish, _) = plane.record_mute("call-1", true, None).unwrap();
+        assert_eq!(publish, MutePublish::EndpointState(EndpointStatePlan::NoDoor));
+    }
+
+    /// A repeat of the state the service holds is not sent again — the client's
+    /// `shouldUpdateEndpointState` — unless a publish is still on its way (it may fail) or the
+    /// newest one did fail, where the service holds an older state. Only the NEWEST publish's
+    /// outcome decides: an older one is superseded by the higher sequence after it.
+    #[test]
+    fn a_repeated_mute_is_published_again_only_while_the_last_one_is_unsure() {
+        let mut plane = CallingPlane::default();
+        plane.call = Some(endpoint_state_call());
+        let mut press = |muted: bool| match plane.record_mute("call-1", muted, None).unwrap().1 {
+            MutePublish::EndpointState(plan) => plan,
+            other => panic!("{other:?}"),
+        };
+        // A first Unmute, before any Mute, is nothing new: absent reads as not muted.
+        assert_eq!(press(false), EndpointStatePlan::Holds);
+        let EndpointStatePlan::Send { sequence: 1, .. } = press(true) else { panic!() };
+        // Repeated while the first is in flight: sent again.
+        let EndpointStatePlan::Send { sequence: 2, .. } = press(true) else { panic!() };
+        // The newest is answered first and the OLDER one fails after it — the order a slow network
+        // really delivers them in. The older one's failure changes nothing: the service holds what
+        // the higher sequence after it said.
+        plane.settle_endpoint_state("call-1", 2, true);
+        plane.settle_endpoint_state("call-1", 1, false);
+        let mut press = |muted: bool| match plane.record_mute("call-1", muted, None).unwrap().1 {
+            MutePublish::EndpointState(plan) => plan,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(press(true), EndpointStatePlan::Holds, "a confirmed state was sent again");
+        let EndpointStatePlan::Send { sequence: 3, body, .. } = press(false) else { panic!() };
+        assert_eq!(body["endpointState"]["state"]["isMuted"], false);
+        plane.settle_endpoint_state("call-1", 3, false);
+        // The newest failed: the service still holds "muted", so the repeat is sent.
+        let mut press = |muted: bool| match plane.record_mute("call-1", muted, None).unwrap().1 {
+            MutePublish::EndpointState(plan) => plan,
+            other => panic!("{other:?}"),
+        };
+        let EndpointStatePlan::Send { sequence: 4, .. } = press(false) else { panic!() };
+        // A call that has gone settles nothing, and the sequence is per call.
+        plane.settle_endpoint_state("another-call", 4, false);
+        assert_eq!(plane.call.as_ref().unwrap().conversation.endpoint_state_in_flight, 1);
+    }
+
+    /// A call this app STARTED publishes its first mute on top of the endpoint state its start
+    /// body declared — the client's `startOrJoinCall` seeds `latestEndpointState` with it — so the
+    /// `endpointProperties` travel again; an answered incoming call publishes `state` alone.
+    #[test]
+    fn a_started_call_publishes_its_mute_over_what_its_start_body_declared() {
+        let local = call_on_session("live").local;
+        let door = Some("https://cc/conv/ues".to_string());
+        let EndpointStatePlan::Send { body, sequence: 1, .. } =
+            CallConversation::started_here().plan(true, door.clone(), &local, true)
+        else {
+            panic!("a first mute was not sent");
+        };
+        assert_eq!(
+            body["endpointState"]["endpointProperties"],
+            json!({ "additionalEndpointProperties": { "infoShownInReportMode": "FullInformation" } })
+        );
+        assert_eq!(body["endpointState"]["state"], json!({ "isMuted": true }));
+        assert_eq!(body["endpointState"]["endpointStateSequenceNumber"], 1);
+        // The seed reads as not muted, so a first Unmute is still nothing new to send.
+        assert_eq!(
+            CallConversation::started_here().plan(false, door.clone(), &local, true),
+            EndpointStatePlan::Holds
+        );
+        let EndpointStatePlan::Send { body, .. } = CallConversation::default().plan(true, door, &local, true)
+        else {
+            panic!("a first mute was not sent");
+        };
+        assert!(body["endpointState"].get("endpointProperties").is_none(), "{body}");
+    }
+
+    /// A call keeps the protocol it STARTED with: the plane stamps it on the way in, and a change
+    /// made mid-call applies to the next one — one call never mixes two mute doors.
+    #[test]
+    fn a_call_keeps_the_protocol_it_started_with() {
+        let mut plane = CallingPlane::default();
+        plane.protocol.mute = calling::MuteProtocol::EndpointState;
+        let mut call = endpoint_state_call();
+        call.conversation.protocol = calling::CallProtocol::default();
+        plane.admit(call);
+        plane.protocol = calling::CallProtocol::default();
+        let (_, publish, _) = plane.record_mute("call-1", true, None).unwrap();
+        assert!(matches!(publish, MutePublish::EndpointState(_)), "{publish:?}");
+        let state = call_state_json(&plane, facts(true, None));
+        assert_eq!(state["protocol"], json!({ "mute": "legacy" }), "the backend's setting");
+        assert_eq!(state["call"]["protocol"], json!({ "mute": "endpoint-state" }), "the call's own");
+    }
+
+    /// A mute pressed before the conversation named its door is OWED, and delivered once an
+    /// answer or a `conversationUpdate` names one — the client's `handlePendingEndpointState` —
+    /// with nothing sent where the service already holds what the user asked for, and nothing
+    /// ever owed on the legacy protocol.
+    #[test]
+    fn a_mute_pressed_before_the_door_is_delivered_once_the_conversation_names_one() {
+        let mut plane = CallingPlane::default();
+        let mut call = endpoint_state_call();
+        call.conversation.leg = None;
+        call.links = calling::Links::default();
+        plane.call = Some(call);
+        let (_, publish, _) = plane.record_mute("call-1", true, None).unwrap();
+        assert_eq!(publish, MutePublish::EndpointState(EndpointStatePlan::NoDoor));
+        assert_eq!(plane.owed_endpoint_state("call-1"), None, "owed with nowhere to send it");
+
+        let surl = plane.call.as_ref().unwrap().callbacks.surl.clone();
+        let leg = |sequence: i64, links: Value| {
+            calling::ConversationLeg::from_response(&json!({ "sequenceNumber": sequence, "links": links }), &surl).unwrap()
+        };
+        assert!(plane.learn_conversation("call-1", leg(3, json!({ "leave": "https://cc/leave" }))));
+        assert_eq!(plane.owed_endpoint_state("call-1"), None, "the conversation names no door yet");
+        assert!(plane.learn_conversation("call-1", leg(4, json!({ "updateEndpointState": "https://cc/ues" }))));
+        let (url, body, sequence) = plane.owed_endpoint_state("call-1").expect("the press is owed");
+        assert_eq!((url.as_str(), sequence), ("https://cc/ues", 1));
+        assert_eq!(body["endpointState"]["state"]["isMuted"], true);
+        assert_eq!(plane.owed_endpoint_state("call-1"), None, "delivered twice");
+
+        // An older object cannot bring back what a newer one replaced; a call that has ended
+        // learns nothing.
+        assert!(!plane.learn_conversation("call-1", leg(2, json!({}))));
+        assert_eq!(
+            plane.call.as_ref().unwrap().conversation.leg.as_ref().unwrap().update_endpoint_state(),
+            Some("https://cc/ues")
+        );
+        plane.call.as_mut().unwrap().phase = CallPhase::Ended;
+        assert!(!plane.learn_conversation("call-1", leg(9, json!({}))));
+
+        // Never pressed muted: nothing is owed. And the legacy protocol owes nothing, ever.
+        let mut quiet = endpoint_state_call();
+        quiet.conversation.leg = None;
+        quiet.links = calling::Links::default();
+        plane.call = Some(quiet);
+        plane.record_mute("call-1", false, None).unwrap();
+        assert!(plane.learn_conversation("call-1", leg(1, json!({ "updateEndpointState": "https://cc/ues" }))));
+        assert_eq!(plane.owed_endpoint_state("call-1"), None);
+        let mut legacy = endpoint_state_call();
+        legacy.conversation.protocol = calling::CallProtocol::default();
+        legacy.conversation.leg = None;
+        plane.call = Some(legacy);
+        plane.record_mute("call-1", true, None).unwrap();
+        assert!(plane.learn_conversation("call-1", leg(1, json!({ "updateEndpointState": "https://cc/ues" }))));
+        assert_eq!(plane.owed_endpoint_state("call-1"), None, "a legacy call published on the new door");
+    }
+
+    /// The real handler replaces the conversation's doors off a `conversationUpdate` frame, under
+    /// the sequence gate, and touches nothing else about the call — the merged links still merge.
+    #[tokio::test]
+    async fn a_conversation_update_replaces_the_doors_it_names() {
+        let ctx = test_ctx();
+        let mut call = endpoint_state_call();
+        call.conversation.leg = None;
+        let session = call.callbacks.session_id.clone();
+        let surl = call.callbacks.surl.clone();
+        ctx.calling.lock().unwrap().call = Some(call);
+        let update = |sequence: i64, links: Value| trouter_events::CallFrame {
+            url: format!("{surl}callAgent/{session}/0a1b2c3d{}", calling::paths::CONVERSATION_UPDATE),
+            call_id: String::new(),
+            body: json!({ "sequenceNumber": sequence, "links": links }),
+        };
+        ctx.handle_call_frame(update(5, json!({ "unmute": "https://cc/unmute", "leave": "https://cc/leave" }))).await;
+        ctx.handle_call_frame(update(6, json!({ "leave": "https://cc/leave2" }))).await;
+        ctx.handle_call_frame(update(4, json!({ "unmute": "https://cc/stale" }))).await;
+        let plane = ctx.calling.lock().unwrap();
+        let call = plane.call.as_ref().unwrap();
+        let leg = call.conversation.leg.as_ref().expect("the doors were learned");
+        assert_eq!((leg.sequence_number, leg.unmute(), leg.leave()), (6, None, Some("https://cc/leave2")));
+        // The merged table keeps every link it was ever handed, which is exactly why the doors
+        // are a table of their own.
+        assert_eq!(call.links.unmute(), Some("https://cc/stale"));
+    }
+
+    /// Under `endpoint-state`, the self toggle never names the call's `mute` link — the arm that
+    /// plans it reads only the conversation's door — and the publish refuses a read-only backend
+    /// BEFORE the network, because it is also the path an owed publish takes with no click behind
+    /// it at that moment. The owed publish is spawned, never awaited by the handler that found it.
+    #[test]
+    fn the_endpoint_state_publish_never_names_the_mute_link_and_refuses_read_only() {
+        let source = include_str!("server.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let between = |from: &str, to: &str| {
+            let at = code.find(from).unwrap_or_else(|| panic!("{from}"));
+            let end = at + code[at..].find(to).unwrap_or_else(|| panic!("{to}"));
+            &code[at..end]
+        };
+        let arm = between("calling::MuteProtocol::EndpointState => {", "Ok((call.local.clone(), publish, call.mute_seq))");
+        assert!(!arm.contains("links.mute()") && !arm.contains("mute_payload"), "{arm}");
+        assert!(arm.contains("endpoint_state_door("), "{arm}");
+        let plan = between("fn plan(&mut self, muted: bool", "fn settle(&mut self");
+        assert!(!plan.contains(".mute()"), "{plan}");
+        // And the function that CHOOSES the door reads the endpoint-state door on both of its
+        // branches, never the mute link.
+        let door = between("fn endpoint_state_door(&self", "fn plan(&mut self");
+        assert_eq!(door.matches("update_endpoint_state()").count(), 2, "{door}");
+        assert!(!door.contains(".mute()") && !door.contains("\"mute\""), "{door}");
+
+        // A call this app STARTS publishes on top of its start body's endpoint state; an answered
+        // incoming call starts from nothing (calling::start_endpoint_state).
+        assert_eq!(code.matches("conversation: CallConversation::started_here(),").count(), 2);
+        let incoming = between("async fn handle_incoming_call(", "plane.admit(call);");
+        assert!(incoming.contains("conversation: CallConversation::default(),"), "{incoming}");
+
+        // The setting's write is serialized on its own turn, and the plane's lock is never held
+        // across the store write.
+        let set = between("\"call_protocol_set\" => {", "Ok(json!({ \"protocol\": next.json() }))");
+        let turn = set.find("CALL_PROTOCOL_WRITE.lock().await").expect("no turn");
+        let write = set.find("set_setting(").expect("no write");
+        assert!(turn < write, "{set}");
+        assert!(!set.contains("let mut plane = ctx.calling.lock()"), "the plane is held across the write: {set}");
+
+        let post = between("async fn post_endpoint_state(", "fn learn_conversation(&self");
+        let refused = post.find("read_only()").expect("no read-only refusal");
+        let network = post.find("post_call_signal(").expect("no publish");
+        assert!(refused < network, "the read-only refusal comes after the network");
+        let adopt = between("fn adopt_conversation(&self", "/// Journal what an ANSWER");
+        let spawn = adopt.find("tokio::spawn(").expect("the owed publish is not spawned");
+        assert!(
+            adopt[..spawn].find(".await").is_none(),
+            "the path that found the owed publish waits on something before spawning it"
+        );
+    }
+
+    /// The protocol is a per-BACKEND, write-token decision: `call_protocol_set` is a machine
+    /// method with words of its own, the store key is this process's own port at every reader,
+    /// and a stored value is what the plane starts from.
+    #[test]
+    fn the_calling_protocol_is_per_backend_and_gated() {
+        assert_eq!(write_class("call_protocol_set"), Some(WriteClass::Machine));
+        assert_eq!(machine_effect("call_protocol_set"), "decides how this machine's calls speak to Teams");
+        let source = include_str!("server.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap_or(source);
+        assert_eq!(code.matches("calling::call_protocol_setting_key(own_port())").count(), 1, "the RPC");
+        assert_eq!(code.matches("stored_call_protocol(&ctx, own_port())").count(), 1, "the boot read");
+
+        let (ctx, dir) = ctx_with_store("calling-protocol");
+        assert_eq!(stored_call_protocol(&ctx, 19422), calling::CallProtocol::default());
+        ctx.store()
+            .unwrap()
+            .set_setting(&calling::call_protocol_setting_key(19422), r#"{"mute":"endpoint-state"}"#)
+            .unwrap();
+        assert_eq!(stored_call_protocol(&ctx, 19422).mute, calling::MuteProtocol::EndpointState);
+        assert_eq!(stored_call_protocol(&ctx, 19420), calling::CallProtocol::default(), "another port's");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     /// A press a page sends AGAIN after a reconnect names the sequence it was made at, and is
@@ -18690,6 +19377,7 @@ mod tests {
             ("sharing end", "calling::paths::CONVERSATION_CONTENT_SHARING_END"),
             ("sharing granted", "calling::paths::CONVERSATION_ADD_MODALITY_SUCCESS"),
             ("merge", "call.links.merge("),
+            ("conversation", "self.learn_conversation(&live, &frame.body)"),
             ("invite failed", "calling::invite_failed("),
             ("end", "calling::call_ended_from_frame("),
             ("roster", "calling::roster_in_frame("),
@@ -19204,8 +19892,12 @@ mod tests {
             state.as_object().expect("an object").keys().map(String::as_str).collect();
         assert_eq!(
             keys,
-            ["backend_started_ms", "call", "enabled", "ready", "registration"].into_iter().collect()
+            ["backend_started_ms", "call", "enabled", "protocol", "ready", "registration"]
+                .into_iter()
+                .collect()
         );
+        // The protocol a call started from now on speaks — the legacy flow out of the box.
+        assert_eq!(state["protocol"], json!({ "mute": "legacy" }));
         assert_eq!(state["enabled"], true);
         assert_eq!(state["ready"], false);
         assert_eq!(state["call"], Value::Null);

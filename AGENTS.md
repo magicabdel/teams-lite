@@ -5300,7 +5300,8 @@ user. Two independent mechanisms enforce that split:
   Code's sign-in as its two steps in both themes, the signed-in row, the API key form, the cloud
   accounts with Bedrock's form open and then set up, opencode's keys, and the sign-in at a phone's
   width: `bun run preview -- --out /tmp/auth --agent-auth`. For Settings › This app — the
-  update check's answer and the restart armed on a live agent run:
+  update check's answer, the restart armed on a live agent run, and the Calling protocol row with
+  its experimental choice made, in both themes:
   `bun run preview -- --out /tmp/app --maintenance`. For the update button, the
   changelog it discloses on hover in both themes, its progress mid-download and the link the
   other install shape keeps: `bun run preview -- --out /tmp/upd --update`. For recording a
@@ -6211,6 +6212,52 @@ call does — this side never handles RTP, and the page never learns a Teams URL
   `{kind:"call_state"}` hooks reach the failed, the travelling, the half-answered and the unheard
   press. **Unverified against the tenant**: the live check is the user's own — Mute on the phone
   while the laptop holds a call with a colleague, who must hear silence at once.
+- **HOW A CALL SPEAKS TO TEAMS IS A STORED, PER-BACKEND SETTING, and its first switch is the
+  mute publish** (Settings › This app › Calling protocol, over `call_protocol_set`;
+  `calling::CallProtocol`; docs/calling-roadmap/incoming-and-conversation.md § 4.7 and § 6).
+  Every protocol change that roadmap makes sits behind a field of it, OFF by default — never an
+  environment variable, which tooling could set and an auto-update's restart would pick up with
+  nobody's step. Six rules hold it, and each is pinned by a test:
+  - **`call_protocol_set` is a `MACHINE_METHODS` entry** ("decides how this machine's calls
+    speak to Teams"): the write token, refused read-only, named in both alternations of the
+    automation guard. It posts nothing itself, but every call this backend starts from now on
+    publishes through what it chose. Reading it is `call_status.protocol`, open.
+  - **It is stored PER PORT** (`calling_protocol:<port>`), because the two send-capable installs
+    on one machine share one store, and the point is that the released build may try a protocol
+    while the staged one keeps this app's existing one. Every key must be one the backend knows and
+    every value one of its words; a stored value this build cannot read — a newer build's key, a
+    word it does not know — reads as the default, field by field.
+  - **A call keeps the protocol it STARTED with** (`CallingPlane::admit` stamps a copy on the one
+    path a call enters), so a change mid-call applies from the next call and one call never mixes
+    two mute doors. The row says so when a live call keeps a different one.
+  - **`endpoint-state` publishes the mute the client's way**: `{from, endpointState: {…the last
+    one published, state: {isMuted}, endpointStateSequenceNumber}}` — for a call this app placed
+    or joined, "the last one" starts as the endpoint state its START body declared
+    (`calling::start_endpoint_state`, which the client's `startOrJoinCall` seeds the same way), so
+    the first publish re-sends its `endpointProperties` — to the CONVERSATION's
+    `updateEndpointState` (`calling::endpoint_state_payload`, the client's `uG`), with the
+    sequence from 1 and planned under the plane's lock so two presses take theirs in order — and
+    NEVER to the call's `mute` link, which is a server mute of the people it names. A repeat of
+    the state the service holds is not sent (the client's `shouldUpdateEndpointState`, which reads
+    an absent mute as unmuted) unless a publish is still on its way or the newest one failed; that
+    last clause is the one place it differs from the client, which never re-sends a failed state.
+  - **A mute pressed before the conversation named its door is OWED**, and published once an
+    answer or a `conversationUpdate` names one (the client's `handlePendingEndpointState`) —
+    spawned, never awaited by the path that found it, and refused read-only before the network.
+    It delivers the user's own press and decides nothing.
+  - **The conversation's doors are a table of their own** (`calling::ConversationLeg`, the
+    structure meeting-awareness calls `conversation_links`): the place and join answers' and every
+    `conversationUpdate`'s TOP-LEVEL `links`, minus our own callbacks, REPLACED whole under the
+    client's sequence gate (an object below the last applied is ignored; none reads as -1). The
+    merged `CallSession.links` is untouched and still merges. It is step 8 of the frame handler's
+    documented order.
+  The microphone never depends on any of it: the track closes on the press, and a publish that
+  fails changes only what the meeting draws. `cd web && bun run preview -- --out /tmp/app
+  --maintenance` captures the row in both themes, `web/e2e/calling-protocol.spec.ts` pins what
+  the page owns, and `bun run join-live -- --pair --toggle-mute` is the live check: the released
+  build mutes and unmutes and the always-on one reports what its roster said about each endpoint.
+  **Unverified against the tenant**: the publish has never been sent — that run needs both of the
+  user's installs up and the setting chosen on 19442, which is their own press.
 - **A start the user STOPS is not a failure, and the call it half-made is taken back.** A
   start is three awaits long — reserve, open the microphone, post the offer — and the
   microphone alone takes up to `GATHER_TIMEOUT_MS`, so a call stopped a second after it was
@@ -10358,7 +10405,9 @@ link the other install shape keeps.
 
 Settings' last section holds the two things the user can do to the APP rather than to their
 Teams account: **Check for updates**, and **Restart the backend**
-(`web/src/components/maintenance-settings.tsx`, over the pure `web/src/lib/maintenance.ts`).
+(`web/src/components/maintenance-settings.tsx`, over the pure `web/src/lib/maintenance.ts`). A
+third block under them, **Calling protocol (experimental)**, decides how this backend's calls
+speak to Teams; it is § Audio calls' to explain, and it is drawn only by a backend that calls.
 Both exist for the same reason, and it is the reason most of this app exists: it is read from
 a PHONE, over a tailnet, and the machine it runs on is somewhere else — everything either row
 does used to need a terminal on that machine.
@@ -11224,6 +11273,14 @@ pointed there found an app that could not call. Both register now — a calling 
 is keyed by the PORT, so they are two devices to the service and a call rings both, exactly
 as it rings a phone beside a laptop. That second ring is the deliberate price of every
 window being able to place a call.
+
+**AND HOW THEIR CALLS SPEAK TO TEAMS MAY DIFFER, on purpose.** The calling protocol
+(Settings › This app › Calling protocol, `call_protocol_set`) is stored per PORT, so the
+released build can publish the mute the Teams client's way while the staged pair keeps this
+app's existing flow — the A/B the roadmap's live checks are built on (§ Audio calls). Each install
+states its own once, as `[calling] calling protocol: …`, when it registers — the staged backend in
+its journal (`journalctl --user -u teams-lite-backend`), the released build in its backend log
+(`/tmp/teams-lite-server-19422.log`), because the launcher writes its child's output there.
 
 **The REAL-TIME endpoint id is the sharpest thing they must not share, and it was the one
 bug this arrangement really cost.** The live feed follows the endpoint id, and a second
