@@ -9,12 +9,18 @@
  * other keeps the existing one, and it applies from the next call: a call keeps the protocol it
  * started with.
  *
- * One choice exists today, the mute. The roadmap's other two rows (how an incoming call is taken,
- * and whether a long call is kept alive) join it in the milestone that gives them something to
+ * Two choices exist: how an incoming call is taken, and how the mute is published. The roadmap's
+ * third (whether a long call is kept alive) joins them in the milestone that gives it something to
  * switch, because a choice that changes nothing reads as a bug.
  */
 
-import { isLive, type CallProtocol, type CallStatus, type MuteProtocol } from "./call";
+import {
+  isLive,
+  type CallProtocol,
+  type CallStatus,
+  type IncomingProtocol,
+  type MuteProtocol,
+} from "./call";
 
 /** One option of a protocol row: the value the backend stores, and what the reader is told. */
 export type ProtocolChoice<T extends string> = {
@@ -44,6 +50,27 @@ export const MUTE_PROTOCOL_CHOICES: readonly ProtocolChoice<MuteProtocol>[] = [
   },
 ];
 
+/** The incoming-call row's two options, in the order the backend lists its words
+ *  (`calling::IncomingProtocol::WORDS`). The measured flow is first and is the default.
+ *
+ *  "As before" rather than the roadmap's "Measured", for the reader's sake: two rows in one
+ *  section must not describe their defaults in two vocabularies. The detail says what "before"
+ *  is worth here — this is the answer that was really tested with a colleague. */
+export const INCOMING_PROTOCOL_CHOICES: readonly ProtocolChoice<IncomingProtocol>[] = [
+  {
+    value: "answer",
+    label: "As before (default)",
+    detail: "How this app has always answered a call — the way that was tested with a colleague.",
+  },
+  {
+    value: "join-at-answer",
+    label: "Join the call's conversation when you answer",
+    detail:
+      "The Teams web client's own way. When you hang up, the caller is told you left, and your " +
+      "mute can be shown to them.",
+  },
+];
+
 /** What the row says under its options, always: where the choice applies, and where not. */
 export const CALLING_PROTOCOL_NOTE =
   "Applies to calls this backend starts from now on. Each teams-lite install on this machine " +
@@ -66,6 +93,9 @@ export function callingProtocolOffered(
 export function liveCallKeepsItsProtocol(status: CallStatus): string | null {
   const call = status.call;
   if (!isLive(call) || !call?.protocol || !status.protocol) return null;
-  if (call.protocol.mute === status.protocol.mute) return null;
+  const same =
+    call.protocol.mute === status.protocol.mute &&
+    (call.protocol.incoming ?? "answer") === (status.protocol.incoming ?? "answer");
+  if (same) return null;
   return "The call going now keeps the way it started with until it ends.";
 }

@@ -794,6 +794,15 @@ const CALL_RING_TIMEOUT: Duration = Duration::from_secs(60);
 /// hears the backend's outcome rather than a bare timeout. A test pins both relations.
 const CALL_START_WAIT: Duration = Duration::from_secs(150);
 
+/// Whether a joining attach REFUSED after `elapsed` may still fall back to the measured one: only
+/// while the two creating requests after it — the measured attach and the acceptance — fit inside
+/// [`CALL_START_WAIT`]. A refusal normally arrives in a second or two; one that took long enough
+/// to break that arithmetic would land the acceptance after the handler had ended the start, so the
+/// call is ended here instead of answered too late.
+fn fallback_still_fits(elapsed: Duration) -> bool {
+    elapsed + calling::SignalClass::Create.timeout() * 2 < CALL_START_WAIT
+}
+
 /// How long `call_hangup` waits for its own POST before it drops the call here regardless.
 ///
 /// The local drop is what tells every other window the call is over, so it never waits on the
@@ -2371,7 +2380,7 @@ impl CallingPlane {
             }
             calling::MuteProtocol::EndpointState => {
                 let door = call.conversation.endpoint_state_door(&call.links, &call.callbacks.surl);
-                MutePublish::EndpointState(call.conversation.plan(muted, door, &call.local, true))
+                MutePublish::EndpointState(call.conversation.plan(muted, door, &call.local, true, false))
             }
         };
         Ok((call.local.clone(), publish, call.mute_seq))
@@ -2393,7 +2402,24 @@ impl CallingPlane {
             return None;
         }
         let door = call.conversation.endpoint_state_door(&call.links, &call.callbacks.surl);
-        match call.conversation.plan(call.muted, door, &call.local, false) {
+        match call.conversation.plan(call.muted, door, &call.local, false, false) {
+            EndpointStatePlan::Send { url, body, sequence } => Some((url, body, sequence)),
+            EndpointStatePlan::NoDoor | EndpointStatePlan::Holds => None,
+        }
+    }
+
+    /// The endpoint-state publish an answered call makes ONCE, at accept — the client's
+    /// `handleEndpointStatesForAccept` — when its protocol publishes the mute the client's way and
+    /// its conversation names the door. Unlike a press it is sent whatever the conversation is
+    /// believed to hold: nothing was ever published on this leg, and "absent reads as unmuted" is
+    /// the client's reading of a state, not a statement the service received.
+    fn endpoint_state_at_accept(&mut self, call_id: &str) -> Option<(String, Value, u64)> {
+        let call = self.call.as_mut().filter(|c| c.id == call_id && !c.ended())?;
+        if call.conversation.protocol.mute != calling::MuteProtocol::EndpointState {
+            return None;
+        }
+        let door = call.conversation.endpoint_state_door(&call.links, &call.callbacks.surl)?;
+        match call.conversation.plan(call.muted, Some(door), &call.local, true, true) {
             EndpointStatePlan::Send { url, body, sequence } => Some((url, body, sequence)),
             EndpointStatePlan::NoDoor | EndpointStatePlan::Holds => None,
         }
@@ -2795,6 +2821,14 @@ struct CallSession {
     /// The conversation leg's doors, the protocol this call started with, and what the last mute
     /// publish on that leg said (see [`CallConversation`]).
     conversation: CallConversation,
+    /// An Answer is being carried out for this ring, by some page of this backend — the CLAIM
+    /// (docs/calling-roadmap/incoming-and-conversation.md § 4.4) — named by the id that page gave
+    /// its answer (`answer_id`; empty from a page too old to give one). Set atomically with the
+    /// check that the call is still ringing, so a second Answer — another window, a second press —
+    /// is answered with an outcome and posts nothing: two attaches for one call would claim the leg
+    /// twice. The id is what tells the answering window's OWN Decline, which declines, from another
+    /// window's, which may not decline under it. Released on every path out of the answer.
+    accepting: Option<String>,
 }
 
 /// What a call publishes about the user on its CONVERSATION leg, and under which protocol.
@@ -2828,9 +2862,49 @@ struct CallConversation {
     /// sent again rather than skipped — a press the client would skip, and the one place this
     /// differs from it: there, a failed publish is only mended by the NEXT change.
     endpoint_state_failed: bool,
+    /// Where an INCOMING call's conversation can be joined — the bare `conversationController`
+    /// its invite named (docs/calling-roadmap/incoming-and-conversation.md § 4.2). `None` for a
+    /// call this app started, and for an invite that named none.
+    controller: Option<String>,
+    /// How an incoming call's leg was taken, which decides where its hangup goes.
+    attach: AttachOutcome,
+}
+
+/// How an incoming call's leg was taken (docs/calling-roadmap/incoming-and-conversation.md § 4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum AttachOutcome {
+    /// Not taken by an attach (yet): a call this app started, or a ring nobody answered.
+    #[default]
+    NotAttempted,
+    /// The measured attach took it: the leg, and no conversation.
+    Measured,
+    /// The attach that also JOINS the conversation took it — so the call knows the
+    /// conversation's `leave`, and is hung up there, as the client hangs up a call it joined.
+    JoinedConversation,
+    /// The joining attach was refused outright (this HTTP status), and the measured one took the
+    /// leg instead. A refusal created nothing, so that is not a second attach.
+    JoinRefused(u16),
+}
+
+impl AttachOutcome {
+    /// The word the journal and the call's state name it by.
+    fn word(self) -> &'static str {
+        match self {
+            AttachOutcome::NotAttempted => "none",
+            AttachOutcome::Measured => "measured",
+            AttachOutcome::JoinedConversation => "joined-conversation",
+            AttachOutcome::JoinRefused(_) => "join-refused",
+        }
+    }
 }
 
 impl CallConversation {
+    /// The conversation leg of an INCOMING call: nothing published yet (an answered call never
+    /// went through the client's `startOrJoinCall`), and the controller its invite named.
+    fn answering(controller: Option<String>) -> Self {
+        Self { controller, ..Self::default() }
+    }
+
     /// The conversation leg of a call this app STARTS — places, or joins. Its endpoint state
     /// begins as the one the start body declared, because the client's `startOrJoinCall` seeds
     /// `latestEndpointState` with it and its first mute publish re-sends every key of it
@@ -2859,12 +2933,24 @@ impl CallConversation {
     /// Without it this is the OWED publish — a mute pressed before the conversation named a door,
     /// delivered once it does (the client's `handlePendingEndpointState`) — which sends only when
     /// the state the service holds differs from the one the user asked for.
-    fn plan(&mut self, muted: bool, door: Option<String>, local: &calling::LocalParticipant, pressed: bool) -> EndpointStatePlan {
+    /// `always` sends whatever the leg is believed to hold — the one publish at accept, which
+    /// states the user's mute to a conversation nothing has published on yet.
+    fn plan(
+        &mut self,
+        muted: bool,
+        door: Option<String>,
+        local: &calling::LocalParticipant,
+        pressed: bool,
+        always: bool,
+    ) -> EndpointStatePlan {
         let Some(url) = door else {
             return EndpointStatePlan::NoDoor;
         };
         let holds = calling::endpoint_state_is_muted(&self.endpoint_state) == muted;
-        if holds && (!pressed || (self.endpoint_state_in_flight == 0 && !self.endpoint_state_failed)) {
+        if !always
+            && holds
+            && (!pressed || (self.endpoint_state_in_flight == 0 && !self.endpoint_state_failed))
+        {
             // The service holds this state already, and nothing on its way may change that.
             return EndpointStatePlan::Holds;
         }
@@ -2920,6 +3006,26 @@ struct EndedElsewhere {
 }
 
 impl CallSession {
+    /// Where this call is HUNG UP (not declined).
+    ///
+    /// An incoming call that JOINED its conversation is left on the conversation's own `leave` —
+    /// the client's `leaveConversation`, which is what it posts for any call it joined
+    /// (`terminateEstablishedCall`: `this.convJoined ? LEAVE_CONVERSATION : END_CALL`). That is
+    /// the door the measured flow never had: an incoming one-to-one taken the measured way knows
+    /// only its leg's `callLeg`, which is unmeasured as a hangup, so the caller may not be told
+    /// (NATIVE-CALLING.md § 8a). Every other call — outgoing, a meeting, an incoming call taken
+    /// the measured way — keeps the merged table's chain unchanged: the verified outgoing door
+    /// is a hangup link of its own, NOT measured to be `leave`.
+    fn hangup_link(&self) -> Option<&str> {
+        if self.conversation.attach == AttachOutcome::JoinedConversation
+            && let Some(leave) = self.conversation.leg.as_ref().and_then(|leg| leg.leave())
+        {
+            return Some(leave);
+        }
+        self.links.hangup()
+    }
+
+
     /// Everybody in the meeting but us. Our own mri is dropped here rather than in the
     /// caller, so a count of "who else is here" is one answer in one place.
     fn others(&self) -> Vec<&calling::RosterMember> {
@@ -3013,7 +3119,12 @@ impl CallSession {
             // What this MACHINE is sending beyond audio, so every page agrees and a
             // reconnecting one is told rather than guessing from its own memory.
             "sending": self.sending,
-            "can_accept": self.phase == CallPhase::Ringing && self.offer.is_some(),
+            "can_accept": self.phase == CallPhase::Ringing && self.offer.is_some() && self.accepting.is_none(),
+            // Why a ring this window may not answer, when that is because another page of this
+            // backend is answering it: a second Answer would be an outcome that posts nothing,
+            // and the card says so rather than offering a press that does nothing.
+            "accept_blocked_reason": (self.phase == CallPhase::Ringing && self.accepting.is_some())
+                .then_some("This call is being answered in another window."),
             "can_hangup": self.phase != CallPhase::Ended,
             // New media is only accepted on an ESTABLISHED call, in the service's own words.
             // Decided here because only this side knows whether the link exists.
@@ -8150,6 +8261,7 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
                     sending: Vec::new(),
                     sharing: None,
                     conversation: CallConversation::started_here(),
+                    accepting: None,
                 };
                 {
                     let mut plane = ctx.calling.lock().unwrap();
@@ -8306,6 +8418,7 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
                         sending: Vec::new(),
                         sharing: None,
                         conversation: CallConversation::started_here(),
+                        accepting: None,
                     };
                     {
                         let mut plane = ctx.calling.lock().unwrap();
@@ -8377,7 +8490,8 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
         "call_accept" => {
             let call_id = param_str(params, "call_id")?;
             let sdp = param_str(params, "sdp")?;
-            let start = ctx.clone().accept_ringing_call(call_id.clone(), sdp);
+            let answer_id = answer_id_param(params, "call_accept")?.unwrap_or_default();
+            let start = ctx.clone().accept_ringing_call(call_id.clone(), sdp, answer_id);
             ctx.await_call_start("call_accept", &call_id, "CallEndReasonAcceptFailed", start).await
         }
 
@@ -8675,7 +8789,7 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
         "call_hangup" => {
             let request = hangup_request(params)?;
             let call_id = request.call_id;
-            let (local, door, url) = {
+            let (local, door, url, narrowed) = {
                 let plane = ctx.calling.lock().unwrap();
                 let call = plane
                     .call
@@ -8683,12 +8797,23 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
                     .filter(|c| c.id == call_id)
                     .context("call_hangup: no such call")?;
                 let door = hangup_door(call.direction, call.phase, request.intent);
+                // AN ANSWER BEING CARRIED OUT IS NOT DECLINED UNDER IT. Another window's Answer has
+                // claimed this ring and its attach is on the wire; a Decline pressed meanwhile is
+                // two presses that disagree, and a decline is the one of them the caller is SHOWN
+                // and nothing takes back. So it lets the call go here instead: the in-flight
+                // answer's own late answer finds the call gone and hangs up what it took.
+                let asked = door;
+                let door = door_while_answering(
+                    door,
+                    call.accepting.as_deref(),
+                    request.answer_id.as_deref(),
+                );
                 let url = match door {
                     HangupDoor::Reject => call.links.reject().or_else(|| call.links.hangup()),
-                    HangupDoor::Hangup => call.links.hangup(),
+                    HangupDoor::Hangup => call.hangup_link(),
                     HangupDoor::Nothing => None,
                 };
-                (call.local.clone(), door, url.map(str::to_string))
+                (call.local.clone(), door, url.map(str::to_string), door != asked)
             };
             // What goes out, if anything.
             let send = match (door, url) {
@@ -8730,6 +8855,11 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
                     false
                 }
             };
+            // A Decline that was not sent as one says so, so the window that pressed it can tell
+            // the reader the caller was NOT declined — it was let go under another window's answer.
+            if narrowed {
+                return Ok(json!({ "call_id": call_id, "told_service": told, "outcome": "answering" }));
+            }
             Ok(json!({ "call_id": call_id, "told_service": told }))
         }
 
@@ -14777,6 +14907,25 @@ enum HangupIntent {
     End,
 }
 
+/// The door a press leaves by while ANOTHER page's Answer is being carried out (see the call's
+/// `accepting` claim): a Decline from that other page is not sent as a decline.
+///
+/// Two presses from two windows that disagree, and a decline is the one of them the caller is
+/// SHOWN and nothing takes back — so the call is let go here instead, and the in-flight answer's
+/// own late answer finds it gone and hangs up what it took (`hang_up_orphan`). The answering
+/// window's OWN Decline is the user changing their mind, and declines as it always did: it names
+/// the claim (`presser`). Every other door is unchanged.
+fn door_while_answering(door: HangupDoor, claim: Option<&str>, presser: Option<&str>) -> HangupDoor {
+    if door == HangupDoor::Reject && claim.is_some() && claim != presser {
+        eprintln!(
+            "[calling] a Decline while an Answer is being carried out — letting the call go here \
+             rather than declining the caller"
+        );
+        return HangupDoor::Nothing;
+    }
+    door
+}
+
 /// Which door a `call_hangup` leaves by. Decided by [`hangup_door`] and nowhere else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HangupDoor {
@@ -14817,6 +14966,9 @@ struct HangupRequest {
     call_id: String,
     /// `None` is a page too old to say, whose one button on a ringing call was Decline.
     intent: Option<HangupIntent>,
+    /// The answer the pressing window itself is carrying out, when it is — so its own Decline is
+    /// told from another window's (see [`door_while_answering`]).
+    answer_id: Option<String>,
 }
 
 fn hangup_request(params: &Value) -> Result<HangupRequest> {
@@ -14826,7 +14978,26 @@ fn hangup_request(params: &Value) -> Result<HangupRequest> {
         Some(Value::String(word)) if word == "end" => Some(HangupIntent::End),
         Some(_) => anyhow::bail!(CALL_HANGUP_BAD_INTENT),
     };
-    Ok(HangupRequest { call_id: param_str(params, "call_id")?, intent })
+    Ok(HangupRequest {
+        call_id: param_str(params, "call_id")?,
+        intent,
+        answer_id: answer_id_param(params, "call_hangup")?,
+    })
+}
+
+/// The id a page gives the Answer it is carrying out (`answer_id`), when it gives one: opaque,
+/// compared and never shown, so it is held to a short run of printable ASCII and nothing more. An
+/// absent one is a page too old to give it.
+fn answer_id_param(params: &Value, method: &str) -> Result<Option<String>> {
+    match params.get("answer_id") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(id))
+            if !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_graphic()) =>
+        {
+            Ok(Some(id.clone()))
+        }
+        Some(_) => anyhow::bail!("{method}: `answer_id` must be a short printable id"),
+    }
 }
 
 /// Which door ends this call, for what the press meant.
@@ -15637,7 +15808,8 @@ impl Ctx {
             source_request_sequence: 0,
             sending: Vec::new(),
             sharing: None,
-            conversation: CallConversation::default(),
+            conversation: CallConversation::answering(invite.conversation.controller.clone()),
+            accepting: None,
         };
 
         {
@@ -16255,8 +16427,58 @@ impl Ctx {
     /// and what each answer means. In a task of its own, for `call_place`'s reason: an attach's
     /// answer carries the door that really accepts the call, and an acceptance cancelled
     /// mid-flight leaves a caller talking to a machine that holds nothing.
-    async fn accept_ringing_call(self, call_id: String, sdp: String) -> Result<Value> {
-        let (local, callbacks, accept, attach, media_answer) = {
+    ///
+    /// It CLAIMS the ring first (docs/calling-roadmap/incoming-and-conversation.md § 4.4): only a
+    /// call still ringing, that no other Answer is carrying out, is taken. Anything else is an
+    /// OUTCOME and posts nothing — `answered_elsewhere` when another page of this backend is
+    /// answering it or has, `not_ringing` when it rings no more. It is an `Ok` rather than an
+    /// error because the press reached nobody, and the page reads it as the reason it is rather
+    /// than as a refusal. A claim that came to nothing — the call still ringing at the end, because
+    /// nothing was attached — is given back, so the next press can answer it.
+    async fn accept_ringing_call(self, call_id: String, sdp: String, answer_id: String) -> Result<Value> {
+        let claimed = {
+            let mut plane = self.calling.lock().unwrap();
+            match plane.call.as_mut().filter(|c| c.id == call_id && !c.ended()) {
+                None => Err("not_ringing"),
+                Some(call) if call.accepting.is_some() || call.phase == CallPhase::Connected => {
+                    Err("answered_elsewhere")
+                }
+                Some(call) if call.phase != CallPhase::Ringing => Err("not_ringing"),
+                Some(call) => {
+                    call.accepting = Some(answer_id);
+                    Ok(())
+                }
+            }
+        };
+        if let Err(outcome) = claimed {
+            eprintln!("[calling] call_accept: nothing to answer here ({outcome}) — nothing was sent");
+            return Ok(json!({ "call_id": call_id, "outcome": outcome }));
+        }
+        // Every other page stops offering Answer from here.
+        self.emit_call_state();
+        let taken = self.clone().take_the_ringing_call(call_id.clone(), sdp).await;
+        // The claim is over either way: an answer that took the call is no longer being carried
+        // out, and one that came to nothing — the call still RINGING, because nothing was
+        // attached — gives the ring back to the next press.
+        let given_back = {
+            let mut plane = self.calling.lock().unwrap();
+            match plane.call.as_mut().filter(|c| c.id == call_id) {
+                Some(call) => {
+                    call.accepting = None;
+                    call.phase == CallPhase::Ringing
+                }
+                None => false,
+            }
+        };
+        if given_back {
+            self.emit_call_state();
+        }
+        taken
+    }
+
+    /// Take the ringing call `call_id` (see [`Ctx::accept_ringing_call`], which claims it first).
+    async fn take_the_ringing_call(self, call_id: String, sdp: String) -> Result<Value> {
+        let (local, callbacks, accept, attach, media_answer, joining_controller) = {
             let plane = self.calling.lock().unwrap();
             let call = plane
                 .call
@@ -16269,19 +16491,37 @@ impl Ctx {
                 call.links.accept().map(str::to_string),
                 call.links.attach().map(str::to_string),
                 call.links.media_answer().map(str::to_string),
+                // Where the attach JOINS the conversation, when this call's protocol asks for it
+                // and its invite named the controller. Without a controller there is nothing to
+                // join, and the measured attach is what takes the call.
+                (call.conversation.protocol.incoming == calling::IncomingProtocol::JoinAtAnswer)
+                    .then(|| call.conversation.controller.clone())
+                    .flatten(),
             )
         };
         let answer = calling::MediaContent::sdp(sdp);
         // Which door was used decides whether the media still has to be answered
         // separately below: the acceptance body carries the answer, an attach does not.
         let mut used_attach = false;
+        let mut taken_by = AttachOutcome::NotAttempted;
         let (url, payload) = match (accept, attach, media_answer) {
             (Some(url), _, _) => {
                 (url, calling::acceptance_payload(&local, &answer, &callbacks))
             }
             (None, Some(url), _) => {
                 used_attach = true;
-                (url, calling::attach_payload(&local, &answer, &callbacks))
+                match &joining_controller {
+                    // The client's own flow: the attach claims the leg AND joins the
+                    // conversation, and carries no media — the acceptance after it does.
+                    Some(controller) => {
+                        taken_by = AttachOutcome::JoinedConversation;
+                        (url, calling::attach_join_payload(&local, controller, &callbacks, false))
+                    }
+                    None => {
+                        taken_by = AttachOutcome::Measured;
+                        (url, calling::attach_payload(&local, &answer, &callbacks))
+                    }
+                }
             }
             (None, None, Some(url)) => {
                 (url, calling::media_answer_payload(&local, &answer, &callbacks, &[calling::MODALITY_AUDIO]))
@@ -16291,13 +16531,93 @@ impl Ctx {
                 anyhow::bail!("call_accept: the invite carried no link to answer on")
             }
         };
-        match self.post_signal_for(&call_id, calling::SignalClass::Create, &url, &payload).await {
+        let began = std::time::Instant::now();
+        let mut first = self.post_signal_for(&call_id, calling::SignalClass::Create, &url, &payload).await;
+        // THE ONE FALLBACK, and only on a DEFINITIVE refusal. A 4xx says the joining attach was
+        // read and turned down, so it created nothing, and the measured attach on the same door
+        // is not a second attach. A timeout, a 5xx or a dropped connection is NOT that — the leg
+        // may be claimed, and attaching again would claim it twice — so it ends the call exactly
+        // as the measured flow's own failure does.
+        if taken_by == AttachOutcome::JoinedConversation
+            && let Err(e) = &first
+            && let Some(refused) = e.downcast_ref::<calling::SignalRefused>()
+        {
+            let status = refused.status;
+            // The refusal created nothing — so a call that went WHILE it travelled (a Decline, the
+            // ring's expiry, the handler's wait running out, an ending frame) must not be taken by
+            // the fallback: that would claim a leg the user let go, and stop it ringing on their
+            // other devices for a call this machine no longer holds. Every other creating request
+            // of this answer re-reads the reservation first; this one has to as well.
+            let still_here = self
+                .calling
+                .lock()
+                .unwrap()
+                .call
+                .as_ref()
+                .is_some_and(|c| c.id == call_id && !c.ended());
+            if !still_here {
+                eprintln!(
+                    "[calling] the attach that joins the conversation was refused ({status}) and the \
+                     call went meanwhile — nothing was taken, so nothing more is sent"
+                );
+                return Ok(json!({ "call_id": call_id, "cancelled": true }));
+            }
+            // And only while the requests after it still fit the handler's wait: the fallback and
+            // the acceptance are two more creating requests, and a start that outlives the wait
+            // has already been ended here by the time they would land.
+            if !fallback_still_fits(began.elapsed()) {
+                eprintln!(
+                    "[calling] the attach that joins the conversation was refused ({status}) too late \
+                     to take the call the measured way inside the start's wait"
+                );
+                self.end_call_if_still(&call_id, "CallEndReasonAcceptFailed").await;
+                anyhow::bail!("call_accept: the call did not start in time");
+            }
+            eprintln!(
+                "[calling] the attach that joins the conversation was refused ({status}) — taking \
+                 the call the measured way instead"
+            );
+            taken_by = AttachOutcome::JoinRefused(status);
+            let measured = calling::attach_payload(&local, &answer, &callbacks);
+            first = self.post_signal_for(&call_id, calling::SignalClass::Create, &url, &measured).await;
+        }
+        match first {
             Ok(response) => {
                 Ctx::note_answer_shapes(
-                    if used_attach { "call_accept (attach)" } else { "call_accept" },
+                    match taken_by {
+                        AttachOutcome::JoinedConversation => "call_accept (attach, joining the conversation)",
+                        _ if used_attach => "call_accept (attach)",
+                        _ => "call_accept",
+                    },
                     &response,
                 );
-                let links = calling::Links::collect(&response);
+                // Our own callbacks are never a door, wherever an answer echoes them — and an
+                // answer that JOINED a conversation carries that conversation's links beside the
+                // leg's, which is where an echo would hide.
+                let links = calling::Links::collect(&response).without_prefix(&callbacks.surl);
+                // The conversation the join answered with, read off its own top-level doors.
+                let joined = (taken_by == AttachOutcome::JoinedConversation)
+                    .then(|| calling::ConversationLeg::from_response(&response, &callbacks.surl))
+                    .flatten();
+                // Where a leg this answer took is hung up if the call goes before it is answered —
+                // ONE table for every orphan path below: a leg that joined its conversation leaves
+                // it there, as its own hangup would (`CallSession::hangup_link`), and any other leg
+                // keeps the merged chain.
+                let orphan_doors = match joined.as_ref().and_then(calling::ConversationLeg::leave) {
+                    Some(leave) => calling::Links::collect(&json!({ "links": { "leave": leave } })),
+                    None => links.clone(),
+                };
+                if used_attach {
+                    eprintln!(
+                        "[calling] the leg was taken ({}), the conversation {}",
+                        taken_by.word(),
+                        match &joined {
+                            Some(leg) if leg.leave().is_some() => "named its leave",
+                            Some(_) => "was joined but named no leave",
+                            None => "was not joined",
+                        }
+                    );
+                }
                 // What the service handed back, by NAME — the shape and never the
                 // content, which is the discipline `calling::media_sections` already
                 // follows. It is here because an ATTACH that succeeds is not yet a call:
@@ -16311,6 +16631,7 @@ impl Ctx {
                             call.links.merge(&links);
                             call.phase = CallPhase::Connected;
                             call.connected_at_ms = Some(now_ms());
+                            call.conversation.attach = taken_by;
                             true
                         }
                         None => false,
@@ -16319,9 +16640,15 @@ impl Ctx {
                 if !held {
                     // The user hung up while the acceptance was in flight, so the caller
                     // is now in a call with a machine that holds nothing: end it on the
-                    // links the acceptance answered with (see `call_place`).
-                    self.hang_up_orphan("call_accept", &call_id, &local, &links).await;
+                    // links the acceptance answered with (see `call_place`). A leg that joined
+                    // its conversation is left there, as its hangup would have been.
+                    self.hang_up_orphan("call_accept", &call_id, &local, &orphan_doors).await;
                     return Ok(json!({ "call_id": call_id, "cancelled": true }));
+                }
+                // The conversation's doors, now the call is known to be held — `leave` for the
+                // hangup, `updateEndpointState` for the mute — through the sequence gate.
+                if let Some(leg) = joined.clone() {
+                    self.adopt_conversation(&call_id, leg);
                 }
                 // AN ATTACH IS NOT AN ACCEPT, and this is the second half of taking a
                 // call here. Measured 2026-09-04: the attach POST was accepted and the
@@ -16359,7 +16686,7 @@ impl Ctx {
                         // The call went between the attach's answer and this read — the user
                         // hung up, or the handler's wait ran out. The attach claimed the forked
                         // leg, so it is hung up on the attach's own links.
-                        self.hang_up_orphan("call_accept (attach)", &call_id, &local, &links).await;
+                        self.hang_up_orphan("call_accept (attach)", &call_id, &local, &orphan_doors).await;
                         return Ok(json!({ "call_id": call_id, "cancelled": true }));
                     };
                     if let Some((url, is_acceptance)) = next {
@@ -16413,8 +16740,10 @@ impl Ctx {
                                     // posted on the attach's `callLeg`, this repeats it, which
                                     // costs one refused request and never leaves a caller talking
                                     // to silence.
-                                    let mut all = links.clone();
-                                    all.merge(&more);
+                                    let mut all = orphan_doors.clone();
+                                    if joined.is_none() {
+                                        all.merge(&more.without_prefix(&callbacks.surl));
+                                    }
                                     self.hang_up_orphan("call_accept (acceptance)", &call_id, &local, &all)
                                         .await;
                                     return Ok(json!({ "call_id": call_id, "cancelled": true }));
@@ -16434,7 +16763,7 @@ impl Ctx {
                                     .as_ref()
                                     .is_some_and(|c| c.id == call_id && !c.ended());
                                 if gone {
-                                    self.hang_up_orphan("call_accept (acceptance)", &call_id, &local, &links)
+                                    self.hang_up_orphan("call_accept (acceptance)", &call_id, &local, &orphan_doors)
                                         .await;
                                     return Ok(json!({ "call_id": call_id, "cancelled": true }));
                                 }
@@ -16443,6 +16772,20 @@ impl Ctx {
                     }
                 }
                 self.emit_call_state();
+                // The client publishes its endpoint state once at accept
+                // (`evaluateEndpointStatesForAccept`), so a call answered under `endpoint-state`
+                // tells the conversation whether the user can be heard from its first moment —
+                // not only at their first press. Spawned: it is a publish on the user's behalf,
+                // and the answer the page is waiting for does not depend on it.
+                if let Some((url, body, sequence)) =
+                    self.calling.lock().unwrap().endpoint_state_at_accept(&call_id)
+                {
+                    let ctx = self.clone();
+                    let id = call_id.clone();
+                    tokio::spawn(async move {
+                        ctx.post_endpoint_state(&id, &url, &body, sequence).await;
+                    });
+                }
                 Ok(json!({ "call_id": call_id }))
             }
             Err(e) => {
@@ -18816,6 +19159,7 @@ mod tests {
             sending: Vec::new(),
             sharing: None,
             conversation: CallConversation::default(),
+            accepting: None,
         };
         let json = call.json();
         assert_eq!(json["phase"], "ringing");
@@ -18874,6 +19218,7 @@ mod tests {
             sending: Vec::new(),
             sharing: None,
             conversation: CallConversation::default(),
+            accepting: None,
         };
         assert_eq!(call.json()["can_accept"], false);
         // And a call that is over offers nothing at all.
@@ -18929,6 +19274,7 @@ mod tests {
                 leave: Some("https://cc/live/sharing/leave".into()),
             }),
             conversation: CallConversation::default(),
+            accepting: None,
         }
     }
 
@@ -19073,7 +19419,7 @@ mod tests {
         let local = call_on_session("live").local;
         let door = Some("https://cc/conv/ues".to_string());
         let EndpointStatePlan::Send { body, sequence: 1, .. } =
-            CallConversation::started_here().plan(true, door.clone(), &local, true)
+            CallConversation::started_here().plan(true, door.clone(), &local, true, false)
         else {
             panic!("a first mute was not sent");
         };
@@ -19085,10 +19431,10 @@ mod tests {
         assert_eq!(body["endpointState"]["endpointStateSequenceNumber"], 1);
         // The seed reads as not muted, so a first Unmute is still nothing new to send.
         assert_eq!(
-            CallConversation::started_here().plan(false, door.clone(), &local, true),
+            CallConversation::started_here().plan(false, door.clone(), &local, true, false),
             EndpointStatePlan::Holds
         );
-        let EndpointStatePlan::Send { body, .. } = CallConversation::default().plan(true, door, &local, true)
+        let EndpointStatePlan::Send { body, .. } = CallConversation::default().plan(true, door, &local, true, false)
         else {
             panic!("a first mute was not sent");
         };
@@ -19108,8 +19454,12 @@ mod tests {
         let (_, publish, _) = plane.record_mute("call-1", true, None).unwrap();
         assert!(matches!(publish, MutePublish::EndpointState(_)), "{publish:?}");
         let state = call_state_json(&plane, facts(true, None));
-        assert_eq!(state["protocol"], json!({ "mute": "legacy" }), "the backend's setting");
-        assert_eq!(state["call"]["protocol"], json!({ "mute": "endpoint-state" }), "the call's own");
+        assert_eq!(state["protocol"], json!({ "mute": "legacy", "incoming": "answer" }), "the backend's setting");
+        assert_eq!(
+            state["call"]["protocol"],
+            json!({ "mute": "endpoint-state", "incoming": "answer" }),
+            "the call's own"
+        );
     }
 
     /// A mute pressed before the conversation named its door is OWED, and delivered once an
@@ -19209,11 +19559,11 @@ mod tests {
         let arm = between("calling::MuteProtocol::EndpointState => {", "Ok((call.local.clone(), publish, call.mute_seq))");
         assert!(!arm.contains("links.mute()") && !arm.contains("mute_payload"), "{arm}");
         assert!(arm.contains("endpoint_state_door("), "{arm}");
-        let plan = between("fn plan(&mut self, muted: bool", "fn settle(&mut self");
+        let plan = between("    fn plan(\n", "fn settle(&mut self");
         assert!(!plan.contains(".mute()"), "{plan}");
         // And the function that CHOOSES the door reads the endpoint-state door on both of its
         // branches, never the mute link.
-        let door = between("fn endpoint_state_door(&self", "fn plan(&mut self");
+        let door = between("fn endpoint_state_door(&self", "    fn plan(\n");
         assert_eq!(door.matches("update_endpoint_state()").count(), 2, "{door}");
         assert!(!door.contains(".mute()") && !door.contains("\"mute\""), "{door}");
 
@@ -19221,7 +19571,12 @@ mod tests {
         // incoming call starts from nothing (calling::start_endpoint_state).
         assert_eq!(code.matches("conversation: CallConversation::started_here(),").count(), 2);
         let incoming = between("async fn handle_incoming_call(", "plane.admit(call);");
-        assert!(incoming.contains("conversation: CallConversation::default(),"), "{incoming}");
+        assert!(
+            incoming.contains("conversation: CallConversation::answering(invite.conversation.controller.clone()),"),
+            "{incoming}"
+        );
+        let answering = between("fn answering(controller: Option<String>) -> Self {", "\n    }");
+        assert!(answering.contains("Self { controller, ..Self::default() }"), "{answering}");
 
         // The setting's write is serialized on its own turn, and the plane's lock is never held
         // across the store write.
@@ -20264,7 +20619,7 @@ mod tests {
                 .collect()
         );
         // The protocol a call started from now on speaks — the legacy flow out of the box.
-        assert_eq!(state["protocol"], json!({ "mute": "legacy" }));
+        assert_eq!(state["protocol"], json!({ "mute": "legacy", "incoming": "answer" }));
         assert_eq!(state["enabled"], true);
         assert_eq!(state["ready"], false);
         assert_eq!(state["call"], Value::Null);
@@ -21280,11 +21635,20 @@ mod tests {
         reply: &'static str,
         delay: Duration,
     ) -> (String, std::sync::mpsc::Receiver<String>) {
+        stand_in_answers(vec![("200 OK", reply.to_string())], delay)
+    }
+
+    /// A stand-in that answers one request per entry of `replies`, in order — a status line and
+    /// a body each — every one after `delay`, and hands back each request it received.
+    fn stand_in_answers(
+        replies: Vec<(&'static str, String)>,
+        delay: Duration,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
         let address = listener.local_addr().expect("its address");
         let (received, requests) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        std::thread::spawn(move || for (status, reply) in replies {
             let Ok((mut socket, _)) = listener.accept() else { return };
             // Read until the declared body is whole, so the request is reported complete.
             let mut request = Vec::new();
@@ -21311,7 +21675,7 @@ mod tests {
             std::thread::sleep(delay);
             let _ = socket.write_all(
                 format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
                      connection: close\r\n\r\n{reply}",
                     reply.len()
                 )
@@ -21436,7 +21800,7 @@ mod tests {
         call.links = calling::Links::collect(&json!({ "links": { "attach": attach } }));
         ctx.calling.lock().unwrap().call = Some(call);
 
-        let start = ctx.clone().accept_ringing_call("call-1".into(), "v=0".into());
+        let start = ctx.clone().accept_ringing_call("call-1".into(), "v=0".into(), "answer-1".into());
         let waited = detached(Duration::from_millis(300), start).await;
         assert!(matches!(waited, Detached::StillRunning), "the acceptance should still be out");
         attaches.recv_timeout(Duration::from_secs(5)).expect("the attach went out");
@@ -21452,6 +21816,327 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("the late acceptance was never hung up — the caller would hear silence");
         assert!(told.contains("callTransactionEnd"), "the hangup body: {told}");
+    }
+
+    /// A ringing incoming call this backend can take, its protocol chosen by `incoming`, with an
+    /// invite that named `attach` and the conversation's controller.
+    fn ringing_incoming_call(attach: &str, incoming: calling::IncomingProtocol) -> CallSession {
+        let mut call = call_on_session("live");
+        call.direction = CallDirection::Incoming;
+        call.phase = CallPhase::Ringing;
+        call.connected_at_ms = None;
+        call.offer = Some(calling::MediaContent::sdp("v=0 offer"));
+        call.links = calling::Links::collect(&json!({ "links": { "attach": attach } }));
+        call.conversation = CallConversation::answering(Some("https://conv/controller/".into()));
+        call.conversation.protocol.incoming = incoming;
+        call
+    }
+
+    /// The body of a request a stand-in received, parsed.
+    fn request_body(request: &str) -> Value {
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("not JSON ({e}): {body}"))
+    }
+
+    /// UNDER `join-at-answer` THE ATTACH JOINS THE CONVERSATION, and the call learns where to leave
+    /// it. Driven end to end: the attach carries the join and no media, the acceptance after it
+    /// carries our answer, the conversation's own doors land on the call, and its hangup is the
+    /// conversation's `leave` — the door the measured flow never had.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_answer_that_joins_the_conversation_learns_where_to_leave_it() {
+        let (acceptance, acceptances) = stand_in_service("{}", Duration::ZERO);
+        // The leg names a `hangup` of its own, which the merged chain PREFERS over the
+        // conversation's `leave` — so the call's door is told apart from the old chain's.
+        let attached = format!(
+            r#"{{"callInvitation":{{"links":{{"acceptance":"{acceptance}","callLeg":"https://cc/leg",
+                  "hangup":"https://cc/leg/hangup"}}}},
+                "additionalActionResponses":[{{"output":{{"sequenceNumber":1,
+                  "links":{{"leave":"https://conv/leave","updateEndpointState":"https://conv/ues"}}}}}}]}}"#
+        );
+        let (attach, attaches) = stand_in_answers(vec![("200 OK", attached)], Duration::ZERO);
+        let ctx = sending_ctx("https://conversation.invalid/").await;
+        let call = ringing_incoming_call(&attach, calling::IncomingProtocol::JoinAtAnswer);
+        ctx.calling.lock().unwrap().call = Some(call);
+
+        let answered = ctx.clone().accept_ringing_call("call-1".into(), "v=0 answer".into(), "answer-1".into()).await;
+        assert_eq!(answered.expect("answered"), json!({ "call_id": "call-1" }));
+
+        let attach_body = request_body(&attaches.recv_timeout(Duration::from_secs(5)).expect("attach"));
+        assert_eq!(attach_body["additionalActions"][0]["url"], "https://conv/controller/");
+        assert!(attach_body.pointer("/attach/mediaContent").is_none(), "{attach_body}");
+        let accepted = request_body(&acceptances.recv_timeout(Duration::from_secs(5)).expect("acceptance"));
+        assert_eq!(accepted.pointer("/callAcceptance/mediaContent/blob"), Some(&json!("v=0 answer")));
+
+        let plane = ctx.calling.lock().unwrap();
+        let call = plane.call.as_ref().expect("the call");
+        assert_eq!(call.phase, CallPhase::Connected);
+        assert_eq!(call.conversation.attach, AttachOutcome::JoinedConversation);
+        assert!(call.accepting.is_none(), "a call that is answered holds no claim");
+        assert_eq!(call.links.hangup(), Some("https://cc/leg/hangup"), "the fixture makes the old chain disagree");
+        assert_eq!(
+            call.conversation.leg.as_ref().and_then(|leg| leg.leave()),
+            Some("https://conv/leave"),
+            "the conversation the join answered with was adopted"
+        );
+        assert_eq!(call.hangup_link(), Some("https://conv/leave"), "an answered call that joined leaves its conversation");
+    }
+
+    /// A JOIN REFUSED OUTRIGHT FALLS BACK TO THE MEASURED ATTACH, ONCE — and nothing else does. A
+    /// 4xx created nothing, so the measured attach on the same door is not a second attach; its
+    /// call is then hung up on the leg, as every measured call is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_join_falls_back_to_the_measured_attach_once() {
+        let (acceptance, acceptances) = stand_in_service("{}", Duration::ZERO);
+        let (attach, attaches) = stand_in_answers(
+            vec![
+                ("400 Bad Request", r#"{"errors":{"AdditionalActions":["not allowed"]}}"#.into()),
+                ("200 OK", format!(r#"{{"links":{{"acceptance":"{acceptance}","callLeg":"https://cc/leg"}}}}"#)),
+            ],
+            Duration::ZERO,
+        );
+        let ctx = sending_ctx("https://conversation.invalid/").await;
+        ctx.calling.lock().unwrap().call =
+            Some(ringing_incoming_call(&attach, calling::IncomingProtocol::JoinAtAnswer));
+
+        ctx.clone().accept_ringing_call("call-1".into(), "v=0 answer".into(), "answer-1".into()).await.expect("answered");
+        let joining = request_body(&attaches.recv_timeout(Duration::from_secs(5)).expect("the join"));
+        assert!(joining.get("additionalActions").is_some(), "{joining}");
+        let measured = request_body(&attaches.recv_timeout(Duration::from_secs(5)).expect("the fallback"));
+        assert_eq!(measured.pointer("/attach/mediaContent/blob"), Some(&json!("v=0 answer")), "{measured}");
+        assert!(measured.get("additionalActions").is_none(), "the fallback is the measured body");
+        acceptances.recv_timeout(Duration::from_secs(5)).expect("the acceptance");
+
+        let plane = ctx.calling.lock().unwrap();
+        let call = plane.call.as_ref().expect("the call");
+        assert_eq!(call.conversation.attach, AttachOutcome::JoinRefused(400));
+        assert_eq!(call.hangup_link(), Some("https://cc/leg"), "a call taken the measured way keeps its door");
+    }
+
+    /// A REFUSED JOIN TAKES NOTHING FOR A CALL THAT WENT WHILE IT TRAVELLED. The refusal created
+    /// nothing, so a Decline, the ring's expiry or the handler's wait running out meanwhile must
+    /// not be answered by the fallback claiming the leg the user let go. The review of M4a found
+    /// the fallback posted with no such check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_join_takes_nothing_for_a_call_that_went_meanwhile() {
+        let (attach, attaches) = stand_in_answers(
+            vec![
+                ("400 Bad Request", "{}".into()),
+                ("200 OK", r#"{"links":{"callLeg":"https://cc/leg"}}"#.into()),
+            ],
+            Duration::from_millis(500),
+        );
+        let ctx = sending_ctx("https://conversation.invalid/").await;
+        ctx.calling.lock().unwrap().call =
+            Some(ringing_incoming_call(&attach, calling::IncomingProtocol::JoinAtAnswer));
+        let start = ctx.clone().accept_ringing_call("call-1".into(), "v=0".into(), "answer-1".into());
+        assert!(matches!(detached(Duration::from_millis(150), start).await, Detached::StillRunning));
+        attaches.recv_timeout(Duration::from_secs(5)).expect("the join went out");
+        // The call goes while the join is on the wire.
+        ctx.end_call_if_still("call-1", calling::END_REASON_LEFT_RINGING).await;
+        assert!(
+            attaches.recv_timeout(Duration::from_millis(1500)).is_err(),
+            "the fallback claimed a leg for a call this machine no longer holds"
+        );
+    }
+
+    /// The fallback is taken only while the two creating requests after it fit the start's wait —
+    /// so the longest answer this flow can make stays inside `CALL_START_WAIT`.
+    #[test]
+    fn a_fallback_is_taken_only_while_the_rest_of_the_answer_fits_the_wait() {
+        let create = calling::SignalClass::Create.timeout();
+        assert!(fallback_still_fits(Duration::from_secs(2)), "an ordinary refusal falls back");
+        assert!(!fallback_still_fits(CALL_START_WAIT - create * 2), "the bound is strict");
+        assert!(!fallback_still_fits(create), "a refusal that took a whole Create bound does not");
+        // And the measured answer's own two requests still fit the wait.
+        assert!(create * 2 < CALL_START_WAIT);
+    }
+
+    /// A CALL ANSWERED UNDER `endpoint-state` PUBLISHES ITS MUTE ONCE AT ACCEPT, on the joined
+    /// conversation's own door, even unmuted — nothing was ever published on that leg — and a call
+    /// under the legacy mute publishes nothing there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_answered_call_publishes_its_mute_once_at_accept() {
+        for (mute, expect_publish) in
+            [(calling::MuteProtocol::EndpointState, true), (calling::MuteProtocol::Legacy, false)]
+        {
+            let (acceptance, _acceptances) = stand_in_service("{}", Duration::ZERO);
+            let (ues, publishes) = stand_in_service("{}", Duration::ZERO);
+            let attached = format!(
+                r#"{{"callInvitation":{{"links":{{"acceptance":"{acceptance}","callLeg":"https://cc/leg"}}}},
+                    "additionalActionResponses":[{{"output":{{"sequenceNumber":1,
+                      "links":{{"leave":"https://conv/leave","updateEndpointState":"{ues}"}}}}}}]}}"#
+            );
+            let (attach, _attaches) = stand_in_answers(vec![("200 OK", attached)], Duration::ZERO);
+            let ctx = sending_ctx("https://conversation.invalid/").await;
+            let mut call = ringing_incoming_call(&attach, calling::IncomingProtocol::JoinAtAnswer);
+            call.conversation.protocol.mute = mute;
+            ctx.calling.lock().unwrap().call = Some(call);
+            ctx.clone().accept_ringing_call("call-1".into(), "v=0".into(), "answer-1".into()).await.expect("answered");
+            let published = publishes.recv_timeout(Duration::from_secs(3));
+            if expect_publish {
+                let body = request_body(&published.expect("the mute was not published at accept"));
+                assert_eq!(body.pointer("/endpointState/state/isMuted"), Some(&json!(false)), "{body}");
+                assert_eq!(body.pointer("/endpointState/endpointStateSequenceNumber"), Some(&json!(1)));
+            } else {
+                assert!(published.is_err(), "the legacy mute published on updateEndpointState");
+            }
+        }
+    }
+
+    /// OUR OWN CALLBACKS ARE NEVER A DOOR, wherever the attach's answer echoes them: an `end` on
+    /// this call's own surl would otherwise rank above the leg and be where its hangup goes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_answer_that_echoes_our_own_callbacks_never_makes_them_a_door() {
+        let (acceptance, _acceptances) = stand_in_service("{}", Duration::ZERO);
+        let attached = format!(
+            r#"{{"callInvitation":{{"links":{{"acceptance":"{acceptance}","callLeg":"https://cc/leg",
+                  "end":"https://tr/v4/f/a/callAgent/live/c/call/end/"}}}},
+                "additionalActionResponses":[{{"output":{{"sequenceNumber":1,
+                  "links":{{"updateEndpointState":"https://conv/ues"}}}}}}]}}"#
+        );
+        let (attach, _attaches) = stand_in_answers(vec![("200 OK", attached)], Duration::ZERO);
+        let ctx = sending_ctx("https://conversation.invalid/").await;
+        ctx.calling.lock().unwrap().call =
+            Some(ringing_incoming_call(&attach, calling::IncomingProtocol::JoinAtAnswer));
+        ctx.clone().accept_ringing_call("call-1".into(), "v=0".into(), "answer-1".into()).await.expect("answered");
+        let plane = ctx.calling.lock().unwrap();
+        let call = plane.call.as_ref().unwrap();
+        assert!(
+            !call.links.names().iter().any(|name| call.links.get(&[name]).is_some_and(|u| u.starts_with(&call.callbacks.surl))),
+            "our own callback joined the door table: {:?}",
+            call.links.names()
+        );
+        assert_eq!(call.hangup_link(), Some("https://cc/leg"), "with no leave, the leg is the door");
+    }
+
+    /// A JOIN THAT WAS NOT ANSWERED IS NEVER ATTACHED AGAIN. A 5xx, a timeout or a dropped
+    /// connection says nothing about whether the leg was claimed, so a second attach could claim
+    /// it twice: the call ends here exactly as the measured flow's own failure does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_join_that_failed_without_a_refusal_is_never_attached_again() {
+        let (attach, attaches) = stand_in_answers(
+            vec![("503 Service Unavailable", "{}".into()), ("200 OK", "{}".into())],
+            Duration::ZERO,
+        );
+        let ctx = sending_ctx("https://conversation.invalid/").await;
+        ctx.calling.lock().unwrap().call =
+            Some(ringing_incoming_call(&attach, calling::IncomingProtocol::JoinAtAnswer));
+        let failed = ctx.clone().accept_ringing_call("call-1".into(), "v=0".into(), "answer-1".into()).await;
+        assert!(failed.is_err(), "{failed:?}");
+        attaches.recv_timeout(Duration::from_secs(5)).expect("the join");
+        assert!(
+            attaches.recv_timeout(Duration::from_millis(800)).is_err(),
+            "a join with no definite answer was attached again"
+        );
+        assert!(ctx.calling.lock().unwrap().call.is_none(), "the call ended here");
+    }
+
+    /// The MEASURED flow is untouched by a protocol that does not ask for the join: its attach is
+    /// the body it always was, and it joins nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_measured_answer_joins_nothing() {
+        let (acceptance, _acceptances) = stand_in_service("{}", Duration::ZERO);
+        let (attach, attaches) = stand_in_answers(
+            vec![("200 OK", format!(r#"{{"links":{{"acceptance":"{acceptance}","callLeg":"https://cc/leg"}}}}"#))],
+            Duration::ZERO,
+        );
+        let ctx = sending_ctx("https://conversation.invalid/").await;
+        ctx.calling.lock().unwrap().call =
+            Some(ringing_incoming_call(&attach, calling::IncomingProtocol::Answer));
+        ctx.clone().accept_ringing_call("call-1".into(), "v=0 answer".into(), "answer-1".into()).await.expect("answered");
+        let body = request_body(&attaches.recv_timeout(Duration::from_secs(5)).expect("attach"));
+        let local = ctx.calling.lock().unwrap().call.as_ref().unwrap().local.clone();
+        let callbacks = ctx.calling.lock().unwrap().call.as_ref().unwrap().callbacks.clone();
+        assert_eq!(
+            body,
+            calling::attach_payload(&local, &calling::MediaContent::sdp("v=0 answer"), &callbacks),
+            "the measured attach is byte for byte its own builder"
+        );
+        let plane = ctx.calling.lock().unwrap();
+        assert_eq!(plane.call.as_ref().unwrap().conversation.attach, AttachOutcome::Measured);
+    }
+
+    /// A SECOND ANSWER IS AN OUTCOME AND NEVER A DECLINE. Another window's Answer has claimed the
+    /// ring, or has already taken it, or the ring is gone: the press reached nobody, so it posts
+    /// nothing and is answered with the reason — an `Ok`, because the page must not read it as a
+    /// refusal. And while a claim stands the ring is not answerable from any other window, which
+    /// says why.
+    #[tokio::test]
+    async fn a_second_answer_is_an_outcome_and_never_a_decline() {
+        let ctx = sending_ctx("https://conversation.invalid/").await;
+        // Nothing listens there: any request this press made would fail the test.
+        let mut call = ringing_incoming_call("http://127.0.0.1:9/attach", calling::IncomingProtocol::Answer);
+        call.accepting = Some("answer-0".into());
+        assert_eq!(call.json()["can_accept"], false);
+        assert_eq!(call.json()["accept_blocked_reason"], "This call is being answered in another window.");
+        ctx.calling.lock().unwrap().call = Some(call);
+        let second = ctx.clone().accept_ringing_call("call-1".into(), "v=0".into(), "answer-1".into()).await.unwrap();
+        assert_eq!(second, json!({ "call_id": "call-1", "outcome": "answered_elsewhere" }));
+        assert_eq!(
+            ctx.calling.lock().unwrap().call.as_ref().unwrap().accepting.as_deref(),
+            Some("answer-0"),
+            "the other claim stands"
+        );
+
+        // The state a FINISHED answer leaves: no claim, and the call connected — the phase alone
+        // decides.
+        {
+            let mut plane = ctx.calling.lock().unwrap();
+            let call = plane.call.as_mut().unwrap();
+            call.accepting = None;
+            call.phase = CallPhase::Connected;
+        }
+        let taken = ctx.clone().accept_ringing_call("call-1".into(), "v=0".into(), "answer-1".into()).await.unwrap();
+        assert_eq!(taken["outcome"], "answered_elsewhere");
+
+        ctx.calling.lock().unwrap().call = None;
+        let gone = ctx.clone().accept_ringing_call("call-1".into(), "v=0".into(), "answer-1".into()).await.unwrap();
+        assert_eq!(gone["outcome"], "not_ringing");
+    }
+
+    /// A DECLINE WHILE AN ANSWER IS CARRIED OUT IS NOT A DECLINE. The two presses disagree, and a
+    /// decline is the one the caller is shown and nothing takes back — so it lets the call go
+    /// here; every other door is unchanged.
+    #[test]
+    fn a_decline_under_an_answer_in_flight_lets_the_call_go_without_declining() {
+        // Another window's Decline under a claim is let go; the ANSWERING window's own Decline is
+        // the user changing their mind and declines; an older page (no id) answering is narrowed
+        // against everybody, itself included, because nothing can tell its press apart.
+        let claim = Some("answer-a");
+        assert_eq!(door_while_answering(HangupDoor::Reject, claim, None), HangupDoor::Nothing);
+        assert_eq!(door_while_answering(HangupDoor::Reject, claim, Some("answer-b")), HangupDoor::Nothing);
+        assert_eq!(door_while_answering(HangupDoor::Reject, claim, Some("answer-a")), HangupDoor::Reject);
+        assert_eq!(door_while_answering(HangupDoor::Reject, Some(""), None), HangupDoor::Nothing);
+        assert_eq!(door_while_answering(HangupDoor::Reject, None, None), HangupDoor::Reject);
+        for door in [HangupDoor::Hangup, HangupDoor::Nothing] {
+            assert_eq!(door_while_answering(door, claim, None), door);
+            assert_eq!(door_while_answering(door, None, None), door);
+        }
+        let arm = production_between("\"call_hangup\" => {", "\"call_mute\" => {");
+        let decided = arm.find("let door = hangup_door(").expect("the door");
+        let narrowed = arm.find("let door = door_while_answering(").expect("narrowed");
+        let used = arm.find("let url = match door {").expect("the url");
+        assert!(decided < narrowed && narrowed < used, "the narrowing decides the door that is used");
+        assert!(arm.contains("request.answer_id.as_deref()"), "the presser's own answer is compared");
+        assert!(
+            arm.contains("\"outcome\": \"answering\""),
+            "a Decline that was not sent as one says so to the window that pressed it"
+        );
+    }
+
+    /// A claim that came to nothing — the call still ringing, because nothing was attached — is
+    /// given back, so the next press can answer it; one that took the call stays taken.
+    #[test]
+    fn a_claim_that_came_to_nothing_is_given_back() {
+        let accept = production_between("async fn accept_ringing_call(", "async fn take_the_ringing_call(");
+        let claim = accept.find("call.accepting = Some(answer_id);").expect("the claim");
+        let take = accept.find("self.clone().take_the_ringing_call(").expect("the take");
+        let back = accept.find("call.accepting = None;").expect("the give-back");
+        assert!(claim < take && take < back, "{accept}");
+        let after = &accept[back..];
+        let told = after.find("call.phase == CallPhase::Ringing").expect("only a ringing call is re-offered");
+        let emit = after.find("self.emit_call_state();").expect("the pages are told it rings again");
+        assert!(told < emit, "{after}");
     }
 
     /// A LATE FAILURE ENDS ITS OWN CALL AND NO OTHER. A start runs in a task of its own and can

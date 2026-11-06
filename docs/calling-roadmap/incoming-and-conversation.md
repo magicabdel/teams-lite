@@ -139,6 +139,28 @@ code), **inferred** (neither).
   - `updateEndpointState`, so an incoming 1:1 can publish its mute (§ 4.7);
   - the acceptance acknowledgement's keep-alive door (§ 4.10).
 - **Status:** the door is measured. The body is read from the bundle. teams-lite has never posted it.
+- **As implemented (M4a, IC4a):** `calling::attach_join_payload(local, controller, callbacks,
+  require_media)` — the § 4.2 body, named for what it does at answer time (M4b's ring-time attach
+  will reuse it), with `ATTACH_ENDPOINT_CAPABILITIES = CAPTURED & !16` (73447) and the shared nine
+  conversation callbacks; its exact bytes are the golden pin `attach-join-at-answer.json`. The
+  controller is the invite's `conversationInvitation.conversationController` (M2's
+  `InviteConversation.controller`), kept on the call by `CallConversation::answering`; an invite
+  that named none is taken the measured way. `Ctx::take_the_ringing_call` posts it in the `Create`
+  class to the invite's `attach`, falls back to the measured `attach_payload` on the same door ONLY
+  on a `SignalRefused` (a 4xx), and otherwise ends the call `CallEndReasonAcceptFailed` as the
+  measured flow does. The answer's links are merged minus our own surl (`without_prefix`), its
+  conversation object is read by `ConversationLeg::from_response` and adopted through the sequence
+  gate once the call is held, and `CallConversation.attach` records `Measured`,
+  `JoinedConversation` or `JoinRefused(status)`. The acceptance after it is unchanged and posted to
+  the merged table's `acceptance`, which the attach answer's `callInvitation.links` supplies. The
+  fallback re-reads the call before it posts (a call let go while the refused join travelled is not
+  taken) and is taken only while `fallback_still_fits` (the measured attach and the acceptance still
+  fit `CALL_START_WAIT`). Every orphan path of one answer shares one door table: the joined
+  conversation's `leave`, else the merged chain. The
+  answer-time `AttachedLeg` struct of § 5 was NOT built: the merged table and the conversation leg
+  already hold every door M4a uses, and M4b will add the struct where it needs the leg alone.
+  Journal: `[calling] the leg was taken (<word>), the conversation named its leave`, and `the
+  attach that joins the conversation was refused (<status>) — taking the call the measured way`.
 
 ### 4.2 Attach and join at RING time (M4b, `incoming = ring`)
 
@@ -340,6 +362,23 @@ code), **inferred** (neither).
 
 - **Status:** the body and door are measured. The ack fields are read-from-bundle, and the
   interval VALUE is unmeasured (M2 journals it).
+- **As implemented (M4a, IC4a):** the claim is `CallSession.accepting: Option<String>`, the
+  `answer_id` the answering page sent (bounded printable ASCII; empty from an older page), taken in
+  `Ctx::accept_ringing_call` under the plane's lock: `answered_elsewhere` when another Answer holds
+  the claim or the call is `Connected`, `not_ringing` when it is gone, ended or not ringing — both
+  `Ok({call_id, outcome})`, posting nothing — and the claim is released on every path out, with a
+  `call_state` when the call still rings so other windows offer Answer again. While it stands,
+  `can_accept` is false and `accept_blocked_reason` is "This call is being answered in another
+  window."; the page keeps its own "Answering…" (`call-bar.tsx`) and says an outcome with
+  `answerOutcomeMessage`. A Decline under ANOTHER page's claim is let go here, never sent as a
+  decline (`door_while_answering(door, claim, presser)`), and `call_hangup` answers it with
+  `outcome: "answering"`, which the pressing window says (`DECLINE_NOT_SENT`); the answering
+  window's own Decline carries its `answer_id` and declines. An answer whose call was let go
+  meanwhile says `ANSWER_LET_GO_ELSEWHERE`. `claiming` and the InFlight wait are M4b's (there is no ring-time
+  attach to wait for yet). The endpoint state at accept is `CallingPlane::endpoint_state_at_accept`,
+  under `mute = endpoint-state` only, SENT whatever the conversation is believed to hold (the plan's
+  `always`), and spawned. The inline acknowledgement's keep-alive door and interval are journaled
+  (M2's `keep_alive_offer`, through `note_answer_shapes`) and NOT acted on: they are M6's.
 
 ### 4.5 Decline a ring attached at ring time (M4b)
 
@@ -388,6 +427,17 @@ code), **inferred** (neither).
 
   `LINKS.HANGUP` is assigned at @1335775, @1371775 and @1386788, and never posted to.
 - **Status:** for an incoming call, read-from-bundle. M4a's live check is the user's own End press.
+- **As implemented (M4a, IC4a):** `CallSession::hangup_link` — the conversation leg's `leave` for a
+  call whose `attach` is `JoinedConversation`, the merged `Links::hangup` chain for every other
+  call — used by `call_hangup`'s Hangup door. `hang_up_orphan` on the attached path posts to the
+  joined conversation's `leave` (`call_accept` builds a one-door table for it), and the late
+  acceptance's own orphan path hangs up on everything the two answers named. Pinned end to end by
+  `an_answer_that_joins_the_conversation_learns_where_to_leave_it`, with
+  `a_refused_join_falls_back_to_the_measured_attach_once`,
+  `a_join_that_failed_without_a_refusal_is_never_attached_again`,
+  `the_measured_answer_joins_nothing`, `a_second_answer_is_an_outcome_and_never_a_decline`,
+  `a_decline_under_an_answer_in_flight_lets_the_call_go_without_declining` and
+  `a_claim_that_came_to_nothing_is_given_back`.
 
 ### 4.7 Publish the user's own mute (M3, `mute = endpoint-state`)
 
@@ -1092,6 +1142,13 @@ declined.
   with until it ends." The checked option is the backend's word, a refusal is said under the row,
   and no row is drawn where `enabled` is false or the backend states no protocol.
   (`web/src/lib/calling-protocol.ts`, `web/src/components/calling-protocol-settings.tsx`.)
+- **As implemented (M4a, IC4a):** a second row above Mute, "Incoming calls", with "As before
+  (default)" ("How this app has always answered a call — the way that was tested with a
+  colleague.") and "Join the call's conversation when you answer" ("The Teams web client's own way.
+  When you hang up, the caller is told you left, and your mute can be shown to them."). "As before"
+  rather than "Measured", so the two rows name their defaults one way; the detail carries what
+  "measured" meant. A backend that states no `incoming` draws no such row. The ringing card a second
+  window shows is captured as `-ring-answered-elsewhere-{light,dark}` by `--call`.
 
 **Mobile:**
 - The ringing card keeps its full-width bottom layout.
@@ -1357,6 +1414,21 @@ Each milestone ships alone.
 - **`web/src/lib/call.ts`:** the header comment.
 
 ## 13. Review notes
+
+- **The review of M4a as built (2026-11-06; four reviewers, a skeptic per finding; 23 agents).**
+  Eleven findings survived (eight distinct) and all were fixed before it landed. (1) THE FALLBACK
+  POSTED WITH NO RE-CHECK, found by two reviewers: a join refused after the call was let go — a
+  Decline, the ring's expiry, the wait running out — was followed by the measured attach anyway,
+  claiming the leg the user had left for their phone. It now re-reads the call and stops; pinned end
+  to end (`a_refused_join_takes_nothing_for_a_call_that_went_meanwhile`). (2) THE ANSWERING WINDOW'S
+  OWN DECLINE was narrowed like another window's; the claim now names its answer (`answer_id`) and
+  that window's Decline declines. (3) The join, its fallback and the acceptance could outlast the
+  150 s wait; the fallback is taken only while the rest fits. (4) A Decline that was not sent said
+  nothing in either window; both now say what happened. (5)–(8) Test gaps: the hang-up-door test
+  could not tell the conversation's `leave` from the old chain (the fixture now makes them disagree),
+  the page's outcome branch, the mute at accept and the own-callback filter were untested, and the
+  `Connected` arm of the claim was masked; each now has a test. A mutation pass then broke 16 rules
+  (13 backend, 3 page) and every one was caught. Eight more findings were refuted.
 
 **What the reviewers changed** (each claim re-checked in the code or the bundle first):
 

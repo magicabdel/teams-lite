@@ -195,7 +195,7 @@ Three rules hold every phase:
 | PR7 | Calling from the image and Kubernetes verified (`--container` driver front) | plane-reliability M7 | M | Low (outcome unknown) | PR1, PR5 |
 | PRg | Gated by PR1's journal: registration extension (M2), refused registration (M9), outgoing ring cancel (M10; a timer-driven hangup, so it needs decision D2) | plane-reliability M2, M9, M10 | S each | Low–medium | PR1; PR10 also consumes RA5's `remote_progress_at_ms` (soft) |
 | IC3 | Per-backend protocol setting (`call_protocol_set`); mute published on `updateEndpointState` (off by default) | incoming-and-conversation M3 | S–M | Low–medium | meeting-awareness M1 (shared reader) |
-| IC4a | Incoming calls join their conversation when answered, so End reaches the caller | incoming-and-conversation M4a | M | Medium (opt-in, 4xx-only fallback) | IC0, IC3, PR4 (the transport API, collision 7) |
+| IC4a | **Landed (opt-in).** Incoming calls join their conversation when answered, so End reaches the caller | incoming-and-conversation M4a | M | Medium (opt-in, 4xx-only fallback) | IC0, IC3, PR4 (the transport API, collision 7) |
 | IC4b | Incoming calls are claimed when they ring (1:1 only, DELETE decline, ring-ended-elsewhere) | incoming-and-conversation M4b | M | Medium–high, **needs decision D1** | IC0, IC2, IC4a (and so PR4) |
 | IC5–IC7 | Promote what passed; keep-alives (opt-in, an automatic act listed in D2); group and meeting invitations ring as what they are | incoming-and-conversation M5–M7 | S / M / M | Low / medium / medium-low | IC5: IC4a, IC4b, IC7. IC6: IC3, IC4a. IC7: IC2, IC4a |
 | RA7–RA8 | A ring push and a ring-over push to your phone; missed-call alerts (both off by default) | ringing M7, M8 | M / S | Medium / low–medium | RA2, RA4; REC |

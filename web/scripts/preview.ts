@@ -2870,6 +2870,18 @@ if (import.meta.main) {
       await shot(`${out}-answer-failed-dark.png`);
       await setTheme("light");
 
+      // 3a. ANOTHER WINDOW is answering the ring: the backend's claim makes it unanswerable
+      //     here, and the card says why in place of Answer.
+      await emit({ kind: "call_claim" });
+      await page.waitForSelector('[data-testid="call-accept-blocked"]');
+      await page.waitForTimeout(200);
+      await shot(`${out}-ring-answered-elsewhere-light.png`, '[data-testid="call-bar"]');
+      await setTheme("dark");
+      await shot(`${out}-ring-answered-elsewhere-dark.png`, '[data-testid="call-bar"]');
+      await setTheme("light");
+      await emit({ kind: "call_claim", release: true });
+      await page.waitForSelector('[data-testid="call-answer"]');
+
       // 3b. The answer TRAVELLING: held at the attach, the card says so and takes no second
       //     press. Its release is what answers the call for step 4.
       await emit({ kind: "call_start", hold: "accept", hold_ms: 1500 });
@@ -3099,7 +3111,8 @@ if (import.meta.main) {
         `[preview] wrote ${out}-button-light.png, ${out}-off-light.png, ` +
           `${out}-call-unregistered-{light,dark}.png, ` +
           `${out}-ringing-{light,card-light,card-dark}.png and ` +
-          `${out}-answer-failed-{light,dark}.png, ${out}-answering-card-light.png and ` +
+          `${out}-answer-failed-{light,dark}.png, ${out}-ring-answered-elsewhere-{light,dark}.png, ` +
+          `${out}-answering-card-light.png and ` +
           `${out}-stage-{light,header-light,muted-light,dark}.png and ` +
           `${out}-mini-{light,page-light,dragged-light,dark,video-light}.png and ` +
           `${out}-group-{button-light,dialing-light,stage-light}.png and ` +

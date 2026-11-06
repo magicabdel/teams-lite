@@ -87,8 +87,13 @@ export type ActiveCall = {
    *  by the backend so two open pages agree and a reconnecting one is told rather than
    *  guessing from its own memory. */
   sending: string[];
-  /** Whether answering is possible — decided by the backend, which holds the links. */
+  /** Whether answering is possible — decided by the backend, which holds the links. False while
+   *  another page of this backend is answering the ring (the backend's claim). */
   can_accept: boolean;
+  /** Why this ring may not be answered from here, when it is because another window is
+   *  answering it — the sentence the ringing card says in place of Answer. Absent from a
+   *  backend too old to claim a ring. */
+  accept_blocked_reason?: string | null;
   can_hangup: boolean;
   /** Whether new media can be offered at all. The service refuses it on a call that is not
    *  established, and only the backend knows whether the link exists. */
@@ -209,10 +214,22 @@ export type CallStatus = {
  */
 export type MuteProtocol = "legacy" | "endpoint-state";
 
+/**
+ * How an incoming call is taken when the user answers it, as `call_protocol_set` names it.
+ *
+ * `answer` is the measured flow: attach to the call with our answer, then accept it.
+ * `join-at-answer` is the Teams web client's: the attach also JOINS the call's conversation, so
+ * the call learns where to leave it — which is how the caller is told the user hung up — and
+ * where its mute is published (docs/calling-roadmap/incoming-and-conversation.md § 4.1). A Rust
+ * test holds this TYPE to exactly the backend's words (`calling::IncomingProtocol::WORDS`).
+ */
+export type IncomingProtocol = "answer" | "join-at-answer";
+
 /** How a backend's calls speak to Teams, where it has a choice between the flow this app
- *  measured and the one the Teams web client uses. One field today; the roadmap's others join
- *  it in the milestone that gives them something to switch. */
-export type CallProtocol = { mute: MuteProtocol };
+ *  measured and the one the Teams web client uses. A field the roadmap names joins it in the
+ *  milestone that gives it something to switch. `incoming` is absent from a backend that
+ *  predates it. */
+export type CallProtocol = { mute: MuteProtocol; incoming?: IncomingProtocol };
 
 /** What `call_prepare` hands back: what one `RTCPeerConnection` needs, and — when
  *  answering — the offer to answer. */

@@ -135,6 +135,27 @@ export function answerFailureMessage(error: unknown, stillRinging: boolean): str
   return `${sentence} The call is still ringing.`;
 }
 
+/** What an Answer that reached NOBODY says — the backend's own outcome, never a failure: nothing
+ *  was posted, the caller was told nothing, and the ring is as the reason says it is.
+ *
+ *  `answered_elsewhere` is another window of this app answering the ring, or having answered it —
+ *  the one way two presses meet, since a press's own window holds "Answering…" until its answer
+ *  lands. Nothing about it is declined, and the sentence says where the call went. */
+export function answerOutcomeMessage(outcome: "answered_elsewhere" | "not_ringing"): string {
+  return outcome === "answered_elsewhere"
+    ? "This call was answered in another window."
+    : "The call stopped ringing before it could be answered.";
+}
+
+/** What a Decline says when it was NOT sent as one: another window was answering the ring, so the
+ *  call was let go here and the caller was never declined (`door_while_answering`). */
+export const DECLINE_NOT_SENT =
+  "Another window was answering this call, so the caller was not declined.";
+
+/** What this window's Answer says when the ring was let go from another window while it was on its
+ *  way: nothing was answered, and nobody was declined. */
+export const ANSWER_LET_GO_ELSEWHERE = "The call was let go in another window before it was answered.";
+
 /** What an insecure origin costs, and the two things that really mend it.
  *
  *  Both are named because this app is reached three ways and they do not overlap: an https

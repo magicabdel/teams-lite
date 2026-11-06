@@ -6258,6 +6258,56 @@ call does — this side never handles RTP, and the page never learns a Teams URL
   build mutes and unmutes and the always-on one reports what its roster said about each endpoint.
   **Unverified against the tenant**: the publish has never been sent — that run needs both of the
   user's installs up and the setting chosen on 19442, which is their own press.
+- **ITS SECOND SWITCH IS HOW AN INCOMING CALL IS TAKEN, and it is what lets a hangup reach the
+  caller** (`incoming = join-at-answer`, the row "Incoming calls" — "As before (default)" or
+  "Join the call's conversation when you answer"; incoming-and-conversation M4a, § 4.1–§ 4.6).
+  The measured answer attaches to the forked leg and accepts it, and it never joins the call's
+  CONVERSATION — so the only door it knows to hang up on is the leg's `callLeg`, unmeasured as a
+  hangup, and the caller may never be told (NATIVE-CALLING.md § 8a). Under `join-at-answer` the
+  attach is the client's own `WV` (`calling::attach_join_payload`): it claims the leg AND joins
+  the conversation in one request, carrying no media — the acceptance after it, unchanged, is what
+  answers the caller. Seven rules, each pinned by a test:
+  - **The join is aimed at the controller the INVITE named** (`conversationInvitation`'s bare
+    `conversationController`, kept on the call as `CallConversation::answering`), and an invite
+    that named none is taken the measured way: there is nothing to join.
+  - **The conversation it answers with is learned like any other** — `additionalActionResponses[0]
+    .output`, its top-level doors through the sequence gate — so its `updateEndpointState` is where
+    the call's mute is published, and its `leave` is where the call is HUNG UP
+    (`CallSession::hangup_link`, the client's `leaveConversation` for any call it joined). Every
+    other call keeps the merged table's chain: the verified outgoing door is NOT measured to be
+    `leave`.
+  - **One fallback, on a definitive refusal only.** A 4xx (`SignalRefused`) created nothing, so the
+    measured attach on the same door is not a second attach; a timeout, a 5xx or a dropped
+    connection may have claimed the leg, so the call ends here exactly as the measured flow's own
+    failure does and is never attached again. And the fallback RE-READS the call first: a call let
+    go while the refused join travelled (a Decline, the ring's expiry, the wait running out) is not
+    taken by it — that would claim the leg the user left for their phone — and it is taken only
+    while the two requests after it still fit `CALL_START_WAIT` (`fallback_still_fits`).
+  - **Our own callbacks are never a door**: the joined answer's links are taken minus this call's
+    surl, wherever an answer echoes them.
+  - **A call answered under `endpoint-state` publishes its mute ONCE at accept** (the client's
+    `handleEndpointStatesForAccept`), whatever the conversation is believed to hold — nothing was
+    ever published on that leg.
+  - **The ring is CLAIMED before anything is sent** (`CallSession.accepting`, named by the
+    `answer_id` the answering page sends): only a call still ringing that no other Answer is
+    carrying out is taken, and a second Answer — another window, a second press — is an OUTCOME
+    that posts nothing (`answered_elsewhere`, `not_ringing`), an `Ok` the page says as "This call
+    was answered in another window." rather than as a failure. While a claim stands every other
+    window offers no Answer and says why ("This call is being answered in another window."), and a
+    Decline pressed THERE is not sent as a decline (`door_while_answering`): two windows' presses
+    disagree, and a decline is the one the caller is shown — that window then says "Another window
+    was answering this call, so the caller was not declined.", and the answering one "The call was
+    let go in another window before it was answered." The ANSWERING window's own Decline names its
+    answer and declines as it always did: that is the user changing their mind. The claim is
+    released on every path out.
+  - **The measured flow is byte for byte what it was** (`the_measured_answer_joins_nothing`, beside
+    the golden pin `attach-join-at-answer.json` for the new body).
+  `web/mock/server.ts` mirrors the word, the claim, its outcomes and the Decline rule, and its
+  `{kind:"call_claim"}` hook draws the card a second window shows; `web/e2e/call-windows.spec.ts`
+  drives two windows on one ring. **Unverified against the tenant**: the joining attach has never
+  been posted. The live check is the user's own Answer with a consenting colleague calling, on
+  19442 with the row set — the journal then shows `the leg was taken (joined-conversation), the
+  conversation named its leave`, and the colleague's call must END when End is pressed.
 - **A start the user STOPS is not a failure, and the call it half-made is taken back.** A
   start is three awaits long — reserve, open the microphone, post the offer — and the
   microphone alone takes up to `GATHER_TIMEOUT_MS`, so a call stopped a second after it was

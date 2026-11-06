@@ -4674,7 +4674,12 @@ type MockCall = {
    *  elsewhere and by whom — the backend's `ended_elsewhere`. */
   ended_elsewhere: { by_self: boolean; name: string } | null;
   /** The protocol this call kept from its start — the backend's per-call snapshot. */
-  protocol: { mute: MockMuteProtocol };
+  protocol: MockCallProtocolValue;
+  /** An Answer is being carried out for this ring — the backend's claim — named by the id the
+   *  answering page gave it (empty from a page that gave none). While it stands the ring is not
+   *  answerable from any other window, and says why. */
+  accepting?: string | null;
+  accept_blocked_reason?: string | null;
   /** What the others publish, and the source ids a subscription is addressed by — the
    *  half of the roster the real backend reads out of `endpoints[…].call.mediaStreams`. */
   publishing: MockPublishing[];
@@ -4844,11 +4849,24 @@ let mockCallingEnabled = true;
 const MOCK_MUTE_PROTOCOLS = ["legacy", "endpoint-state"] as const;
 type MockMuteProtocol = (typeof MOCK_MUTE_PROTOCOLS)[number];
 
+/** How an incoming call is taken, as `call_protocol_set` names it — the backend's
+ *  `calling::IncomingProtocol::WORDS`, mirrored for the same reason. What the attach SENDS under
+ *  each is the backend's alone and pinned in Rust; the mock keeps the word, so the row it draws
+ *  and the refusal it answers are the backend's. */
+const MOCK_INCOMING_PROTOCOLS = ["answer", "join-at-answer"] as const;
+type MockIncomingProtocol = (typeof MOCK_INCOMING_PROTOCOLS)[number];
+
+type MockCallProtocolValue = { mute: MockMuteProtocol; incoming: MockIncomingProtocol };
+
+/** The sentence a ring another window is answering says in place of Answer — the backend's
+ *  `accept_blocked_reason`, word for word. */
+const MOCK_ANSWERING_ELSEWHERE = "This call is being answered in another window.";
+
 /** How a call this mock starts from now on speaks to Teams — the backend's `CallingPlane.protocol`,
  *  the legacy flow out of the box. A call takes a COPY when it starts and keeps it, exactly as
  *  the backend's `admit` stamps one, so a change mid-call applies from the next call.
  *  `call_invite {reset:true}` puts it back, and a spec that sets it MUST call it. */
-let mockCallProtocol: { mute: MockMuteProtocol } = { mute: "legacy" };
+let mockCallProtocol: MockCallProtocolValue = { mute: "legacy", incoming: "answer" };
 
 /** Armed by `{kind:"call_protocol", refuse:true}`: the NEXT `call_protocol_set` is refused, once,
  *  with nothing changed — the one way to a refusal the page has to say at the row. */
@@ -4894,7 +4912,7 @@ let mockCallStartHold: { at: MockCallStartStep; ms: number } | null = null;
 /** The steps a start can be held at. `accept` is an ANSWER still travelling: the backend's
  *  phase stays `ringing` until its attach answers, which is the window an End or a Decline
  *  lands in while the page already holds a microphone. */
-type MockCallStartStep = "prepare" | "place" | "accept" | "join";
+type MockCallStartStep = "prepare" | "place" | "accept" | "join" | "answer";
 
 /** Armed by `{kind:"call_start", refuse:"prepare"}`: the NEXT `call_prepare` is refused, on
  *  any path, and only that one — a failure BEFORE anything reached anybody, which is the case
@@ -5058,7 +5076,7 @@ function mockCallStatus(): {
   call: MockCall | null;
   registration: { state: MockCallRegistrationState; registrar_status: number | null } | null;
   backend_started_ms: number;
-  protocol: { mute: MockMuteProtocol };
+  protocol: MockCallProtocolValue;
 } {
   return {
     enabled: mockCallingEnabled,
@@ -10499,6 +10517,10 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
         if (!mockCall || mockCall.id !== o.call_id || mockCall.phase !== "ringing") {
           throw new Error("call_prepare: that call is not ringing");
         }
+        // A hold here is an ANSWER still opening its microphone — the window in which another
+        // window can answer the same ring first, which is the only way a spec reaches an Answer
+        // that comes back as an outcome.
+        await holdMockCallStart("answer");
         const refuseMicrophone = mockRefusesNextMicrophone;
         mockRefusesNextMicrophone = false;
         return {
@@ -10741,7 +10763,24 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
     case "call_accept": {
       const callId = requireString(params, "call_id");
       requireString(params, "sdp");
-      if (!mockCall || mockCall.id !== callId) throw new Error("call_accept: no such call");
+      // THE CLAIM, as the backend makes it (`accept_ringing_call`): only a ring still ringing
+      // that no other Answer is carrying out is taken, and anything else is an OUTCOME that
+      // posts nothing — an `Ok`, so the page reads the reason rather than a refusal.
+      if (!mockCall || mockCall.id !== callId || mockCall.phase === "ended") {
+        return { call_id: callId, outcome: "not_ringing" };
+      }
+      if (typeof mockCall.accepting === "string" || mockCall.phase === "connected") {
+        return { call_id: callId, outcome: "answered_elsewhere" };
+      }
+      if (mockCall.phase !== "ringing") return { call_id: callId, outcome: "not_ringing" };
+      const answerId = asObject(params).answer_id;
+      mockCall = {
+        ...mockCall,
+        accepting: typeof answerId === "string" ? answerId : "",
+        can_accept: false,
+        accept_blocked_reason: MOCK_ANSWERING_ELSEWHERE,
+      };
+      broadcastMockCall();
       // A hold here is the attach on the wire: the phase is still `ringing`, which is the
       // window an End or a Decline lands in while the page already holds a microphone.
       await holdMockCallStart("accept");
@@ -10761,6 +10800,8 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
         connected_at_ms: Date.now(),
         can_accept: false,
         can_send_media: true,
+        accepting: null,
+        accept_blocked_reason: null,
       };
       broadcastMockCall();
       return { call_id: callId };
@@ -10879,7 +10920,13 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
       }
       const callId = requireString(params, "call_id");
       if (!mockCall || mockCall.id !== callId) throw new Error("call_hangup: no such call");
-      const door = mockHangupDoor(mockCall.direction, mockCall.phase, intent);
+      // A Decline under ANOTHER window's Answer is not a decline (`door_while_answering`): the
+      // two presses disagree, and a decline is the one the caller is shown. The answering
+      // window's own Decline names its answer and declines.
+      const asked = mockHangupDoor(mockCall.direction, mockCall.phase, intent);
+      const presser = typeof o.answer_id === "string" ? o.answer_id : null;
+      const claim = typeof mockCall.accepting === "string" ? mockCall.accepting : null;
+      const door = asked === "reject" && claim !== null && claim !== presser ? "nothing" : asked;
       mockHangups.push({ intent, declined: door === "reject" });
       endMockCall(
         door === "reject"
@@ -10888,7 +10935,11 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
             ? "CallEndReasonLeftRinging"
             : "CallEndReasonHangup",
       );
-      return { call_id: callId, told_service: door !== "nothing" };
+      return {
+        call_id: callId,
+        told_service: door !== "nothing",
+        ...(door !== asked ? { outcome: "answering" } : {}),
+      };
     }
 
     case "call_protocol_set": {
@@ -10910,13 +10961,23 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
       const next = { ...mockCallProtocol };
       for (const [key, value] of Object.entries(asObject(params))) {
         if (key === "write_token") continue;
-        if (key !== "mute") throw new Error(`call_protocol_set: this backend does not know \`${key}\``);
-        if (!MOCK_MUTE_PROTOCOLS.includes(value as MockMuteProtocol)) {
-          throw new Error(
-            `call_protocol_set: \`mute\` must be one of ${JSON.stringify(MOCK_MUTE_PROTOCOLS)}`,
-          );
+        if (key === "mute") {
+          if (!MOCK_MUTE_PROTOCOLS.includes(value as MockMuteProtocol)) {
+            throw new Error(
+              `call_protocol_set: \`mute\` must be one of ${JSON.stringify(MOCK_MUTE_PROTOCOLS)}`,
+            );
+          }
+          next.mute = value as MockMuteProtocol;
+        } else if (key === "incoming") {
+          if (!MOCK_INCOMING_PROTOCOLS.includes(value as MockIncomingProtocol)) {
+            throw new Error(
+              `call_protocol_set: \`incoming\` must be one of ${JSON.stringify(MOCK_INCOMING_PROTOCOLS)}`,
+            );
+          }
+          next.incoming = value as MockIncomingProtocol;
+        } else {
+          throw new Error(`call_protocol_set: this backend does not know \`${key}\``);
         }
-        next.mute = value as MockMuteProtocol;
       }
       mockCallProtocol = next;
       broadcastMockCall();
@@ -13859,9 +13920,26 @@ async function handleTestHook(req: Request, url: URL): Promise<Response | null> 
       mockRefusesNextAccept = true;
       return Response.json({ ok: true, refuse: "accept" }, { status: 200 });
     }
+    // Another window of this backend is answering the ringing call — the backend's claim, with
+    // no answer of this page's behind it. The one way to draw the card a second window shows, in
+    // a capture that has one window. `release:true` gives the claim back.
+    if (body.kind === "call_claim") {
+      if (!mockCall || mockCall.phase !== "ringing") {
+        return Response.json({ error: "no ringing call to claim" }, { status: 409 });
+      }
+      const release = body.release === true;
+      mockCall = {
+        ...mockCall,
+        accepting: release ? null : "another-window",
+        can_accept: release,
+        accept_blocked_reason: release ? null : MOCK_ANSWERING_ELSEWHERE,
+      };
+      broadcastMockCall();
+      return Response.json({ ok: true, claimed: !release }, { status: 200 });
+    }
     if (body.kind === "call_start") {
       const at: MockCallStartStep =
-        body.hold === "place" || body.hold === "accept" || body.hold === "join"
+        body.hold === "place" || body.hold === "accept" || body.hold === "join" || body.hold === "answer"
           ? body.hold
           : "prepare";
       const ms = typeof body.hold_ms === "number" ? body.hold_ms : 1500;
@@ -13976,7 +14054,7 @@ async function handleTestHook(req: Request, url: URL): Promise<Response | null> 
         mockMuteHoldMs = 0;
         mockMuteLosesAnswer = false;
         mockMutes = [];
-        mockCallProtocol = { mute: "legacy" };
+        mockCallProtocol = { mute: "legacy", incoming: "answer" };
         mockRefusesNextProtocol = false;
         mockProtocolHoldMs = 0;
         broadcastMockCall();

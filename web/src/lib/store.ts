@@ -171,7 +171,10 @@ import {
   type SendKind,
 } from "./call-media";
 import {
+  ANSWER_LET_GO_ELSEWHERE,
+  DECLINE_NOT_SENT,
   answerFailureMessage,
+  answerOutcomeMessage,
   callFailureMessage,
   requestOutcomeUnknown,
   captureDroppedMessage,
@@ -2666,6 +2669,12 @@ export class TeamsController {
    *  whoever ended it, the failure included, and a failure must still be said. */
   private callAttempt = 0;
 
+  /** The Answer THIS window is carrying out, by the id it sent with it, while it travels — so this
+   *  window's own Decline is told from another window's (the backend's claim names the answer
+   *  that holds it). */
+  private answering: { callId: string; answerId: string } | null = null;
+  private answerSerial = 0;
+
   /** True while `attempt` is still the start the user wants. */
   private callAttemptStands(attempt: number): boolean {
     return attempt === this.callAttempt;
@@ -3406,7 +3415,36 @@ export class TeamsController {
       });
       if (!this.adoptCallMedia(media, attempt, call.id)) return;
       posted = true;
-      await this.backend.callAccept(call.id, media.localSdp);
+      // The id this window's answer is known by while it travels — what tells this window's own
+      // Decline from another window's. A counter and the clock rather than `randomUUID`, which a
+      // page reached over plain http:// does not have.
+      const answerId = `answer-${Date.now().toString(36)}-${(++this.answerSerial).toString(36)}`;
+      this.answering = { callId: call.id, answerId };
+      let accepted: Awaited<ReturnType<typeof this.backend.callAccept>>;
+      try {
+        accepted = await this.backend.callAccept(call.id, media.localSdp, answerId);
+      } finally {
+        if (this.answering?.answerId === answerId) this.answering = null;
+      }
+      // The ring was let go from ANOTHER window while this answer travelled: nothing was answered
+      // and nobody was declined. A hang-up in THIS window ended the attempt and says nothing.
+      if (accepted.cancelled) {
+        if (!this.callAttemptStands(attempt)) return;
+        this.stopCallMedia();
+        await this.refreshCallStatus();
+        this.reportCall(ANSWER_LET_GO_ELSEWHERE, "report");
+        return;
+      }
+      // The press reached NOBODY: another window is answering this ring or has, or it rings no
+      // more. Nothing was posted, so the microphone this page opened goes back, and the reason
+      // is said — never as a failure, because nothing failed.
+      if (accepted.outcome) {
+        if (!this.callAttemptStands(attempt)) return;
+        this.stopCallMedia();
+        await this.refreshCallStatus();
+        this.reportCall(answerOutcomeMessage(accepted.outcome), "report");
+        return;
+      }
     } catch (error) {
       if (!this.callAttemptStands(attempt)) return;
       if (posted && requestOutcomeUnknown(error)) {
@@ -3439,13 +3477,21 @@ export class TeamsController {
 
   private async leaveCall(intent: CallHangupIntent): Promise<void> {
     const call = this.get().callStatus.call;
+    // Read before anything is let go: the answer THIS window is carrying out, if it is, which is
+    // what makes its own Decline a decline rather than a press under another window's answer.
+    const ownAnswer = call && this.answering?.callId === call.id ? this.answering.answerId : undefined;
     // Whatever start is in flight is over: this click is the user saying so, and it is the
     // one thing an await inside that start cannot see (see {@link callAttempt}).
     this.callAttempt += 1;
     this.stopCallMedia();
     if (!call) return;
     try {
-      await this.backend.callHangup(call.id, intent);
+      const left = await this.backend.callHangup(call.id, intent, ownAnswer);
+      // Another window was answering the ring: the caller was NOT declined, and the reader who
+      // pressed Decline is told so rather than left believing they were.
+      if (intent === "decline" && left.outcome === "answering") {
+        this.reportCall(DECLINE_NOT_SENT, "report");
+      }
     } catch (error) {
       console.error("[call] the hangup failed", error);
     }

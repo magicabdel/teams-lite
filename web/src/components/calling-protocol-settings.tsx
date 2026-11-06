@@ -1,6 +1,7 @@
 import { useState } from "react";
 import {
   CALLING_PROTOCOL_NOTE,
+  INCOMING_PROTOCOL_CHOICES,
   MUTE_PROTOCOL_CHOICES,
   callingProtocolOffered,
   liveCallKeepsItsProtocol,
@@ -60,6 +61,18 @@ export function CallingProtocolSettings() {
           instead of what this app has always done.
         </span>
       </div>
+
+      {/* An older backend states no `incoming`, and has no such choice to offer. */}
+      {protocol.incoming && (
+        <ProtocolRow
+          title="Incoming calls"
+          testId="calling-protocol-incoming"
+          choices={INCOMING_PROTOCOL_CHOICES}
+          value={protocol.incoming}
+          pending={pending}
+          onChoose={(incoming) => void choose({ incoming }, incoming)}
+        />
+      )}
 
       <ProtocolRow
         title="Mute"

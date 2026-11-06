@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   answerFailureMessage,
+  answerOutcomeMessage,
   callFailureMessage,
   captureDroppedMessage,
   captureRefusedMessage,
@@ -165,6 +166,13 @@ describe("callFailureMessage", () => {
     // The PAGE's own ceiling is a different thing — a lost answer — and keeps its sentence.
     expect(callFailureMessage(new Error("timeout: call_place"))).toBe(
       "The backend did not answer. Try again.",
+    );
+  });
+
+  it("says why an Answer took nothing, and never as a failure", () => {
+    expect(answerOutcomeMessage("answered_elsewhere")).toBe("This call was answered in another window.");
+    expect(answerOutcomeMessage("not_ringing")).toBe(
+      "The call stopped ringing before it could be answered.",
     );
   });
 

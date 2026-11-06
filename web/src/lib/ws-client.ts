@@ -310,6 +310,13 @@ const SIGNIN_REQUEST_TIMEOUT_MS = 2 * 60_000;
  */
 const CALL_START_REQUEST_TIMEOUT_MS = 180_000;
 
+/** What `call_accept` answers. `outcome` names why an Answer took nothing (see `callAccept`). */
+export type CallAcceptance = {
+  call_id: string;
+  outcome?: "answered_elsewhere" | "not_ringing";
+  cancelled?: boolean;
+};
+
 export type BackendOptions = {
   giveUpMs?: number;
   initialDelayMs?: number;
@@ -1099,11 +1106,15 @@ export class Backend {
     );
   }
   /** Answer the ringing call with our own SDP. Outward: it opens the user's microphone
-   *  to whoever is on the other end. */
-  callAccept(callId: string, sdp: string): Promise<{ call_id: string }> {
-    return this.writeRequest<{ call_id: string }>(
+   *  to whoever is on the other end.
+   *
+   *  `outcome` is present when the press reached NOBODY — another window is answering the ring
+   *  or has (`answered_elsewhere`), or it rings no more (`not_ringing`) — and is the backend's
+   *  reason rather than a refusal. */
+  callAccept(callId: string, sdp: string, answerId: string): Promise<CallAcceptance> {
+    return this.writeRequest<CallAcceptance>(
       "call_accept",
-      { call_id: callId, sdp },
+      { call_id: callId, sdp, answer_id: answerId },
       CALL_START_REQUEST_TIMEOUT_MS,
     );
   }
@@ -1204,11 +1215,14 @@ export class Backend {
   callHangup(
     callId: string,
     intent: CallHangupIntent,
-  ): Promise<{ call_id: string; told_service: boolean }> {
-    return this.writeRequest<{ call_id: string; told_service: boolean }>("call_hangup", {
-      call_id: callId,
-      intent,
-    });
+    answerId?: string,
+  ): Promise<{ call_id: string; told_service: boolean; outcome?: "answering" }> {
+    // `answerId` names the Answer THIS window is carrying out, when it is: its own Decline then
+    // declines, where another window's would be let go under it (`door_while_answering`).
+    return this.writeRequest<{ call_id: string; told_service: boolean; outcome?: "answering" }>(
+      "call_hangup",
+      { call_id: callId, intent, ...(answerId ? { answer_id: answerId } : {}) },
+    );
   }
   /** Publish whether the user can be heard. The page has already stopped sending audio;
    *  this is the half the other side sees, which is why it is outward. */

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { UNKNOWN_CALL_STATUS, type ActiveCall, type CallStatus } from "./call";
 import {
   CALLING_PROTOCOL_NOTE,
+  INCOMING_PROTOCOL_CHOICES,
   MUTE_PROTOCOL_CHOICES,
   callingProtocolOffered,
   liveCallKeepsItsProtocol,
@@ -72,7 +73,38 @@ describe("the mute row's choices", () => {
   });
 });
 
+describe("the incoming-call row's choices", () => {
+  /** The measured answer is the default and comes first, in the same vocabulary as the mute row
+   *  — two rows of one section must not name their defaults two ways — and the other option
+   *  says what the reader gets from it: the caller is told when they hang up. */
+  it("offers the measured answer first, as the default, and says what joining buys", () => {
+    expect(INCOMING_PROTOCOL_CHOICES.map((choice) => choice.value)).toEqual([
+      "answer",
+      "join-at-answer",
+    ]);
+    expect(INCOMING_PROTOCOL_CHOICES[0]!.label).toBe("As before (default)");
+    expect(INCOMING_PROTOCOL_CHOICES[0]!.detail).toContain("tested with a colleague");
+    expect(INCOMING_PROTOCOL_CHOICES[1]!.label).toBe("Join the call's conversation when you answer");
+    expect(INCOMING_PROTOCOL_CHOICES[1]!.detail).toContain("the caller is told you left");
+  });
+});
+
 describe("liveCallKeepsItsProtocol", () => {
+  /** The incoming half counts too: a call answered the measured way keeps that way, whatever the
+   *  row now says — and a call or a backend too old to state it reads as the measured answer. */
+  it("says a live call keeps its incoming protocol as well as its mute", () => {
+    const live = call({ protocol: { mute: "legacy", incoming: "answer" } });
+    expect(
+      liveCallKeepsItsProtocol(
+        status({ call: live, protocol: { mute: "legacy", incoming: "join-at-answer" } }),
+      ),
+    ).toBe("The call going now keeps the way it started with until it ends.");
+    const older = call({ protocol: { mute: "legacy" } });
+    expect(
+      liveCallKeepsItsProtocol(status({ call: older, protocol: { mute: "legacy", incoming: "answer" } })),
+    ).toBeNull();
+  });
+
   /** A call keeps the protocol it started with, so the one moment the "from the next call" rule
    *  would surprise the reader — they change it during a call — is the one it is said. */
   it("says a live call keeps the way it started with when that differs", () => {

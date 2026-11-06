@@ -138,13 +138,23 @@ function RingingCard(props: { call: ActiveCall }) {
         <p data-testid="call-peer" className="truncate text-sm font-semibold text-foreground">
           {call.peer || (isMeeting(call) ? "Meeting" : "Unknown caller")}
         </p>
-        <p data-testid="call-phase" className="truncate text-xs text-text-faint">
-          {callPhaseLabel(call)}
-        </p>
+        {/* Another window is answering this ring: the card says so in place of Answer, and
+            wraps rather than truncates, because the sentence IS the reason there is no button. */}
+        {!answering && !call.can_accept && call.accept_blocked_reason ? (
+          <p data-testid="call-accept-blocked" className="line-clamp-2 text-xs text-text-faint">
+            {call.accept_blocked_reason}
+          </p>
+        ) : (
+          <p data-testid="call-phase" className="truncate text-xs text-text-faint">
+            {callPhaseLabel(call)}
+          </p>
+        )}
       </div>
 
       <div className="flex shrink-0 items-center gap-1.5">
-        {call.can_accept && (
+        {/* This window's own answer keeps its button ("Answering…") while the backend's claim
+            makes the ring unanswerable from every other window. */}
+        {(call.can_accept || answering) && (
           <Button
             size="sm"
             data-testid="call-answer"

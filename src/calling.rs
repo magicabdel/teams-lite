@@ -1733,13 +1733,51 @@ pub fn call_protocol_setting_key(port: u16) -> String {
 /// write-token method) — never by an environment variable, which tooling could set. A call
 /// keeps the protocol it started with, so a change applies from the next call.
 ///
-/// It holds one field today. The others the roadmap names (`incoming`, `keepalive`, and
-/// meeting-awareness's `server_mute`) join it in the milestone that gives them something to
-/// switch: a choice that changes nothing reads as a bug.
+/// The others the roadmap names (`keepalive`, and meeting-awareness's `server_mute`) join it in
+/// the milestone that gives them something to switch: a choice that changes nothing reads as a
+/// bug.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CallProtocol {
     /// How the user's own mute is published to the call.
     pub mute: MuteProtocol,
+    /// How an incoming call is taken when the user answers it.
+    pub incoming: IncomingProtocol,
+}
+
+/// How an incoming call is taken, on the user's own Answer press.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IncomingProtocol {
+    /// The measured flow (NATIVE-CALLING.md § 8a): attach to the forked leg with our answer in
+    /// [`attach_payload`], then accept it. Verified both ways with a colleague on 2026-09-04 — and
+    /// it never joins the call's CONVERSATION, so the conversation's `leave` is never learned and
+    /// hanging up is posted on the leg (`callLeg`), which is unmeasured as a hangup.
+    #[default]
+    Answer,
+    /// The client's own flow: the attach also JOINS the call's conversation in the same request
+    /// ([`attach_join_payload`], the client's `WV`), so the call learns the conversation's doors —
+    /// `leave`, which is how the client hangs up a call it joined, and `updateEndpointState`,
+    /// where an answered call's mute is published. The acceptance after it is unchanged.
+    JoinAtAnswer,
+}
+
+impl IncomingProtocol {
+    /// Every word the setting takes, in the order the page offers them.
+    pub const WORDS: [&'static str; 2] = ["answer", "join-at-answer"];
+
+    pub fn word(self) -> &'static str {
+        match self {
+            IncomingProtocol::Answer => "answer",
+            IncomingProtocol::JoinAtAnswer => "join-at-answer",
+        }
+    }
+
+    pub fn from_word(word: &str) -> Option<Self> {
+        match word {
+            "answer" => Some(IncomingProtocol::Answer),
+            "join-at-answer" => Some(IncomingProtocol::JoinAtAnswer),
+            _ => None,
+        }
+    }
 }
 
 /// Where the user's own mute is published.
@@ -1783,18 +1821,16 @@ impl CallProtocol {
     /// fatal, because the two installs on one machine may be different builds.
     pub fn from_stored(raw: Option<&str>) -> Self {
         let stored: Value = raw.and_then(|raw| serde_json::from_str(raw).ok()).unwrap_or(Value::Null);
+        let word = |key: &str| stored.get(key).and_then(Value::as_str);
         Self {
-            mute: stored
-                .get("mute")
-                .and_then(Value::as_str)
-                .and_then(MuteProtocol::from_word)
-                .unwrap_or_default(),
+            mute: word("mute").and_then(MuteProtocol::from_word).unwrap_or_default(),
+            incoming: word("incoming").and_then(IncomingProtocol::from_word).unwrap_or_default(),
         }
     }
 
-    /// The shape it is stored in and stated in: `{"mute": "legacy"}`.
+    /// The shape it is stored in and stated in: `{"incoming": "answer", "mute": "legacy"}`.
     pub fn json(self) -> Value {
-        json!({ "mute": self.mute.word() })
+        json!({ "mute": self.mute.word(), "incoming": self.incoming.word() })
     }
 
     /// This protocol with the changes an RPC asked for. Every key must be one this build knows
@@ -1815,6 +1851,15 @@ impl CallProtocol {
                         format!(
                             "call_protocol_set: `mute` must be one of {:?}",
                             MuteProtocol::WORDS
+                        )
+                    })?;
+                }
+                "incoming" => {
+                    let word = value.as_str().unwrap_or_default();
+                    next.incoming = IncomingProtocol::from_word(word).with_context(|| {
+                        format!(
+                            "call_protocol_set: `incoming` must be one of {:?}",
+                            IncomingProtocol::WORDS
                         )
                     })?;
                 }
@@ -2051,6 +2096,71 @@ pub fn attach_payload(
     callbacks: &CallbackBase,
 ) -> Value {
     json!({ "attach": taking_the_call(local, answer, callbacks) })
+}
+
+/// The capability mask an ATTACH declares: the captured one with bit 16
+/// (`brokerEnabledIncoming`) CLEARED — 73447.
+///
+/// The one computed mask in this module, and a stated exception to the rule above it
+/// (docs/calling-roadmap/incoming-and-conversation.md § 4.2, divergence 1). The client sets bit 16
+/// only when its broker channel is on, and follows the attach with a broker subscription; this app
+/// implements no broker channel, so it must not claim one on the incoming path. The measured
+/// legacy attach declared no capabilities at all.
+const ATTACH_ENDPOINT_CAPABILITIES: u32 = CAPTURED_ENDPOINT_CAPABILITIES & !16;
+
+/// Build the body that ATTACHES this endpoint to a forked incoming call and, in the same request,
+/// JOINS the call's conversation — the client's `WV` (docs/calling-roadmap/incoming-and-
+/// conversation.md § 4.1 and § 4.2).
+///
+/// It carries no SDP, no `sender` and no `acceptedCallModalities`: claiming the leg and joining
+/// the conversation is all it does, and the acceptance after it (unchanged, [`acceptance_payload`])
+/// is what answers the caller and carries our media. The join is an `additionalActions` entry the
+/// service runs against the conversation's controller — the bare `conversationController` the
+/// invite named — and its answer, `additionalActionResponses[0].output`, is the conversation
+/// object whose doors the call has never had on the measured flow: `leave`, and
+/// `updateEndpointState`.
+///
+/// `require_media` is the client's `requireMediaContent`: true only when the invite carried no
+/// offer. At answer time it is always false, because a ring with no offer is not answerable here.
+///
+/// Two stated divergences from `WV`: bit 16 is cleared (see [`ATTACH_ENDPOINT_CAPABILITIES`]), and
+/// the join publishes the same nine conversation callbacks the place and join bodies publish
+/// (`WV` names six) — a link missing from one body fails invisibly, which is why they are shared.
+pub fn attach_join_payload(
+    local: &LocalParticipant,
+    controller: &str,
+    callbacks: &CallbackBase,
+    require_media: bool,
+) -> Value {
+    json!({
+        "attach": {
+            "requireMediaContent": require_media,
+            "links": { "end": callbacks.link(paths::CALL_END) },
+            "locationContent": null,
+            "networkContent": null,
+            "areaContent": null,
+        },
+        "capabilities": null,
+        "endpointCapabilities": ATTACH_ENDPOINT_CAPABILITIES,
+        "additionalActions": [{
+            "input": {
+                "capabilities": null,
+                "endpointCapabilities": ATTACH_ENDPOINT_CAPABILITIES,
+                "conversationRequest": {
+                    "roster": {
+                        "type": "Delta",
+                        "rosterUpdate": callbacks.link(paths::CONVERSATION_ROSTER_UPDATE),
+                    },
+                    "links": conversation_callback_links(callbacks),
+                },
+                "endpointMetadata": { "holographicCapabilities": 3 },
+                "participants": { "from": local.json() },
+            },
+            "name": "join",
+            "url": controller,
+            "waitForResponse": true,
+        }],
+    })
 }
 
 /// Build the body that accepts an incoming call: we take it, and we publish the
@@ -4031,12 +4141,24 @@ mod tests {
             assert_eq!(CallProtocol::from_stored(stored), CallProtocol::default(), "{stored:?}");
         }
         assert_eq!(CallProtocol::default().mute, MuteProtocol::Legacy);
-        let stored = CallProtocol::from_stored(Some(r#"{"mute":"endpoint-state","incoming":"ring"}"#));
+        assert_eq!(CallProtocol::default().incoming, IncomingProtocol::Answer);
+        // A word this build does not know — M4b's `ring`, a newer build's key — reads as the
+        // default for that field alone, and the field beside it keeps its own.
+        let stored = CallProtocol::from_stored(Some(
+            r#"{"mute":"endpoint-state","incoming":"ring","keepalive":"client"}"#,
+        ));
         assert_eq!(stored.mute, MuteProtocol::EndpointState);
-        assert_eq!(stored.json(), json!({ "mute": "endpoint-state" }));
+        assert_eq!(stored.incoming, IncomingProtocol::Answer);
+        assert_eq!(stored.json(), json!({ "mute": "endpoint-state", "incoming": "answer" }));
         assert_eq!(CallProtocol::from_stored(Some(&stored.json().to_string())), stored);
+        let joining = CallProtocol::from_stored(Some(r#"{"incoming":"join-at-answer"}"#));
+        assert_eq!(joining.incoming, IncomingProtocol::JoinAtAnswer);
+        assert_eq!(joining.mute, MuteProtocol::Legacy);
         for word in MuteProtocol::WORDS {
             assert_eq!(MuteProtocol::from_word(word).unwrap().word(), word);
+        }
+        for word in IncomingProtocol::WORDS {
+            assert_eq!(IncomingProtocol::from_word(word).unwrap().word(), word);
         }
 
         let base = CallProtocol::default();
@@ -4045,8 +4167,15 @@ mod tests {
         assert_eq!(set(json!({ "write_token": "t", "mute": "endpoint-state" })).unwrap().mute, MuteProtocol::EndpointState);
         let refused = format!("{:#}", set(json!({ "mute": "loud" })).unwrap_err());
         assert!(refused.contains("`mute` must be one of"), "{refused}");
+        assert_eq!(
+            set(json!({ "incoming": "join-at-answer" })).unwrap().incoming,
+            IncomingProtocol::JoinAtAnswer
+        );
+        // `ring` is M4b's word, and a choice that changes nothing is refused rather than kept.
         let refused = format!("{:#}", set(json!({ "incoming": "ring" })).unwrap_err());
-        assert!(refused.contains("does not know `incoming`"), "{refused}");
+        assert!(refused.contains("`incoming` must be one of"), "{refused}");
+        let refused = format!("{:#}", set(json!({ "keepalive": "client" })).unwrap_err());
+        assert!(refused.contains("does not know `keepalive`"), "{refused}");
         assert_eq!(format!("{:#}", set(json!({ "mute": true })).unwrap_err()).contains("must be one of"), true);
     }
 
@@ -4159,6 +4288,57 @@ mod tests {
         let offered: Vec<usize> =
             words.iter().map(|w| row.find(&format!("value: \"{w}\"")).expect(w)).collect();
         assert!(offered.windows(2).all(|pair| pair[0] < pair[1]), "the row's order is not the backend's");
+
+        // And the INCOMING row, the same three ways.
+        let words: Vec<String> = IncomingProtocol::WORDS.iter().map(|w| w.to_string()).collect();
+        assert_eq!(members(page, "export type IncomingProtocol =", ';'), words, "web/src/lib/call.ts");
+        let mock_words = members(mock, "const MOCK_INCOMING_PROTOCOLS = [", ']');
+        assert_eq!(mock_words, words, "web/mock/server.ts must refuse exactly what the backend refuses");
+        let start = row.find("INCOMING_PROTOCOL_CHOICES").expect("the incoming row's choices");
+        let offered: Vec<usize> = words
+            .iter()
+            .map(|w| start + row[start..].find(&format!("value: \"{w}\"")).expect(w))
+            .collect();
+        assert!(offered.windows(2).all(|pair| pair[0] < pair[1]), "the incoming row's order is not the backend's");
+    }
+
+    /// The attach that JOINS the conversation is the client's `WV` in what matters and nothing
+    /// more: no SDP, no sender, no accepted modalities — claiming the leg and joining the
+    /// conversation is all it does — the join aimed at the controller the invite named, the
+    /// captured mask with bit 16 cleared, and no request envelope. Its exact bytes are the golden
+    /// pin; this names the rules the pin holds.
+    #[test]
+    fn the_attach_that_joins_carries_no_media_and_names_the_controller() {
+        let body = attach_join_payload(&local(), "https://conv/controller/", &callbacks(), false);
+        assert_eq!(body["attach"]["requireMediaContent"], false);
+        assert_eq!(
+            attach_join_payload(&local(), "https://conv/controller/", &callbacks(), true)["attach"]
+                ["requireMediaContent"],
+            true
+        );
+        let text = body.to_string();
+        for absent in ["mediaContent", "sender", "acceptedCallModalities", "\"payload\"", "blob"] {
+            assert!(!text.contains(absent), "the attach carries {absent}: {text}");
+        }
+        assert_eq!(ATTACH_ENDPOINT_CAPABILITIES, 73447, "the captured mask with bit 16 cleared");
+        assert_eq!(ATTACH_ENDPOINT_CAPABILITIES, CAPTURED_ENDPOINT_CAPABILITIES & !16);
+        assert_eq!(body["endpointCapabilities"], 73447);
+        let join = &body["additionalActions"][0];
+        assert_eq!(join["name"], "join");
+        assert_eq!(join["url"], "https://conv/controller/");
+        assert_eq!(join["waitForResponse"], true);
+        assert_eq!(join["input"]["endpointCapabilities"], 73447);
+        assert_eq!(join["input"]["participants"]["from"]["participantId"], "participant-1");
+        assert_eq!(
+            join["input"]["conversationRequest"]["links"],
+            conversation_callback_links(&callbacks()),
+            "the join publishes the same conversation callbacks the place and join bodies do"
+        );
+        assert_eq!(
+            body["attach"]["links"]["end"],
+            callbacks().link(paths::CALL_END),
+            "a ring's own ending lands on our call end callback"
+        );
     }
 
     /// The same contract for every ending a RING can have and for one nobody answered: each
@@ -5921,6 +6101,15 @@ mod tests {
             ("join-short-link", join_payload(&local, &short_link, &callbacks, Some(&sdp))),
             ("join-thread-roster-only", join_payload(&local, &thread, &callbacks, None)),
             ("attach", attach_payload(&local, &sdp, &callbacks)),
+            (
+                "attach-join-at-answer",
+                attach_join_payload(
+                    &local,
+                    "https://api.flightproxy.teams.microsoft.com/api/v2/ep/conv-golden/conversation/",
+                    &callbacks,
+                    false,
+                ),
+            ),
             ("acceptance", acceptance_payload(&local, &sdp, &callbacks)),
             ("media-answer", media_answer_payload(&local, &sdp, &callbacks, &[MODALITY_AUDIO])),
             (

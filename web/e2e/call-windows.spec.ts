@@ -362,6 +362,111 @@ test.describe("One call in several windows", () => {
   });
 });
 
+test.describe("One ring in several windows", () => {
+  test.afterEach(async ({ page }) => {
+    await resetCall(page);
+  });
+
+  /** The backend CLAIMS a ring when an Answer starts carrying it out (incoming-and-conversation
+   *  M4a), so a second window cannot answer it too — two attaches would claim the leg twice. The
+   *  window answering keeps its "Answering…"; every other window offers no Answer and says why;
+   *  and nothing in the second window ever posts. */
+  test("a ring another window is answering offers no Answer here, and says why", async ({ page }) => {
+    await ringBothWindows(page, async (second) => {
+      await holdCallStart(page, "accept", 2500);
+      await page.locator('[data-testid="call-answer"]').click();
+      await expect(page.locator('[data-testid="call-answer"]')).toHaveText("Answering…");
+      // The window answering is not told another window is: it is the one.
+      await expect(page.locator('[data-testid="call-accept-blocked"]')).toHaveCount(0);
+      await expect(page.locator('[data-testid="call-phase"]')).toBeVisible();
+      await expect(second.locator('[data-testid="call-answer"]')).toHaveCount(0);
+      await expect(second.locator('[data-testid="call-accept-blocked"]')).toHaveText(
+        "This call is being answered in another window.",
+      );
+      // The answer lands, and both windows draw the live call it made.
+      await expect(page.locator('[data-testid="call-stage"]')).toHaveAttribute("data-phase", "connected");
+      await expect(second.locator('[data-testid="call-stage"]')).toHaveAttribute("data-phase", "connected");
+      expect((await callRecord(page)).hangups).toEqual([]);
+    });
+  });
+
+  /** Decline pressed in one window while another window's Answer is on the wire: two presses that
+   *  disagree, and a decline is the one of them the caller is SHOWN and nothing takes back. So the
+   *  ring is let go here and the caller is never declined. */
+  test("a Decline under another window's Answer never declines the caller", async ({ page }) => {
+    await ringBothWindows(page, async (second) => {
+      await holdCallStart(page, "accept", 2500);
+      await page.locator('[data-testid="call-answer"]').click();
+      await expect(second.locator('[data-testid="call-accept-blocked"]')).toBeVisible();
+      await second.locator('[data-testid="call-hangup"]').click();
+      await expect.poll(async () => (await callRecord(page)).hangups).toEqual([
+        { intent: "decline", declined: false },
+      ]);
+      // And neither window leaves its reader guessing: the one that pressed Decline says the
+      // caller was not declined, and the one that was answering says the call was let go.
+      await expect(second.locator('[data-testid="call-notice"]')).toContainText(
+        "Another window was answering this call, so the caller was not declined.",
+      );
+      await expect(page.locator('[data-testid="call-notice"]')).toContainText(
+        "The call was let go in another window before it was answered.",
+      );
+    });
+  });
+
+  /** The ANSWERING window's own Decline is the user changing their mind, and declines as it
+   *  always did — its press names the answer that holds the claim. */
+  test("the answering window's own Decline still declines", async ({ page }) => {
+    await ringBothWindows(page, async () => {
+      await holdCallStart(page, "accept", 2500);
+      await page.locator('[data-testid="call-answer"]').click();
+      await expect(page.locator('[data-testid="call-answer"]')).toHaveText("Answering…");
+      await page.locator('[data-testid="call-hangup"]').click();
+      await expect.poll(async () => (await callRecord(page)).hangups).toEqual([
+        { intent: "decline", declined: true },
+      ]);
+    });
+  });
+
+  /** Two Answers that RACE — the second window's still opening its microphone while the first
+   *  takes the call — meet at the backend's claim: the late one posts nothing, gives its
+   *  microphone back, and says where the call went. Never a decline, never a failure. */
+  test("an Answer that lost the race says the call was answered in another window", async ({ page }) => {
+    await ringBothWindows(page, async (second) => {
+      await holdCallStart(page, "answer", 2500);
+      // The second window's answer is held while it would be opening its microphone; the first
+      // window's, pressed meanwhile, goes straight through and takes the call.
+      await second.locator('[data-testid="call-answer"]').click();
+      await page.locator('[data-testid="call-answer"]').click();
+      await expect(page.locator('[data-testid="call-stage"]')).toHaveAttribute("data-phase", "connected");
+      await expect(second.locator('[data-testid="call-notice"]')).toContainText(
+        "This call was answered in another window.",
+      );
+      await expect(second.locator('[data-testid="call-stage"]')).toHaveAttribute("data-media", "none");
+      await expect(page.locator('[data-testid="call-stage"]')).toHaveAttribute("data-media", "held");
+      expect((await callRecord(page)).hangups).toEqual([]);
+    });
+  });
+});
+
+/** Ring BOTH windows with one one-to-one call, then hand the second window to `act`. */
+async function ringBothWindows(page: Page, act: (second: Page) => Promise<void>): Promise<void> {
+  await gotoApp(page);
+  await openConversationNamed(page, "Ava Thompson");
+  const conversationId = await page
+    .locator('[data-testid="composer-shell"]')
+    .getAttribute("data-conversation-id");
+  expect(conversationId).toBeTruthy();
+  const second = await openSecondWindow(page);
+  try {
+    await emitCallInvite(page, conversationId!);
+    await expect(page.locator('[data-testid="call-bar"]')).toHaveAttribute("data-phase", "ringing");
+    await expect(second.locator('[data-testid="call-bar"]')).toHaveAttribute("data-phase", "ringing");
+    await act(second);
+  } finally {
+    await second.close();
+  }
+}
+
 /** Ring the first window with a one-to-one call and answer it there, so it holds the call's
  *  microphone. Returns the call's id. */
 async function answerACall(page: Page): Promise<string> {

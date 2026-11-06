@@ -525,7 +525,7 @@ export async function mockRpc(
  */
 export async function holdCallStart(
   page: Page,
-  hold: "prepare" | "place" | "accept" | "join",
+  hold: "prepare" | "place" | "accept" | "join" | "answer",
   holdMs = 1500,
 ): Promise<void> {
   const res = await page.request.post(`http://127.0.0.1:${MOCK_PORT}/__test/emit`, {

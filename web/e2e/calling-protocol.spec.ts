@@ -69,6 +69,36 @@ test.describe("Calling protocol", () => {
     expect(realErrors(consoleErrors)).toEqual([]);
   });
 
+  /** How an incoming call is taken is the section's second row: the measured answer by default,
+   *  the client's join-at-answer on a press, and the choice the backend's after a reload. */
+  test("offers how an incoming call is taken, and keeps the choice", async ({ page }) => {
+    await gotoApp(page);
+    await openProtocol(page);
+    const row = page.getByTestId("calling-protocol-incoming");
+    await expect(page.getByRole("group", { name: "Incoming calls" })).toBeVisible();
+    await expect(row).toHaveAttribute("data-value", "answer");
+    await expect(page.getByTestId("calling-protocol-incoming-answer")).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    const join = page.getByTestId("calling-protocol-incoming-join-at-answer");
+    await join.click();
+    await expect(row).toHaveAttribute("data-value", "join-at-answer");
+    await expect(join).toHaveAttribute("aria-pressed", "true");
+    // The mute row is its own choice, and did not move.
+    await expect(page.getByTestId("calling-protocol-mute")).toHaveAttribute("data-value", "legacy");
+
+    await page.reload();
+    await openProtocol(page);
+    await expect(page.getByTestId("calling-protocol-incoming")).toHaveAttribute(
+      "data-value",
+      "join-at-answer",
+    );
+    for (const option of [page.getByTestId("calling-protocol-incoming-answer"), join]) {
+      expect((await option.boundingBox())?.height ?? 0).toBeGreaterThanOrEqual(44);
+    }
+  });
+
   /** A press the backend did not carry out must not look like one that worked. */
   test("says a refused change at the row, and keeps the old choice", async ({ page }) => {
     await gotoApp(page);
