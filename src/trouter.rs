@@ -912,12 +912,16 @@ async fn register(
 /// It matters most for the CALLING worker. A registration Teams still believes in
 /// keeps routing the user's calls to a client that is no longer listening, and a call
 /// offered to a device that never rings is a call they miss.
+///
+/// `bound` is the caller's: an ordinary stop takes the signaling `End` class's ten seconds, and a
+/// backend that is going away takes less, inside the stop budget its supervisor grants it.
 pub async fn unregister(
     http: &reqwest::Client,
     skypetoken: &str,
     ic3: &str,
     registrar: &str,
     registration_id: &str,
+    bound: Duration,
 ) -> Result<()> {
     let url = format!(
         "{}/{}",
@@ -928,6 +932,7 @@ pub async fn unregister(
         .delete(&url)
         .header("X-Skypetoken", skypetoken)
         .header("authorization", format!("Bearer {ic3}"))
+        .timeout(bound)
         .send()
         .await?;
     if !response.status().is_success() {

@@ -6273,7 +6273,9 @@ call does — this side never handles RTP, and the page never learns a Teams URL
     refusal of an offer for a call it had already let go was floated at the user as a fault
     — `no such call — call_prepare first`, for a call they stopped themselves.
   - **The backend hangs up what the service accepted meanwhile** (`hang_up_orphan`, in
-    `call_place`, `call_join` and `call_accept`). The hangup finds no link to post on while
+    `call_place`, `call_join` and `call_accept` — the work of each now runs in a task of its own,
+    `Ctx::place_reserved_call`, `join_reserved_meeting` and `accept_ringing_call`, for the reason
+    the bullet below gives). The hangup finds no link to post on while
     that POST is still on the wire, so it drops the call here — and a moment later the
     service has a device buzzing in somebody's pocket, or a caller talking into a machine
     that holds nothing. The answer's own links are that call's only address and this is the
@@ -6284,6 +6286,80 @@ call does — this side never handles RTP, and the page never learns a Teams URL
     hold:"prepare"|"place"|"accept"}`, over `holdCallStart`), which is what makes the window
     reachable from a spec at all: the mock's own media is instant, so the window a user
     cancels in did not exist there.
+- **EVERY SIGNALING REQUEST IS BOUNDED, AND A START NEVER DIES WITH ITS PAGE** (plane-reliability
+  M4; docs/calling-roadmap/plane-reliability.md § 4.6). Two defects, one cause each, and the fix is
+  the ONE transport every request now goes through — `calling::post_signal`, `put_signal` and
+  `delete_signal`, each taking a `SignalClass`, over one header builder (`signal_headers`) and one
+  reply reader (`read_signal_reply`). A workstream that needs another verb or another bound uses
+  these and adds no transport of its own (docs/calling-roadmap/README.md § 3, collision 7). Eight
+  rules, each pinned by a test:
+  - **Nothing was bounded.** The backend's HTTP client carries no timeout, so a signaling request
+    the service never answered held its caller for ever — and the frame handler awaits its
+    acknowledgements in line, so one unanswered acknowledgement stopped every later frame of the
+    call behind it. Each request now carries its class's bound (`RequestBuilder::timeout`, which
+    covers the connection, the answer and its body): `Create` 65 s for the invitation, a join, an
+    attach, an acceptance and a sharing session; `Answer` 35 s for a media answer, our own offer
+    and a subscription; `End` 10 s for a hangup, a reject, a mute, a keep-alive, a stop-sharing, a
+    glare refusal, an acknowledgement, the relay token and the unregister; `Shutdown` 4 s for a
+    stopping backend. Each is the real client's own number for that operation or above it, so
+    this app never gives up on an answer the client would still be waiting for.
+  - **The bound is the REQUEST's and never the credentials'.** `session()` and the token cache can
+    hold the broker's interactive turn, and a future dropped there would leave an abandoned window
+    on the broker's display — so the credentials are read before the request and outside its bound.
+  - **A page that goes away cancelled the request whose answer mattered most.** Every RPC handler
+    lives in its page's connection (`serve_conn`'s `FuturesUnordered`), so a phone locking or a
+    socket the network dropped CANCELLED `call_place` mid-POST: the service had accepted the
+    invite, somebody's phone was ringing, and the answer carrying the only links that call would
+    ever have was never read — so nothing could hang it up. The four starts (place, join, accept,
+    sharing) and the hangup now run their work in a task of their own (`detached`): the handler
+    WAITS for the task, and the task never waits for the handler — `finish_claude_signin`'s rule.
+  - **The handler's wait is bounded, the operation's is not** (`CALL_START_WAIT`, 150 s — two
+    `Create` requests and their credentials; `HANGUP_WAIT`, 12 s). When a start's wait runs out the
+    handler ends it HERE with its own failure reason and answers the page; the task finishes by
+    itself, and its late answer finds the call gone and goes through `hang_up_orphan`, exactly as
+    a start the user cancelled does. A hangup whose POST has not answered is dropped here anyway,
+    because the local drop is what tells every other window the call is over.
+  - **A late failure ends its OWN call** (`end_call_if_still`). A task outlives the moment its call
+    was the live one, and the user may be in the next call by the time a failure lands, so every
+    ending a task makes names its call; `end_call_locally` likewise clears the slot only if it is
+    still the call it ended. The requests a task sends carry their call's correlation id
+    (`post_signal_for`) rather than whichever call is live by then.
+  - **A REFUSAL is typed; silence is not.** A 4xx carries `calling::SignalRefused { status }` in the
+    error chain, so a step that falls back on a refusal (incoming-and-conversation M4a) can tell it
+    from a timeout or a 5xx — after which the leg it would fall back from may exist. The sentence a
+    refusal reads as is unchanged. A timeout is said as a lost answer, never as a no — and its
+    sentence carries the REDACTED address only: reqwest's own error prints the whole URL, query
+    included, so it is stripped before it is wrapped. A success whose body was cut off is still a
+    success and reads as an empty answer, as it always did: reported as a failure it would end a
+    placed call here while the callee's phone rang, and leave the frames that can still name its
+    links nowhere to land.
+  - **The page waits LONGER than the backend** (`CALL_START_REQUEST_TIMEOUT_MS`, 180 s, on the four
+    starts), so a slow start tells the reader the backend's own outcome — "The call took too long
+    to start. Try again in a moment.", with the call already let go — rather than a bare
+    `timeout: call_place` the page must read as a lost answer and keep the microphone open for.
+    `the_pages_call_start_ceiling_outlasts_the_backends_wait` pins the pair across the socket. The
+    give-up names NO cause, because the backend knows none: every request inside the wait is
+    bounded well under it, so what ran out was as likely the sign-in read before them. Only one
+    request that went unanswered within its own bound says "Teams' calling service did not
+    answer in time."
+  - **A late answer is hung up whichever request it answers.** An accept is two requests: the
+    attach takes the call, and the ACCEPTANCE is what answers the caller. When the handler's wait
+    runs out between them, or the user hangs up then, the acceptance's own late answer — or its
+    failure — finds the call gone and hangs the leg up on everything both answers named
+    (`hang_up_orphan("call_accept (acceptance)", …)`); the acceptance is never posted at all for a
+    call that went while the attach was answered. The review of this milestone found that path
+    missing, and `an_acceptance_that_answers_after_its_handler_gave_up_is_hung_up` drives it end to
+    end against stand-in services, beside its twin for a placed call.
+
+  **Nothing on the wire moved, and that is proved rather than claimed:** every body this backend
+  builds is pinned byte for byte (`every_call_body_is_byte_for_byte_its_golden_pin`, nineteen files
+  in `src/testdata/call-bodies/`, landed before the transport changed — video-send M1's fixture set,
+  which later kinds extend rather than duplicate), and the header set is built and read back for
+  POST, PUT and DELETE alike (`every_signaling_verb_carries_the_one_header_set`). A deliberate body
+  change re-blesses with `TEAMS_LITE_BLESS_CALL_BODIES=1 cargo test --lib golden`, and the diff of
+  that directory is the review. **Unverified against the tenant**: no request has timed out live;
+  every measured signaling answer arrived in about two seconds, so the bounds are the pathological
+  case, and what a live call checks is that the verified one-to-one and meeting join still work.
 - **A FAILED ANSWER NEVER DECLINES, and a LOST answer is not a refusal.** The Answer's catch
   used to hang the call up, and on a call still ringing that posted the invite's reject — so a
   microphone the browser refused, a page that timed out or a socket that dropped showed the
@@ -6312,9 +6388,9 @@ call does — this side never handles RTP, and the page never learns a Teams URL
     `requestOutcomeUnknown`), on all three starts — answering, placing and joining. Neither says
     whether the backend did it, and hanging up would end a call that may be connecting, or
     decline a caller already talking to this machine. The backend's own frames connect it or
-    end it. Without the roadmap's M4 a dropped socket can cancel the backend's handler too, and
-    then what ends it is the ring expiry (`CALL_RING_TIMEOUT`, ringing and dialing) or the
-    stage's own Hang up (a join): bounded, and on screen.
+    end it. A dropped socket no longer cancels the backend's start (§ EVERY SIGNALING REQUEST IS
+    BOUNDED, above), so the backend always reaches an outcome of its own within `CALL_START_WAIT`
+    and says it on a frame.
   - **One answer at a time.** While the page holds a microphone for the ringing call, Answer
     reads "Answering…" and does nothing: a second press opened a second microphone over the
     first — which nothing could stop — and accepted the call twice. `adoptCallMedia` also

@@ -781,6 +781,60 @@ const CALL_KEEPALIVE: Duration = Duration::from_secs(20);
 /// answering moves the phase out of the two this applies to.
 const CALL_RING_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long a call START's handler waits for the operation it runs in a task of its own — the
+/// requests that place a call, join a meeting, answer a ring or ask for a sharing session (see
+/// [`detached`]; docs/calling-roadmap/plane-reliability.md § 4.6).
+///
+/// It bounds the handler's WAIT and never the operation. When it runs out the handler ends the
+/// start here and answers the page, and the operation goes on by itself: its late answer finds the
+/// call gone and hangs up the leg the service made (`hang_up_orphan`). 150 s holds the longest
+/// start there is — an attach and then an acceptance, two `Create` requests of 65 s each, with the
+/// credentials read before each — and the page's own ceiling for these four methods
+/// (`CALL_START_REQUEST_TIMEOUT_MS` in web/src/lib/ws-client.ts) is longer still, so the page
+/// hears the backend's outcome rather than a bare timeout. A test pins both relations.
+const CALL_START_WAIT: Duration = Duration::from_secs(150);
+
+/// How long `call_hangup` waits for its own POST before it drops the call here regardless.
+///
+/// The local drop is what tells every other window the call is over, so it never waits on the
+/// network for longer than this. Above the `End` class's bound, so an ordinary hangup — answered
+/// in about two seconds on every measured call — is always told before the wait runs out; and
+/// below the page's ordinary 30 s ceiling, so the page hears what happened.
+const HANGUP_WAIT: Duration = Duration::from_secs(12);
+
+/// What a handler learns from an operation it ran in a task of its own (see [`detached`]).
+enum Detached<T> {
+    /// The operation finished inside the wait, with this outcome.
+    Finished(T),
+    /// The wait ran out first. The operation is still running, and finishes on its own.
+    StillRunning,
+    /// The task stopped without finishing — a panic, named here.
+    Stopped(String),
+}
+
+/// Run `operation` in a task of its own and wait for it at most `wait`.
+///
+/// An RPC handler lives inside its page's connection (`serve_conn` keeps every request future in
+/// a local `FuturesUnordered`), so a page that goes away — a phone locking, a tab closed, a socket
+/// the network dropped — CANCELS the handler at whatever it is awaiting. For a request whose answer
+/// matters that is the worst moment there is: a POST that placed a call, cancelled after the
+/// service accepted it and before its answer was read, leaves somebody's phone ringing for a call
+/// nothing here holds — the answer's links were the only address it had, and nobody reads them.
+///
+/// So the operation is spawned and the handler only WAITS for it: the handler waits for the task,
+/// and the task never waits for the handler — the rule `finish_claude_signin` already follows.
+/// When the wait ends first, dropping the join handle DETACHES the task rather than stopping it.
+async fn detached<T: Send + 'static>(
+    wait: Duration,
+    operation: impl std::future::Future<Output = T> + Send + 'static,
+) -> Detached<T> {
+    match tokio::time::timeout(wait, tokio::spawn(operation)).await {
+        Ok(Ok(outcome)) => Detached::Finished(outcome),
+        Ok(Err(stopped)) => Detached::Stopped(stopped.to_string()),
+        Err(_) => Detached::StillRunning,
+    }
+}
+
 /// How often this MACHINE asks GitHub what the rolling `latest` release names.
 ///
 /// Two minutes, so an app somebody left open on a phone offers a build within two minutes
@@ -8288,73 +8342,8 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
         "call_place" => {
             let call_id = param_str(params, "call_id")?;
             let sdp = param_str(params, "sdp")?;
-            let (local, callbacks, to, thread) = {
-                let plane = ctx.calling.lock().unwrap();
-                let call = plane
-                    .call
-                    .as_ref()
-                    .filter(|c| c.id == call_id)
-                    .context("call_place: no such call — call_prepare first")?;
-                (
-                    call.local.clone(),
-                    call.callbacks.clone(),
-                    call.ring.clone(),
-                    call.conversation_id.clone(),
-                )
-            };
-            if to.is_empty() {
-                anyhow::bail!("call_place: that call rings nobody — call_prepare first");
-            }
-            let session = ctx.session().await?;
-            let ic3 = ctx.tokens.get(IC3_SCOPE).await?;
-            let placed = calling::place_call(
-                &ctx.http,
-                &session,
-                &ic3,
-                &local,
-                &to,
-                thread.as_deref(),
-                &calling::MediaContent::sdp(sdp),
-                &callbacks,
-                &call_id,
-            )
-            .await;
-            match placed {
-                Ok(placed) => {
-                    Ctx::note_answer_shapes("call_place", &placed.raw);
-                    let held = {
-                        let mut plane = ctx.calling.lock().unwrap();
-                        match plane.call.as_mut().filter(|c| c.id == call_id && !c.ended()) {
-                            Some(call) => {
-                                call.links.merge(&placed.links);
-                                call.invite_sent = true;
-                                true
-                            }
-                            None => false,
-                        }
-                    };
-                    if !held {
-                        // The user hung up while this POST was in flight, so the invite is
-                        // out and the reservation is gone: a device is buzzing for a call
-                        // nothing here holds, and the answer's own links are the only way
-                        // to take it back.
-                        ctx.hang_up_orphan("call_place", &local, &placed.links).await;
-                        return Ok(json!({ "call_id": call_id, "cancelled": true }));
-                    }
-                    // The conversation the call was placed in, and its doors — after the call
-                    // is known to be held, so a mute pressed while the invite travelled is
-                    // published on the door the answer names.
-                    if let Some(leg) = placed.conversation.clone() {
-                        ctx.adopt_conversation(&call_id, leg);
-                    }
-                    ctx.emit_call_state();
-                    Ok(json!({ "call_id": call_id, "links": placed.links.names() }))
-                }
-                Err(e) => {
-                    ctx.end_call_locally("CallEndReasonPlaceFailed").await;
-                    Err(e)
-                }
-            }
+            let start = ctx.clone().place_reserved_call(call_id.clone(), sdp);
+            ctx.await_call_start("call_place", &call_id, "CallEndReasonPlaceFailed", start).await
         }
 
         // Join a meeting: ONE POST, and it carries the microphone
@@ -8372,80 +8361,8 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
             let meeting = meeting_address(params)
                 .context("call_join")?
                 .context("call_join: no meeting named — pass join_url or meeting_thread")?;
-            let (local, callbacks) = {
-                let plane = ctx.calling.lock().unwrap();
-                let call = plane
-                    .call
-                    .as_ref()
-                    .filter(|c| c.id == call_id && c.kind == CallKind::Meeting)
-                    .context("call_join: no such meeting — call_prepare first")?;
-                (call.local.clone(), call.callbacks.clone())
-            };
-            let session = ctx.session().await?;
-            let ic3 = ctx.tokens.get(IC3_SCOPE).await?;
-
-            let joined = match calling::join_meeting(
-                &ctx.http,
-                &session,
-                &ic3,
-                &local,
-                &meeting,
-                &callbacks,
-                &call_id,
-                Some(&calling::MediaContent::sdp(sdp)),
-            )
-            .await
-            {
-                Ok(joined) => joined,
-                Err(e) => {
-                    ctx.end_call_locally("CallEndReasonJoinFailed").await;
-                    return Err(e);
-                }
-            };
-            Ctx::note_answer_shapes("call_join", &joined.raw);
-            // The meeting is joined. Its links are held before anything else, so an
-            // ending always has somewhere to post — and the lobby is a state of its own,
-            // because the one thing the user has to know is that nobody has let them in.
-            let held = {
-                let mut plane = ctx.calling.lock().unwrap();
-                match plane.call.as_mut().filter(|c| c.id == call_id && !c.ended()) {
-                    Some(call) => {
-                        call.links.merge(&joined.links);
-                        if calling::lobby_state_in_frame(&joined.raw)
-                            == Some(calling::LobbyState::Waiting)
-                        {
-                            call.in_lobby = true;
-                        }
-                        true
-                    }
-                    None => false,
-                }
-            };
-            if !held {
-                // The user left while this POST was in flight, so the meeting holds a
-                // participant this machine no longer has: leave it, on the links the answer
-                // carried (see `call_place`).
-                ctx.hang_up_orphan("call_join", &local, &joined.links).await;
-                return Ok(json!({ "call_id": call_id, "cancelled": true }));
-            }
-            // The meeting's own doors, replaced rather than merged (see `call_place`).
-            if let Some(leg) = joined.conversation.clone() {
-                ctx.adopt_conversation(&call_id, leg);
-            }
-            ctx.emit_call_state();
-            // What the answer granted. `activeModalities.call` is the audio leg, and it
-            // is normally ABSENT here: the leg is created after the answer, and the
-            // `conversationUpdate` frames that follow a second later do carry it
-            // (measured). So this line is a record of the answer, not a verdict on the
-            // media — that is `getStats` in the browser, which `bun run join-live`
-            // reports.
-            eprintln!(
-                "[calling] joined the meeting: audio_leg_in_answer={} lobby={} links={}",
-                joined.raw.pointer("/activeModalities/call").is_some_and(|c| !c.is_null()),
-                calling::lobby_state_in_frame(&joined.raw) == Some(calling::LobbyState::Waiting),
-                joined.links.names().len()
-            );
-            Ok(json!({ "call_id": call_id, "links": joined.links.names() }))
+            let start = ctx.clone().join_reserved_meeting(call_id.clone(), meeting, sdp);
+            ctx.await_call_start("call_join", &call_id, "CallEndReasonJoinFailed", start).await
         }
 
         // Answer the ringing call with our own SDP.
@@ -8460,149 +8377,8 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
         "call_accept" => {
             let call_id = param_str(params, "call_id")?;
             let sdp = param_str(params, "sdp")?;
-            let (local, callbacks, accept, attach, media_answer) = {
-                let plane = ctx.calling.lock().unwrap();
-                let call = plane
-                    .call
-                    .as_ref()
-                    .filter(|c| c.id == call_id)
-                    .context("call_accept: no such call")?;
-                (
-                    call.local.clone(),
-                    call.callbacks.clone(),
-                    call.links.accept().map(str::to_string),
-                    call.links.attach().map(str::to_string),
-                    call.links.media_answer().map(str::to_string),
-                )
-            };
-            let answer = calling::MediaContent::sdp(sdp);
-            // Which door was used decides whether the media still has to be answered
-            // separately below: the acceptance body carries the answer, an attach does not.
-            let mut used_attach = false;
-            let (url, payload) = match (accept, attach, media_answer) {
-                (Some(url), _, _) => {
-                    (url, calling::acceptance_payload(&local, &answer, &callbacks))
-                }
-                (None, Some(url), _) => {
-                    used_attach = true;
-                    (url, calling::attach_payload(&local, &answer, &callbacks))
-                }
-                (None, None, Some(url)) => {
-                    (url, calling::media_answer_payload(&local, &answer, &callbacks, &[calling::MODALITY_AUDIO]))
-                }
-                (None, None, None) => {
-                    ctx.end_call_locally("CallEndReasonNoAcceptLink").await;
-                    anyhow::bail!("call_accept: the invite carried no link to answer on")
-                }
-            };
-            match ctx.post_call_signal(&url, &payload).await {
-                Ok(response) => {
-                    Ctx::note_answer_shapes(
-                        if used_attach { "call_accept (attach)" } else { "call_accept" },
-                        &response,
-                    );
-                    let links = calling::Links::collect(&response);
-                    // What the service handed back, by NAME — the shape and never the
-                    // content, which is the discipline `calling::media_sections` already
-                    // follows. It is here because an ATTACH that succeeds is not yet a call:
-                    // the first live one came back with no `hangup` and no `end`, so the only
-                    // way to know what the rest of the handshake may use is to say so.
-                    eprintln!("[calling] the call was taken; the service answered with {:?}", links.names());
-                    let held = {
-                        let mut plane = ctx.calling.lock().unwrap();
-                        match plane.call.as_mut().filter(|c| c.id == call_id && !c.ended()) {
-                            Some(call) => {
-                                call.links.merge(&links);
-                                call.phase = CallPhase::Connected;
-                                call.connected_at_ms = Some(now_ms());
-                                true
-                            }
-                            None => false,
-                        }
-                    };
-                    if !held {
-                        // The user hung up while the acceptance was in flight, so the caller
-                        // is now in a call with a machine that holds nothing: end it on the
-                        // links the acceptance answered with (see `call_place`).
-                        ctx.hang_up_orphan("call_accept", &local, &links).await;
-                        return Ok(json!({ "call_id": call_id, "cancelled": true }));
-                    }
-                    // AN ATTACH IS NOT AN ACCEPT, and this is the second half of taking a
-                    // call here. Measured 2026-09-04: the attach POST was accepted and the
-                    // CALLER went on ringing, and the links it answered with say why —
-                    // `["acceptance", "callController", "callLeg", "mediaAnswer", "newOffer",
-                    // "progress", "redirection"]`. There is an `acceptance` in there and no
-                    // `hangup` and no `end`, so what the attach did was claim the forked leg
-                    // and hand back the door that really accepts it. Posting only the media
-                    // answer was tried first and left the caller ringing exactly as before.
-                    //
-                    // Nothing here is skipped for the acceptance door: that one posted its
-                    // acceptance already, and a second would accept one call twice.
-                    //
-                    // A failure leaves the call TAKEN as far as this side is concerned and
-                    // reports itself, because the ending arrives as a frame like any other —
-                    // and the reader is looking at a live call either way.
-                    if used_attach {
-                        // The guard is taken and DROPPED before the await: a `MutexGuard`
-                        // held across one makes the whole future non-Send.
-                        let next = {
-                            let plane = ctx.calling.lock().unwrap();
-                            plane.call.as_ref().and_then(|call| {
-                                call.links
-                                    .accept()
-                                    .map(|url| (url.to_string(), true))
-                                    .or_else(|| {
-                                        call.links.media_answer().map(|url| (url.to_string(), false))
-                                    })
-                            })
-                        };
-                        if let Some((url, is_acceptance)) = next {
-                            let body = if is_acceptance {
-                                calling::acceptance_payload(&local, &answer, &callbacks)
-                            } else {
-                                calling::media_answer_payload(
-                                    &local,
-                                    &answer,
-                                    &callbacks,
-                                    &[calling::MODALITY_AUDIO],
-                                )
-                            };
-                            match ctx.post_call_signal(&url, &body).await {
-                                Ok(response) => {
-                                    Ctx::note_answer_shapes(
-                                        if is_acceptance {
-                                            "call_accept (acceptance)"
-                                        } else {
-                                            "call_accept (media answer)"
-                                        },
-                                        &response,
-                                    );
-                                    let more = calling::Links::collect(&response);
-                                    eprintln!(
-                                        "[calling] the call was accepted; the service answered with {:?}",
-                                        more.names()
-                                    );
-                                    let mut plane = ctx.calling.lock().unwrap();
-                                    if let Some(call) =
-                                        plane.call.as_mut().filter(|c| c.id == call_id && !c.ended())
-                                    {
-                                        call.links.merge(&more);
-                                    }
-                                }
-                                Err(e) => eprintln!(
-                                    "[calling] the acceptance did not reach the service: {e:#}"
-                                ),
-                            }
-                        }
-                    }
-                    ctx.emit_call_state();
-                    Ok(json!({ "call_id": call_id }))
-                }
-                Err(e) => {
-                    ctx.end_call_locally("CallEndReasonAcceptFailed").await;
-                    Err(e)
-                }
-            }
+            let start = ctx.clone().accept_ringing_call(call_id.clone(), sdp);
+            ctx.await_call_start("call_accept", &call_id, "CallEndReasonAcceptFailed", start).await
         }
 
         // Answer a media offer the service made mid-call.
@@ -8636,7 +8412,7 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
             let answer = calling::MediaContent::sdp(sdp);
             let names: Vec<&str> = modalities.iter().map(String::as_str).collect();
             let payload = calling::media_answer_payload(&local, &answer, &callbacks, &names);
-            let response = ctx.post_call_signal(&url, &payload).await?;
+            let response = ctx.post_call_signal(calling::SignalClass::Answer, &url, &payload).await?;
             {
                 let links = calling::Links::collect(&response);
                 let mut plane = ctx.calling.lock().unwrap();
@@ -8672,148 +8448,19 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
         // follows carries whatever is on the user's screen.
         "call_start_sharing" => {
             let call_id = param_str(params, "call_id")?;
-            let (local, callbacks, url, correlation_id, displacing, replacing) = {
-                let mut plane = ctx.calling.lock().unwrap();
-                let call = plane
-                    .call
-                    .as_mut()
-                    .filter(|c| c.id == call_id && !c.ended())
-                    .context("call_start_sharing: no such call")?;
-                if call.phase != CallPhase::Connected {
-                    anyhow::bail!(
-                        "call_start_sharing: this call is not connected yet — a modality is \
-                         added to a live conversation"
-                    );
+            // In a task of its own, like a call start: the POST creates the session on this
+            // tenant, and a page that went away mid-request would leave the reservation and the
+            // grant wait half done. A start that outlives the wait finishes by itself — it gives
+            // its own reservation back when no grant comes — so the page is only told.
+            match detached(CALL_START_WAIT, ctx.clone().start_sharing_session(call_id)).await {
+                Detached::Finished(outcome) => outcome,
+                Detached::StillRunning => {
+                    Err(anyhow::anyhow!("call_start_sharing: the screen share did not start in time"))
                 }
-                // A session THIS ENDPOINT already holds is REPLACED, never refused. Pressing
-                // Share is one gesture with one meaning — "show them my screen now" — and real
-                // Teams answers it that way whoever is presenting, including you. This used to
-                // `bail!` about a session the call still held: an error about the app's own
-                // bookkeeping, shown in place of the action somebody asked for, with nothing they
-                // could do about it. Every path that leaves a stale session behind — a share the
-                // service rejected, an end frame that arrived late, a give-back whose POST failed
-                // — turned Share into a dead button for the rest of the call.
-                //
-                // Nothing here refuses on somebody ELSE's session either: that is the takeover
-                // below, which the service performs and which is the feature.
-                let replacing = call.sharing.take();
-                // A share TAKES the role off whoever holds it, and that is the feature rather
-                // than an accident. Measured 2026-08-06 against a colleague's real share: the
-                // service granted the role — `role = "presenter"` in our own roster entry — and
-                // then offered their `applicationsharing-video` section at PORT 0, so their
-                // screen stopped arriving. That IS what "a meeting shows one screen at a time"
-                // means, and it is what real Teams does when somebody presses Share while a
-                // colleague presents: the new share displaces the old one, and no client asks
-                // first. This handler used to REFUSE while anybody else was sharing, which cost
-                // the user the one action they came for in the very state they wanted it in.
-                //
-                // Whether it takes one is only READ, for the journal: the service does the
-                // displacing, and nothing here posts at a colleague's session.
-                let displacing = call.roster.iter().any(|member| {
-                    member.streams.iter().any(calling::RosterStream::is_shared_screen)
-                });
-                let url = call.links.add_modality().map(str::to_string).context(
-                    "call_start_sharing: this call has no addModality link — the service names \
-                     it on the conversation",
-                )?;
-                (
-                    call.local.clone(),
-                    call.callbacks.clone(),
-                    url,
-                    uuid::Uuid::new_v4().to_string(),
-                    displacing,
-                    replacing,
-                )
-            };
-            // Give the old one back before asking for a new one, so the service is not left
-            // holding two sessions for one endpoint. Best-effort by design: it is told only
-            // where the session named a way out (this tenant's answer names none — § 10.8), and
-            // a failure is one journal line rather than the reader's problem. The session is
-            // already gone from the call either way, so nothing here can block the new share.
-            if let Some(old) = replacing {
-                eprintln!("[calling] replacing the sharing session this endpoint already held");
-                if let Some(url) = &old.leave {
-                    let payload = calling::content_sharing_leave_payload(&local, &callbacks);
-                    if let Err(e) = ctx.post_call_signal(url, &payload).await {
-                        eprintln!("[calling] the old sharing session would not close: {e:#}");
-                    }
+                Detached::Stopped(why) => {
+                    Err(anyhow::anyhow!("call_start_sharing: the sharing session could not be asked for ({why})"))
                 }
             }
-            if displacing {
-                // One line, and no name in it: a colleague's name is theirs, and what this
-                // record is for is that a share of theirs stopped because of a press here.
-                eprintln!(
-                    "[calling] asking for the sharing session while somebody else presents — \
-                     the service takes their share down, as it does for every Teams client"
-                );
-            }
-            let payload = calling::content_sharing_payload(&local, &callbacks, &correlation_id);
-            // The reservation goes in FIRST, so the frame that grants the session has somewhere
-            // to land: it can arrive before this POST has even answered.
-            {
-                let mut plane = ctx.calling.lock().unwrap();
-                if let Some(call) = plane.call.as_mut().filter(|c| c.id == call_id) {
-                    call.sharing = Some(calling::ContentSharing {
-                        correlation_id: correlation_id.clone(),
-                        session_id: None,
-                        leave: None,
-                    });
-                }
-            }
-            let response = ctx.post_call_signal(&url, &payload).await?;
-            // The answer carries `{}` — measured — so the session is not in it. It is read off
-            // the `addModalitySuccess` FRAME, and this WAITS for that frame: the client's own
-            // `start` returns a deferred the frame resolves, and a section offered before the
-            // service has registered the presenter is a section it rejects.
-            let granted = ctx.await_sharing_session(&call_id).await;
-            if !granted {
-                // A SESSION THAT WAS NEVER GRANTED IS NOT A SESSION, so the reservation above
-                // is given back. Without this it stayed on the call for ever and the guard at
-                // the top of this arm refused every later attempt with `this call already
-                // holds a sharing session` — measured 2026-09-04 in a real meeting: the first
-                // press failed because the meeting granted nothing, and the reader could then
-                // never try again for the rest of the call, with a message that blamed a
-                // session they did not have.
-                //
-                // Nothing is posted to give it back, because there is nothing to post TO: the
-                // answer named no links at all, so there is no `leave`. That is the same
-                // reading `call_stop_sharing` already takes for a session the service named no
-                // way out of — drop it locally rather than keep it for ever.
-                //
-                // A grant that merely arrived LATE is harmless: its own frame puts the session
-                // back, and this only clears what this attempt reserved.
-                {
-                    let mut plane = ctx.calling.lock().unwrap();
-                    if let Some(call) = plane
-                        .call
-                        .as_mut()
-                        .filter(|c| c.id == call_id)
-                        .filter(|c| {
-                            c.sharing.as_ref().is_some_and(|s| s.correlation_id == correlation_id)
-                        })
-                    {
-                        call.sharing = None;
-                    }
-                }
-                // NOT "never granted" — that read the silence as a refusal and it is false.
-                // Measured 2026-09-04 with the request and every frame logged: no grant frame
-                // arrives on EITHER callback (`addModalitySuccess`, `contentSharingUpdate`),
-                // and the session exists all the same — on leaving, the service reported it
-                // ending with `Content sharing session ended as present left the session`,
-                // which names this endpoint as the presenter that held it. So the POST itself
-                // creates the session on this tenant, and what is missing is only the way to
-                // give it back explicitly (the answer is `{}`, so there is no `leave`).
-                //
-                // This matters more than the wording: it means the presenter role is NOT what
-                // the rejected `applicationsharing-video` section is missing, which is where
-                // § 10.4 pointed and where two rounds of work went.
-                eprintln!(
-                    "[calling] no grant frame for the sharing session — the POST creates it on \
-                     this tenant, but it named no way to give it back (answer links={:?})",
-                    calling::Links::collect(&response).names()
-                );
-            }
-            Ok(json!({ "call_id": call_id, "can_stop": granted }))
         }
 
         // Give the sharing session back.
@@ -8841,7 +8488,7 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
             let told = match &session.leave {
                 Some(url) => {
                     let payload = calling::content_sharing_leave_payload(&local, &callbacks);
-                    match ctx.post_call_signal(url, &payload).await {
+                    match ctx.post_call_signal(calling::SignalClass::End, url, &payload).await {
                         Ok(_) => true,
                         Err(e) => {
                             eprintln!("[calling] the sharing session would not close: {e:#}");
@@ -8918,7 +8565,7 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
             } else {
                 calling::media_offer_payload(&local, &offer, &callbacks, &names)
             };
-            let response = ctx.post_call_signal(&url, &payload).await?;
+            let response = ctx.post_call_signal(calling::SignalClass::Answer, &url, &payload).await?;
             {
                 let links = calling::Links::collect(&response);
                 let mut plane = ctx.calling.lock().unwrap();
@@ -9006,7 +8653,7 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
             let request =
                 calling::SourceRequest { mid, source_id, stream_msid, fmt_params };
             let payload = calling::source_request_payload(&request, sequence, modern);
-            ctx.post_call_signal(&url, &payload).await?;
+            ctx.post_call_signal(calling::SignalClass::Answer, &url, &payload).await?;
             // What was ASKED for. The service sends a meeting's video only to a client that
             // asks, so a subscription that never goes out is a tile that never fills — and it
             // left no trace on this machine at all.
@@ -9043,9 +8690,8 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
                 };
                 (call.local.clone(), door, url.map(str::to_string))
             };
-            // Tell the other side first, then drop it locally: the local drop is what
-            // stops the microphone, and it must happen even if the POST fails.
-            let told = match (door, url) {
+            // What goes out, if anything.
+            let send = match (door, url) {
                 (HangupDoor::Nothing, _) => {
                     // An accept still on the wire is not lost by this: its own answer finds
                     // the call gone and hangs up what it made (`hang_up_orphan`).
@@ -9053,27 +8699,37 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
                         "[calling] let a ringing call go without declining it — the caller \
                          was not told, and it still rings on the user's other devices"
                     );
-                    false
+                    None
                 }
                 (_, Some(url)) => {
                     let payload = match door {
                         HangupDoor::Reject => calling::rejection_payload(&local),
                         _ => calling::hangup_payload(&local),
                     };
-                    match ctx.post_call_signal(&url, &payload).await {
-                        Ok(_) => true,
-                        Err(e) => {
-                            eprintln!("[calling] the hangup did not reach the service: {e:#}");
-                            false
-                        }
-                    }
+                    Some((url, payload))
                 }
                 (_, None) => {
                     eprintln!("[calling] no link to hang up on — dropping the call locally");
+                    None
+                }
+            };
+            // Tell the other side first, then drop it locally — in a task of its own, so a page
+            // that goes away mid-request does not leave the call standing here with the hangup
+            // half sent. The local drop is what stops the microphone in every other window, so it
+            // happens whether or not the POST does, and it never waits longer than HANGUP_WAIT.
+            let reason = door.end_reason();
+            let hangup = ctx.clone().tell_then_end_call(call_id.clone(), send, reason);
+            let told = match detached(HANGUP_WAIT, hangup).await {
+                Detached::Finished(told) => told,
+                Detached::StillRunning | Detached::Stopped(_) => {
+                    eprintln!(
+                        "[calling] the hangup had no answer within {} s — dropping the call here",
+                        HANGUP_WAIT.as_secs()
+                    );
+                    ctx.end_call_if_still(&call_id, reason).await;
                     false
                 }
             };
-            ctx.end_call_locally(door.end_reason()).await;
             Ok(json!({ "call_id": call_id, "told_service": told }))
         }
 
@@ -9108,7 +8764,7 @@ async fn dispatch(ctx: &Ctx, method: &str, params: &Value) -> Result<Value> {
             ctx.emit_call_state();
             let told = match publish {
                 MutePublish::Legacy(Some(url)) => ctx
-                    .post_call_signal(&url, &calling::mute_payload(&local, muted))
+                    .post_call_signal(calling::SignalClass::End, &url, &calling::mute_payload(&local, muted))
                     .await
                     .inspect_err(|e| eprintln!("[calling] the mute did not reach the service: {e:#}"))
                     .is_ok(),
@@ -15435,8 +15091,15 @@ impl Ctx {
         let session = self.session().await?;
         let ic3 = self.tokens.get(IC3_SCOPE).await?;
         let endpoints = calling::endpoints(&session)?;
-        trouter::unregister(&self.http, &session.skypetoken, &ic3, &endpoints.registrar, endpoint_id)
-            .await
+        trouter::unregister(
+            &self.http,
+            &session.skypetoken,
+            &ic3,
+            &endpoints.registrar,
+            endpoint_id,
+            calling::SignalClass::End.timeout(),
+        )
+        .await
     }
 
     /// One decoded frame from the calling socket. This is the whole receive path.
@@ -15722,7 +15385,7 @@ impl Ctx {
             let callbacks = self.calling.lock().unwrap().call.as_ref().map(|c| c.callbacks.clone());
             if let Some(callbacks) = callbacks {
                 let payload = calling::acceptance_acknowledgement_payload(&callbacks);
-                if let Err(e) = self.post_call_signal(&url, &payload).await {
+                if let Err(e) = self.post_call_signal(calling::SignalClass::End, &url, &payload).await {
                     eprintln!("[calling] could not acknowledge the acceptance: {e:#}");
                 }
             }
@@ -15795,7 +15458,7 @@ impl Ctx {
                     };
                     if let Some(local) = local {
                         let body = calling::media_glare_rejection_payload(&local);
-                        if let Err(e) = self.post_call_signal(url, &body).await {
+                        if let Err(e) = self.post_call_signal(calling::SignalClass::End, url, &body).await {
                             eprintln!("[calling] could not refuse the renegotiation: {e:#}");
                         }
                     }
@@ -15880,7 +15543,7 @@ impl Ctx {
             self.emit_call_state();
             // Acknowledge it, or the service re-sends the answer until it gives up.
             if let Some(url) = acknowledgement
-                && let Err(e) = self.post_call_signal(&url, &json!({})).await
+                && let Err(e) = self.post_call_signal(calling::SignalClass::End, &url, &json!({})).await
             {
                 eprintln!("[calling] could not acknowledge the answer: {e:#}");
             }
@@ -16080,7 +15743,7 @@ impl Ctx {
         let accepted = if read_only() {
             false
         } else {
-            match self.post_call_signal(url, body).await {
+            match self.post_signal_for(call_id, calling::SignalClass::End, url, body).await {
                 Ok(_) => {
                     eprintln!(
                         "[calling] published the mute on updateEndpointState (isMuted={}, \
@@ -16163,10 +15826,25 @@ impl Ctx {
     /// runs when the SERVICE ended it, when the connection moved, or after our own
     /// hangup has already gone out.
     async fn end_call_locally(&self, reason: &str) {
+        self.end_call_where(None, reason).await;
+    }
+
+    /// [`Ctx::end_call_locally`], for call `call_id` and no other.
+    ///
+    /// A start that runs in a task of its own can fail after its call is gone and another has
+    /// begun — the user hung up and called again while the first POST was still out — and its
+    /// failure must end ITS call, never the one the user is in now.
+    async fn end_call_if_still(&self, call_id: &str, reason: &str) {
+        self.end_call_where(Some(call_id), reason).await;
+    }
+
+    async fn end_call_where(&self, only: Option<&str>, reason: &str) {
         let ending = {
             let mut plane = self.calling.lock().unwrap();
             match plane.call.as_mut() {
-                Some(call) if call.phase != CallPhase::Ended => {
+                Some(call)
+                    if call.phase != CallPhase::Ended && only.is_none_or(|id| call.id == id) =>
+                {
                     call.phase = CallPhase::Ended;
                     // A call that rang NOBODY ends with a phrase about the symptom ("no one
                     // else has joined"), and the cause arrived on its own frame a beat
@@ -16177,12 +15855,12 @@ impl Ctx {
                         reason.to_string()
                     };
                     call.end_reason = Some(stated.clone());
-                    Some(stated)
+                    Some((call.id.clone(), stated))
                 }
                 _ => None,
             }
         };
-        let Some(stated) = ending else {
+        let Some((ended, stated)) = ending else {
             return;
         };
         // EVERY ending passes through here, so this is the one place that can state why.
@@ -16194,7 +15872,584 @@ impl Ctx {
         // One emit with the ending in it, then the slot is free. The UI needs that
         // frame to stop holding the microphone, so the drop cannot be folded into it.
         self.emit_call_state();
-        self.calling.lock().unwrap().call = None;
+        // Only the call that ended: an ENDED call frees the slot, so a new one can be admitted
+        // in the moment the frame above goes out, and clearing that one would lose it.
+        let mut plane = self.calling.lock().unwrap();
+        if plane.call.as_ref().is_some_and(|call| call.id == ended) {
+            plane.call = None;
+        }
+    }
+
+    /// Become the PRESENTER of the meeting's content-sharing session (see `call_start_sharing`):
+    /// give back a session this endpoint already held, ask for the new one, and wait for its
+    /// grant. In a task of its own, for `call_place`'s reason.
+    async fn start_sharing_session(self, call_id: String) -> Result<Value> {
+        let (local, callbacks, url, correlation_id, displacing, replacing) = {
+            let mut plane = self.calling.lock().unwrap();
+            let call = plane
+                .call
+                .as_mut()
+                .filter(|c| c.id == call_id && !c.ended())
+                .context("call_start_sharing: no such call")?;
+            if call.phase != CallPhase::Connected {
+                anyhow::bail!(
+                    "call_start_sharing: this call is not connected yet — a modality is \
+                     added to a live conversation"
+                );
+            }
+            // A session THIS ENDPOINT already holds is REPLACED, never refused. Pressing
+            // Share is one gesture with one meaning — "show them my screen now" — and real
+            // Teams answers it that way whoever is presenting, including you. This used to
+            // `bail!` about a session the call still held: an error about the app's own
+            // bookkeeping, shown in place of the action somebody asked for, with nothing they
+            // could do about it. Every path that leaves a stale session behind — a share the
+            // service rejected, an end frame that arrived late, a give-back whose POST failed
+            // — turned Share into a dead button for the rest of the call.
+            //
+            // Nothing here refuses on somebody ELSE's session either: that is the takeover
+            // below, which the service performs and which is the feature.
+            let replacing = call.sharing.take();
+            // A share TAKES the role off whoever holds it, and that is the feature rather
+            // than an accident. Measured 2026-08-06 against a colleague's real share: the
+            // service granted the role — `role = "presenter"` in our own roster entry — and
+            // then offered their `applicationsharing-video` section at PORT 0, so their
+            // screen stopped arriving. That IS what "a meeting shows one screen at a time"
+            // means, and it is what real Teams does when somebody presses Share while a
+            // colleague presents: the new share displaces the old one, and no client asks
+            // first. This handler used to REFUSE while anybody else was sharing, which cost
+            // the user the one action they came for in the very state they wanted it in.
+            //
+            // Whether it takes one is only READ, for the journal: the service does the
+            // displacing, and nothing here posts at a colleague's session.
+            let displacing = call.roster.iter().any(|member| {
+                member.streams.iter().any(calling::RosterStream::is_shared_screen)
+            });
+            let url = call.links.add_modality().map(str::to_string).context(
+                "call_start_sharing: this call has no addModality link — the service names \
+                 it on the conversation",
+            )?;
+            (
+                call.local.clone(),
+                call.callbacks.clone(),
+                url,
+                uuid::Uuid::new_v4().to_string(),
+                displacing,
+                replacing,
+            )
+        };
+        // Give the old one back before asking for a new one, so the service is not left
+        // holding two sessions for one endpoint. Best-effort by design: it is told only
+        // where the session named a way out (this tenant's answer names none — § 10.8), and
+        // a failure is one journal line rather than the reader's problem. The session is
+        // already gone from the call either way, so nothing here can block the new share.
+        if let Some(old) = replacing {
+            eprintln!("[calling] replacing the sharing session this endpoint already held");
+            if let Some(url) = &old.leave {
+                let payload = calling::content_sharing_leave_payload(&local, &callbacks);
+                if let Err(e) = self.post_signal_for(&call_id, calling::SignalClass::End, url, &payload).await {
+                    eprintln!("[calling] the old sharing session would not close: {e:#}");
+                }
+            }
+        }
+        if displacing {
+            // One line, and no name in it: a colleague's name is theirs, and what this
+            // record is for is that a share of theirs stopped because of a press here.
+            eprintln!(
+                "[calling] asking for the sharing session while somebody else presents — \
+                 the service takes their share down, as it does for every Teams client"
+            );
+        }
+        let payload = calling::content_sharing_payload(&local, &callbacks, &correlation_id);
+        // The reservation goes in FIRST, so the frame that grants the session has somewhere
+        // to land: it can arrive before this POST has even answered.
+        {
+            let mut plane = self.calling.lock().unwrap();
+            if let Some(call) = plane.call.as_mut().filter(|c| c.id == call_id) {
+                call.sharing = Some(calling::ContentSharing {
+                    correlation_id: correlation_id.clone(),
+                    session_id: None,
+                    leave: None,
+                });
+            }
+        }
+        let response = self
+            .post_signal_for(&call_id, calling::SignalClass::Create, &url, &payload)
+            .await?;
+        // The answer carries `{}` — measured — so the session is not in it. It is read off
+        // the `addModalitySuccess` FRAME, and this WAITS for that frame: the client's own
+        // `start` returns a deferred the frame resolves, and a section offered before the
+        // service has registered the presenter is a section it rejects.
+        let granted = self.await_sharing_session(&call_id).await;
+        if !granted {
+            // A SESSION THAT WAS NEVER GRANTED IS NOT A SESSION, so the reservation above
+            // is given back. Without this it stayed on the call for ever and the guard at
+            // the top of this arm refused every later attempt with `this call already
+            // holds a sharing session` — measured 2026-09-04 in a real meeting: the first
+            // press failed because the meeting granted nothing, and the reader could then
+            // never try again for the rest of the call, with a message that blamed a
+            // session they did not have.
+            //
+            // Nothing is posted to give it back, because there is nothing to post TO: the
+            // answer named no links at all, so there is no `leave`. That is the same
+            // reading `call_stop_sharing` already takes for a session the service named no
+            // way out of — drop it locally rather than keep it for ever.
+            //
+            // A grant that merely arrived LATE is harmless: its own frame puts the session
+            // back, and this only clears what this attempt reserved.
+            {
+                let mut plane = self.calling.lock().unwrap();
+                if let Some(call) = plane
+                    .call
+                    .as_mut()
+                    .filter(|c| c.id == call_id)
+                    .filter(|c| {
+                        c.sharing.as_ref().is_some_and(|s| s.correlation_id == correlation_id)
+                    })
+                {
+                    call.sharing = None;
+                }
+            }
+            // NOT "never granted" — that read the silence as a refusal and it is false.
+            // Measured 2026-09-04 with the request and every frame logged: no grant frame
+            // arrives on EITHER callback (`addModalitySuccess`, `contentSharingUpdate`),
+            // and the session exists all the same — on leaving, the service reported it
+            // ending with `Content sharing session ended as present left the session`,
+            // which names this endpoint as the presenter that held it. So the POST itself
+            // creates the session on this tenant, and what is missing is only the way to
+            // give it back explicitly (the answer is `{}`, so there is no `leave`).
+            //
+            // This matters more than the wording: it means the presenter role is NOT what
+            // the rejected `applicationsharing-video` section is missing, which is where
+            // § 10.4 pointed and where two rounds of work went.
+            eprintln!(
+                "[calling] no grant frame for the sharing session — the POST creates it on \
+                 this tenant, but it named no way to give it back (answer links={:?})",
+                calling::Links::collect(&response).names()
+            );
+        }
+        Ok(json!({ "call_id": call_id, "can_stop": granted }))
+    }
+
+    /// Send a hangup or a decline for call `call_id`, if there is one to send, and then drop the
+    /// call here whatever became of it (see `call_hangup`). Returns whether the service took it.
+    async fn tell_then_end_call(
+        self,
+        call_id: String,
+        send: Option<(String, Value)>,
+        reason: &'static str,
+    ) -> bool {
+        let told = match send {
+            Some((url, payload)) => {
+                match self.post_signal_for(&call_id, calling::SignalClass::End, &url, &payload).await {
+                    Ok(_) => true,
+                    Err(e) => {
+                        eprintln!("[calling] the hangup did not reach the service: {e:#}");
+                        false
+                    }
+                }
+            }
+            None => false,
+        };
+        self.end_call_if_still(&call_id, reason).await;
+        told
+    }
+
+    /// Wait for a call start that runs in a task of its own (see [`detached`]), at most
+    /// [`CALL_START_WAIT`].
+    ///
+    /// When the wait runs out first, the start ends HERE with `failed` and the page is told — and
+    /// the operation goes on by itself: its late answer finds the call gone and hangs up what the
+    /// service made (`hang_up_orphan`), exactly as it does for a start the user cancelled.
+    async fn await_call_start(
+        &self,
+        method: &str,
+        call_id: &str,
+        failed: &str,
+        start: impl std::future::Future<Output = Result<Value>> + Send + 'static,
+    ) -> Result<Value> {
+        match detached(CALL_START_WAIT, start).await {
+            Detached::Finished(outcome) => outcome,
+            Detached::StillRunning => {
+                // Not "the service did not answer": every request inside is bounded well under
+                // this wait, so what ran out was as likely the sign-in read before them. The
+                // sentence names what is known — the start did not finish — and nothing else.
+                eprintln!(
+                    "[calling] {method}: the start did not finish within {} s — it ends here, and \
+                     a late answer is hung up on its own links",
+                    CALL_START_WAIT.as_secs()
+                );
+                self.end_call_if_still(call_id, failed).await;
+                Err(anyhow::anyhow!("{method}: the call did not start in time"))
+            }
+            Detached::Stopped(why) => {
+                eprintln!("[calling] {method}: the start stopped unexpectedly: {why}");
+                self.end_call_if_still(call_id, failed).await;
+                Err(anyhow::anyhow!("{method}: the call could not be started ({why})"))
+            }
+        }
+    }
+
+    /// Place the reserved call `call_id`: ONE POST carrying our offer (NATIVE-CALLING.md § 2.3),
+    /// and what its answer means.
+    ///
+    /// This is the request that makes a device buzz in somebody's pocket, so it carries out
+    /// exactly one click and nothing else. A failure ends the reservation rather than leaving the
+    /// UI on "calling…" forever. It runs in a task of its own (`call_place`), because its answer
+    /// is the only address the call it starts will ever have.
+    async fn place_reserved_call(self, call_id: String, sdp: String) -> Result<Value> {
+        let (local, callbacks, to, thread) = {
+            let plane = self.calling.lock().unwrap();
+            let call = plane
+                .call
+                .as_ref()
+                .filter(|c| c.id == call_id)
+                .context("call_place: no such call — call_prepare first")?;
+            (
+                call.local.clone(),
+                call.callbacks.clone(),
+                call.ring.clone(),
+                call.conversation_id.clone(),
+            )
+        };
+        if to.is_empty() {
+            anyhow::bail!("call_place: that call rings nobody — call_prepare first");
+        }
+        let session = self.session().await?;
+        let ic3 = self.tokens.get(IC3_SCOPE).await?;
+        let placed = calling::place_call(
+            &self.http,
+            &session,
+            &ic3,
+            &local,
+            &to,
+            thread.as_deref(),
+            &calling::MediaContent::sdp(sdp),
+            &callbacks,
+            &call_id,
+        )
+        .await;
+        match placed {
+            Ok(placed) => {
+                Ctx::note_answer_shapes("call_place", &placed.raw);
+                let held = {
+                    let mut plane = self.calling.lock().unwrap();
+                    match plane.call.as_mut().filter(|c| c.id == call_id && !c.ended()) {
+                        Some(call) => {
+                            call.links.merge(&placed.links);
+                            call.invite_sent = true;
+                            true
+                        }
+                        None => false,
+                    }
+                };
+                if !held {
+                    // The user hung up while this POST was in flight, so the invite is
+                    // out and the reservation is gone: a device is buzzing for a call
+                    // nothing here holds, and the answer's own links are the only way
+                    // to take it back.
+                    self.hang_up_orphan("call_place", &call_id, &local, &placed.links).await;
+                    return Ok(json!({ "call_id": call_id, "cancelled": true }));
+                }
+                // The conversation the call was placed in, and its doors — after the call
+                // is known to be held, so a mute pressed while the invite travelled is
+                // published on the door the answer names.
+                if let Some(leg) = placed.conversation.clone() {
+                    self.adopt_conversation(&call_id, leg);
+                }
+                self.emit_call_state();
+                Ok(json!({ "call_id": call_id, "links": placed.links.names() }))
+            }
+            Err(e) => {
+                self.end_call_if_still(&call_id, "CallEndReasonPlaceFailed").await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Join the reserved meeting `call_id`: ONE POST, and it carries the microphone
+    /// (NATIVE-CALLING.md § 2.3a). The answer names every link the meeting offers — leave, mute,
+    /// admit — and whether we are in its lobby. In a task of its own, for `call_place`'s reason.
+    async fn join_reserved_meeting(
+        self,
+        call_id: String,
+        meeting: calling::MeetingJoin,
+        sdp: String,
+    ) -> Result<Value> {
+        let (local, callbacks) = {
+            let plane = self.calling.lock().unwrap();
+            let call = plane
+                .call
+                .as_ref()
+                .filter(|c| c.id == call_id && c.kind == CallKind::Meeting)
+                .context("call_join: no such meeting — call_prepare first")?;
+            (call.local.clone(), call.callbacks.clone())
+        };
+        let session = self.session().await?;
+        let ic3 = self.tokens.get(IC3_SCOPE).await?;
+
+        let joined = match calling::join_meeting(
+            &self.http,
+            &session,
+            &ic3,
+            &local,
+            &meeting,
+            &callbacks,
+            &call_id,
+            Some(&calling::MediaContent::sdp(sdp)),
+        )
+        .await
+        {
+            Ok(joined) => joined,
+            Err(e) => {
+                self.end_call_if_still(&call_id, "CallEndReasonJoinFailed").await;
+                return Err(e);
+            }
+        };
+        Ctx::note_answer_shapes("call_join", &joined.raw);
+        // The meeting is joined. Its links are held before anything else, so an
+        // ending always has somewhere to post — and the lobby is a state of its own,
+        // because the one thing the user has to know is that nobody has let them in.
+        let held = {
+            let mut plane = self.calling.lock().unwrap();
+            match plane.call.as_mut().filter(|c| c.id == call_id && !c.ended()) {
+                Some(call) => {
+                    call.links.merge(&joined.links);
+                    if calling::lobby_state_in_frame(&joined.raw)
+                        == Some(calling::LobbyState::Waiting)
+                    {
+                        call.in_lobby = true;
+                    }
+                    true
+                }
+                None => false,
+            }
+        };
+        if !held {
+            // The user left while this POST was in flight, so the meeting holds a
+            // participant this machine no longer has: leave it, on the links the answer
+            // carried (see `call_place`).
+            self.hang_up_orphan("call_join", &call_id, &local, &joined.links).await;
+            return Ok(json!({ "call_id": call_id, "cancelled": true }));
+        }
+        // The meeting's own doors, replaced rather than merged (see `call_place`).
+        if let Some(leg) = joined.conversation.clone() {
+            self.adopt_conversation(&call_id, leg);
+        }
+        self.emit_call_state();
+        // What the answer granted. `activeModalities.call` is the audio leg, and it
+        // is normally ABSENT here: the leg is created after the answer, and the
+        // `conversationUpdate` frames that follow a second later do carry it
+        // (measured). So this line is a record of the answer, not a verdict on the
+        // media — that is `getStats` in the browser, which `bun run join-live`
+        // reports.
+        eprintln!(
+            "[calling] joined the meeting: audio_leg_in_answer={} lobby={} links={}",
+            joined.raw.pointer("/activeModalities/call").is_some_and(|c| !c.is_null()),
+            calling::lobby_state_in_frame(&joined.raw) == Some(calling::LobbyState::Waiting),
+            joined.links.names().len()
+        );
+        Ok(json!({ "call_id": call_id, "links": joined.links.names() }))
+    }
+
+    /// Answer the ringing call `call_id` with our own SDP — every request that takes, in order,
+    /// and what each answer means. In a task of its own, for `call_place`'s reason: an attach's
+    /// answer carries the door that really accepts the call, and an acceptance cancelled
+    /// mid-flight leaves a caller talking to a machine that holds nothing.
+    async fn accept_ringing_call(self, call_id: String, sdp: String) -> Result<Value> {
+        let (local, callbacks, accept, attach, media_answer) = {
+            let plane = self.calling.lock().unwrap();
+            let call = plane
+                .call
+                .as_ref()
+                .filter(|c| c.id == call_id)
+                .context("call_accept: no such call")?;
+            (
+                call.local.clone(),
+                call.callbacks.clone(),
+                call.links.accept().map(str::to_string),
+                call.links.attach().map(str::to_string),
+                call.links.media_answer().map(str::to_string),
+            )
+        };
+        let answer = calling::MediaContent::sdp(sdp);
+        // Which door was used decides whether the media still has to be answered
+        // separately below: the acceptance body carries the answer, an attach does not.
+        let mut used_attach = false;
+        let (url, payload) = match (accept, attach, media_answer) {
+            (Some(url), _, _) => {
+                (url, calling::acceptance_payload(&local, &answer, &callbacks))
+            }
+            (None, Some(url), _) => {
+                used_attach = true;
+                (url, calling::attach_payload(&local, &answer, &callbacks))
+            }
+            (None, None, Some(url)) => {
+                (url, calling::media_answer_payload(&local, &answer, &callbacks, &[calling::MODALITY_AUDIO]))
+            }
+            (None, None, None) => {
+                self.end_call_if_still(&call_id, "CallEndReasonNoAcceptLink").await;
+                anyhow::bail!("call_accept: the invite carried no link to answer on")
+            }
+        };
+        match self.post_signal_for(&call_id, calling::SignalClass::Create, &url, &payload).await {
+            Ok(response) => {
+                Ctx::note_answer_shapes(
+                    if used_attach { "call_accept (attach)" } else { "call_accept" },
+                    &response,
+                );
+                let links = calling::Links::collect(&response);
+                // What the service handed back, by NAME — the shape and never the
+                // content, which is the discipline `calling::media_sections` already
+                // follows. It is here because an ATTACH that succeeds is not yet a call:
+                // the first live one came back with no `hangup` and no `end`, so the only
+                // way to know what the rest of the handshake may use is to say so.
+                eprintln!("[calling] the call was taken; the service answered with {:?}", links.names());
+                let held = {
+                    let mut plane = self.calling.lock().unwrap();
+                    match plane.call.as_mut().filter(|c| c.id == call_id && !c.ended()) {
+                        Some(call) => {
+                            call.links.merge(&links);
+                            call.phase = CallPhase::Connected;
+                            call.connected_at_ms = Some(now_ms());
+                            true
+                        }
+                        None => false,
+                    }
+                };
+                if !held {
+                    // The user hung up while the acceptance was in flight, so the caller
+                    // is now in a call with a machine that holds nothing: end it on the
+                    // links the acceptance answered with (see `call_place`).
+                    self.hang_up_orphan("call_accept", &call_id, &local, &links).await;
+                    return Ok(json!({ "call_id": call_id, "cancelled": true }));
+                }
+                // AN ATTACH IS NOT AN ACCEPT, and this is the second half of taking a
+                // call here. Measured 2026-09-04: the attach POST was accepted and the
+                // CALLER went on ringing, and the links it answered with say why —
+                // `["acceptance", "callController", "callLeg", "mediaAnswer", "newOffer",
+                // "progress", "redirection"]`. There is an `acceptance` in there and no
+                // `hangup` and no `end`, so what the attach did was claim the forked leg
+                // and hand back the door that really accepts it. Posting only the media
+                // answer was tried first and left the caller ringing exactly as before.
+                //
+                // Nothing here is skipped for the acceptance door: that one posted its
+                // acceptance already, and a second would accept one call twice.
+                //
+                // A failure leaves the call TAKEN as far as this side is concerned and
+                // reports itself, because the ending arrives as a frame like any other —
+                // and the reader is looking at a live call either way.
+                if used_attach {
+                    // The guard is taken and DROPPED before the await: a `MutexGuard`
+                    // held across one makes the whole future non-Send.
+                    //
+                    // It reads THIS call, still live, and no other: a call that went while the
+                    // attach was answered must not have another call's acceptance posted for it.
+                    let next = {
+                        let plane = self.calling.lock().unwrap();
+                        plane.call.as_ref().filter(|c| c.id == call_id && !c.ended()).map(|call| {
+                            call.links
+                                .accept()
+                                .map(|url| (url.to_string(), true))
+                                .or_else(|| {
+                                    call.links.media_answer().map(|url| (url.to_string(), false))
+                                })
+                        })
+                    };
+                    let Some(next) = next else {
+                        // The call went between the attach's answer and this read — the user
+                        // hung up, or the handler's wait ran out. The attach claimed the forked
+                        // leg, so it is hung up on the attach's own links.
+                        self.hang_up_orphan("call_accept (attach)", &call_id, &local, &links).await;
+                        return Ok(json!({ "call_id": call_id, "cancelled": true }));
+                    };
+                    if let Some((url, is_acceptance)) = next {
+                        let body = if is_acceptance {
+                            calling::acceptance_payload(&local, &answer, &callbacks)
+                        } else {
+                            calling::media_answer_payload(
+                                &local,
+                                &answer,
+                                &callbacks,
+                                &[calling::MODALITY_AUDIO],
+                            )
+                        };
+                        match self.post_signal_for(&call_id, calling::SignalClass::Create, &url, &body).await {
+                            Ok(response) => {
+                                Ctx::note_answer_shapes(
+                                    if is_acceptance {
+                                        "call_accept (acceptance)"
+                                    } else {
+                                        "call_accept (media answer)"
+                                    },
+                                    &response,
+                                );
+                                let more = calling::Links::collect(&response);
+                                eprintln!(
+                                    "[calling] the call was accepted; the service answered with {:?}",
+                                    more.names()
+                                );
+                                let held = {
+                                    let mut plane = self.calling.lock().unwrap();
+                                    match plane
+                                        .call
+                                        .as_mut()
+                                        .filter(|c| c.id == call_id && !c.ended())
+                                    {
+                                        Some(call) => {
+                                            call.links.merge(&more);
+                                            true
+                                        }
+                                        None => false,
+                                    }
+                                };
+                                if !held {
+                                    // THE ACCEPTANCE ANSWERED FOR A CALL THAT IS GONE — the user
+                                    // hung up while it travelled, or the handler's wait ran out —
+                                    // so the caller is now connected to a machine that holds
+                                    // nothing. It is the second half of `call_place`'s rule, and
+                                    // the one a detached accept most needs: the acceptance is the
+                                    // request that answers the caller. Hung up on everything the
+                                    // two answers named. Where the user's own Hang up already
+                                    // posted on the attach's `callLeg`, this repeats it, which
+                                    // costs one refused request and never leaves a caller talking
+                                    // to silence.
+                                    let mut all = links.clone();
+                                    all.merge(&more);
+                                    self.hang_up_orphan("call_accept (acceptance)", &call_id, &local, &all)
+                                        .await;
+                                    return Ok(json!({ "call_id": call_id, "cancelled": true }));
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[calling] the acceptance did not reach the service: {e:#}");
+                                // A call that went while the acceptance travelled still holds the
+                                // leg the attach claimed, whatever became of the acceptance — a
+                                // lost answer may have answered the caller. While the call is still
+                                // here it stays taken, as before: its ending arrives as a frame.
+                                let gone = !self
+                                    .calling
+                                    .lock()
+                                    .unwrap()
+                                    .call
+                                    .as_ref()
+                                    .is_some_and(|c| c.id == call_id && !c.ended());
+                                if gone {
+                                    self.hang_up_orphan("call_accept (acceptance)", &call_id, &local, &links)
+                                        .await;
+                                    return Ok(json!({ "call_id": call_id, "cancelled": true }));
+                                }
+                            }
+                        }
+                    }
+                }
+                self.emit_call_state();
+                Ok(json!({ "call_id": call_id }))
+            }
+            Err(e) => {
+                self.end_call_if_still(&call_id, "CallEndReasonAcceptFailed").await;
+                Err(e)
+            }
+        }
     }
 
     /// End a call the service accepted for a reservation this machine no longer holds.
@@ -16208,9 +16463,13 @@ impl Ctx {
     ///
     /// Nothing is retried and nothing is reported to the page: the user ended this call
     /// before it existed, and there is no surface left to say anything on.
+    ///
+    /// `call_id` names the call the leg belongs to, so the hangup carries ITS correlation id
+    /// rather than that of whichever call is live by the time the answer lands.
     async fn hang_up_orphan(
         &self,
         method: &str,
+        call_id: &str,
         local: &calling::LocalParticipant,
         links: &calling::Links,
     ) {
@@ -16219,14 +16478,20 @@ impl Ctx {
             return;
         };
         let url = url.to_string();
-        match self.post_call_signal(&url, &calling::hangup_payload(local)).await {
+        let payload = calling::hangup_payload(local);
+        match self.post_signal_for(call_id, calling::SignalClass::End, &url, &payload).await {
             Ok(_) => eprintln!("[calling] {method}: the call was cancelled — hung it up"),
             Err(e) => eprintln!("[calling] {method}: the cancelled call did not hang up: {e:#}"),
         }
     }
 
-    /// POST one signaling frame for the live call, with its correlation id.
-    async fn post_call_signal(&self, url: &str, payload: &Value) -> Result<Value> {
+    /// POST one signaling frame for the LIVE call, with its correlation id, bounded by `class`.
+    async fn post_call_signal(
+        &self,
+        class: calling::SignalClass,
+        url: &str,
+        payload: &Value,
+    ) -> Result<Value> {
         let correlation = self
             .calling
             .lock()
@@ -16235,9 +16500,25 @@ impl Ctx {
             .as_ref()
             .map(|c| c.id.clone())
             .unwrap_or_default();
+        self.post_signal_for(&correlation, class, url, payload).await
+    }
+
+    /// POST one signaling frame on behalf of call `call_id`, which may already be over.
+    ///
+    /// A start running in a task of its own, and the hangup of a leg nothing holds, outlive the
+    /// moment their call was the live one — so they name the call they are about rather than
+    /// whichever call is live by the time they are sent. The credentials are read here, before
+    /// the request and outside its bound (see [`calling::SignalClass`]).
+    async fn post_signal_for(
+        &self,
+        call_id: &str,
+        class: calling::SignalClass,
+        url: &str,
+        payload: &Value,
+    ) -> Result<Value> {
         let session = self.session().await?;
         let ic3 = self.tokens.get(IC3_SCOPE).await?;
-        calling::post_signal(&self.http, url, &session, &ic3, &correlation, payload).await
+        calling::post_signal(&self.http, class, url, &session, &ic3, call_id, payload).await
     }
 
     /// Drop a call NOBODY ANSWERED once it has held the one call slot for too long.
@@ -16313,7 +16594,7 @@ impl Ctx {
                 .and_then(|call| call.links.keep_alive().map(str::to_string))
         };
         let Some(url) = url else { return };
-        if let Err(e) = self.post_call_signal(&url, &json!({})).await {
+        if let Err(e) = self.post_call_signal(calling::SignalClass::End, &url, &json!({})).await {
             eprintln!("[calling] the keep-alive did not reach the service: {e:#}");
         }
     }
@@ -16899,6 +17180,42 @@ fn call_capture_line(ts_ms: u64, url: &str, call_id: &str, body: &Value) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every spelling by which this backend sends a signaling request — for a scan that must find
+    /// NONE in a window. One list, so the next poster added cannot slip past the scans that know
+    /// only the old names (the review that landed this list found three that did).
+    const SIGNAL_POSTERS: &[&str] = &[
+        "post_call_signal(",
+        "post_signal_for(",
+        "calling::post_signal(",
+        "calling::put_signal(",
+        "calling::delete_signal(",
+        "hang_up_orphan(",
+        "tell_then_end_call(",
+    ];
+
+    /// The first of [`SIGNAL_POSTERS`] found in `window`, if any.
+    fn first_signal_poster(window: &str) -> Option<(usize, &'static str)> {
+        SIGNAL_POSTERS
+            .iter()
+            .filter_map(|poster| window.find(poster).map(|at| (at, *poster)))
+            .min()
+    }
+
+    /// The production source of this file between `from` and the first `to` after it — for a
+    /// scan that must read one function or one arm and nothing beside it. Both markers must be
+    /// present, so a scan whose window went missing fails rather than passing over nothing.
+    fn production_between(from: &str, to: &str) -> &'static str {
+        let source = include_str!("server.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let at = code.find(from).unwrap_or_else(|| panic!("the source holds no {from:?}"));
+        let end = at
+            + code[at + from.len()..]
+                .find(to)
+                .map(|len| len + from.len())
+                .unwrap_or_else(|| panic!("nothing ends {from:?} at {to:?}"));
+        &code[at..end]
+    }
 
     // ---- the write lock ----------------------------------------------------
     // Reads stay open (the point: tooling may inspect real data); writes need the
@@ -18916,7 +19233,7 @@ mod tests {
 
         let post = between("async fn post_endpoint_state(", "fn learn_conversation(&self");
         let refused = post.find("read_only()").expect("no read-only refusal");
-        let network = post.find("post_call_signal(").expect("no publish");
+        let (network, _) = first_signal_poster(post).expect("no publish");
         assert!(refused < network, "the read-only refusal comes after the network");
         let adopt = between("fn adopt_conversation(&self", "/// Journal what an ANSWER");
         let spawn = adopt.find("tokio::spawn(").expect("the owed publish is not spawned");
@@ -19250,11 +19567,10 @@ mod tests {
         let source = include_str!("server.rs");
         let code = source.split("#[cfg(test)]").next().unwrap_or(source);
         assert_eq!(code.matches("invite_sent = true").count(), 1, "one place sets it");
-        let place = code
-            .split("\"call_place\" => {")
-            .nth(1)
-            .and_then(|rest| rest.split("\"call_join\" => {").next())
-            .expect("the call_place arm");
+        let place = production_between(
+            "async fn place_reserved_call(",
+            "async fn join_reserved_meeting(",
+        );
         let merged = place.find("call.links.merge(&placed.links);").expect("the answer is merged");
         let set = place.find("call.invite_sent = true;").expect("call_place sets invite_sent");
         assert!(set > merged, "invite_sent is set once the answer is held, not before the POST");
@@ -19447,28 +19763,66 @@ mod tests {
     /// exist, so a handler that merely skipped its merge would leave the call standing.
     #[test]
     fn a_call_answered_for_a_cancelled_start_is_hung_up() {
-        let source = include_str!("server.rs");
-        let code = source.split("#[cfg(test)]").next().unwrap_or(source);
-        for (method, next) in [
-            ("\"call_place\" => {", "\"call_join\" => {"),
-            ("\"call_join\" => {", "\"call_accept\" => {"),
-            ("\"call_accept\" => {", "\"call_answer_media\" => {"),
+        // Each start's work, in the order the methods stand: what follows the last is the shared
+        // wait.
+        for (start, next, method, failed) in [
+            (
+                "async fn place_reserved_call(",
+                "async fn join_reserved_meeting(",
+                "call_place",
+                "CallEndReasonPlaceFailed",
+            ),
+            (
+                "async fn join_reserved_meeting(",
+                "async fn accept_ringing_call(",
+                "call_join",
+                "CallEndReasonJoinFailed",
+            ),
+            (
+                "async fn accept_ringing_call(",
+                "/// End a call the service accepted for a reservation",
+                "call_accept",
+                "CallEndReasonAcceptFailed",
+            ),
         ] {
-            let handler = code.split(method).nth(1).expect(method);
-            let handler = handler.split(next).next().expect("the handler ends at the next arm");
+            let work = production_between(start, next);
             assert!(
-                handler.contains("hang_up_orphan"),
+                work.contains(&format!("self.hang_up_orphan(\"{method}\", &call_id,")),
                 "{method} keeps a call the user cancelled while its POST was in flight. \
                  Re-read the reservation after the answer and hang the call up on the links \
                  that answer carried."
             );
             assert!(
-                handler.contains("!c.ended()"),
+                work.contains("!c.ended()"),
                 "{method} reads the reservation without checking whether it ENDED. \
                  `end_call_locally` marks the session before it drops it, so a request \
                  landing on that side of the emit would look like a live call."
             );
+            // Its failure ends ITS call and no other: a task outlives its call, and the user may
+            // be in the next one by the time a late failure lands.
+            assert!(work.contains(&format!("self.end_call_if_still(&call_id, \"{failed}\")")), "{work}");
+            assert!(!work.contains("end_call_locally("), "{method} ends whichever call is live:\n{work}");
+
+            // AND THE WORK RUNS IN A TASK OF ITS OWN. The arm hands it to the wait and does
+            // nothing else after the parameters are read — so a page that goes away cancels the
+            // wait, never the request whose answer is the only address of the leg it made.
+            let arm = production_between(&format!("\"{method}\" => {{"), "\n        }\n");
+            let wait = format!("ctx.await_call_start(\"{method}\", &call_id, \"{failed}\", start).await");
+            assert!(arm.contains(&wait), "{method} does not run its start detached:\n{arm}");
+            assert!(arm.contains(&format!("ctx.clone().{}", &start["async fn ".len()..])), "{arm}");
+            assert!(
+                !arm.contains("post_") && !arm.contains("calling::place_call") && !arm.contains("join_meeting("),
+                "{method} sends something from the handler itself:\n{arm}"
+            );
         }
+        // The shared wait spawns, waits at most CALL_START_WAIT, and on giving up ends the start
+        // HERE for that call alone.
+        let wait = production_between("async fn await_call_start(", "async fn place_reserved_call(");
+        assert!(wait.contains("detached(CALL_START_WAIT, start).await"), "{wait}");
+        assert!(wait.contains("Detached::StillRunning => {"), "{wait}");
+        assert!(wait.contains("self.end_call_if_still(call_id, failed).await;"), "{wait}");
+        let spawn = production_between("async fn detached<", "\n}\n");
+        assert!(spawn.contains("tokio::time::timeout(wait, tokio::spawn(operation))"), "{spawn}");
     }
 
     /// A renegotiation that lands while OURS is out is REFUSED, and never applied.
@@ -19637,7 +19991,7 @@ mod tests {
              UI is told and the slot is really freed.\n{sweep}"
         );
         assert!(
-            !sweep.contains("reject()") && !sweep.contains("post_call_signal"),
+            !sweep.contains("reject()") && first_signal_poster(sweep).is_none(),
             "the sweep must reach NOBODY: declining on the user's behalf is shown to the \
              caller, and a timer does not get to decide that.\n{sweep}"
         );
@@ -19711,11 +20065,21 @@ mod tests {
 
         let source = include_str!("server.rs");
         let code = source.split("#[cfg(test)]").next().unwrap_or(source);
-        let start = code
-            .rsplit("\"call_start_sharing\" => {")
-            .next()
-            .and_then(|rest| rest.split("\"call_stop_sharing\" => {").next())
-            .expect("the start handler");
+        // The arm runs the start in a task of its own; the start's work is the method.
+        let arm = production_between("\"call_start_sharing\" => {", "\"call_stop_sharing\" => {");
+        assert!(
+            arm.contains("detached(CALL_START_WAIT, ctx.clone().start_sharing_session(call_id))"),
+            "the sharing session is asked for from the handler itself:\n{arm}"
+        );
+        assert!(!arm.contains("post_"), "{arm}");
+        let start = production_between(
+            "async fn start_sharing_session(",
+            "async fn tell_then_end_call(",
+        );
+        assert!(
+            start.contains("post_signal_for(&call_id, calling::SignalClass::Create, &url, &payload)"),
+            "the sharing session's answer may carry its links, so it is a creating request:\n{start}"
+        );
         // The link is the conversation's own, and the session is asked of a LIVE call: the
         // service adds a modality to an ongoing conversation and refuses one before that.
         assert!(start.contains("add_modality()"), "the session is asked for on `addModality`");
@@ -19747,17 +20111,20 @@ mod tests {
         // already holds a sharing session` — measured 2026-09-04 in a real meeting, where the
         // reader could not try again for the rest of the call and was blamed for a session they
         // did not have.
+        // The whole branch, to the answer the method gives after it — not to the first closing
+        // brace, which is the inner block's.
         let ungranted = start
             .split("if !granted {")
             .nth(1)
-            .and_then(|rest| rest.split("\n            }").next())
+            .and_then(|rest| rest.split("Ok(json!({ \"call_id\": call_id, \"can_stop\": granted }))").next())
             .expect("the ungranted branch");
+        assert!(ungranted.contains("no grant frame for the sharing session"), "{ungranted}");
         assert!(
             ungranted.contains("call.sharing = None"),
             "an ungranted session must be forgotten, or no later share can be attempted:\n{ungranted}"
         );
         assert!(
-            !ungranted.contains("post_call_signal"),
+            first_signal_poster(ungranted).is_none(),
             "there is nothing to post a give-back to — the answer named no links at all:\n{ungranted}"
         );
         // And the session's links never join the call's: merged in, this frame's `leave`
@@ -20095,7 +20462,19 @@ mod tests {
         assert!(handler.contains("let request = hangup_request(params)?;"));
         assert!(handler.contains("hangup_door(call.direction, call.phase, request.intent)"));
         assert!(handler.contains("HangupDoor::Nothing => None,"), "the Nothing door has no url");
-        assert!(handler.contains("ctx.end_call_locally(door.end_reason()).await;"));
+        // Told first and dropped here after, in a task of its own, for that call alone — and the
+        // handler drops it itself when the POST has not answered within HANGUP_WAIT.
+        assert!(handler.contains("ctx.clone().tell_then_end_call(call_id.clone(), send, reason)"));
+        assert!(handler.contains("detached(HANGUP_WAIT, hangup).await"));
+        assert!(handler.contains("ctx.end_call_if_still(&call_id, reason).await;"));
+        assert!(!handler.contains("end_call_locally("), "{handler}");
+        assert!(!handler.contains("post_"), "the handler sends nothing itself:\n{handler}");
+        let tell = production_between("async fn tell_then_end_call(", "/// Wait for a call start");
+        let post = tell
+            .find("self.post_signal_for(&call_id, calling::SignalClass::End, &url, &payload)")
+            .expect("the hangup goes out on the End class, for its own call");
+        let drop = tell.find("self.end_call_if_still(&call_id, reason).await;").expect("the drop");
+        assert!(post < drop, "the other side is told before the call is dropped here");
         assert!(!handler.contains("let declining"), "the old phase-only decision is gone");
     }
 
@@ -20843,6 +21222,252 @@ mod tests {
              min of silence — so a reader would meet `timeout: gitlab_mr_review_run` in place of the \
              CLI's own reason, which is the bug this pairing exists to prevent"
         );
+    }
+
+    /// THE PAGE WAITS LONGER THAN THE BACKEND DOES, for every request that starts something on a
+    /// call — so what a slow start tells the reader is the backend's own outcome ("the calling
+    /// service did not answer in time", with the call already let go), never a bare
+    /// `timeout: call_place` the page must read as a LOST answer and keep the microphone open for.
+    /// And the backend's waits hold the requests inside them. Nothing but this test can notice
+    /// either relation breaking: the mock answers in one frame, so no spec ever waits.
+    #[test]
+    fn the_pages_call_start_ceiling_outlasts_the_backends_wait() {
+        let client = include_str!("../../web/src/lib/ws-client.ts");
+        let millis = |name: &str| -> u64 {
+            let line = client
+                .lines()
+                .find(|line| line.starts_with(&format!("const {name} = ")))
+                .unwrap_or_else(|| panic!("ws-client.ts declares no {name}"));
+            line.split('=')
+                .nth(1)
+                .map(|rhs| rhs.trim().trim_end_matches(';').replace('_', ""))
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("{name} is not a plain number of milliseconds: `{line}`"))
+        };
+        let start_ceiling = millis("CALL_START_REQUEST_TIMEOUT_MS");
+        let ordinary = millis("REQUEST_TIMEOUT_MS");
+        assert!(
+            start_ceiling > CALL_START_WAIT.as_millis() as u64,
+            "the page gives up on a call start ({start_ceiling} ms) before the backend does \
+             ({} ms)",
+            CALL_START_WAIT.as_millis()
+        );
+        assert!(
+            ordinary > HANGUP_WAIT.as_millis() as u64,
+            "the page gives up on a hangup ({ordinary} ms) before the backend's own wait"
+        );
+        // Each of the four starts carries the long ceiling; the hangup keeps the ordinary one.
+        for method in ["call_place", "call_join", "call_accept", "call_start_sharing"] {
+            let at = client.find(&format!("\"{method}\",")).unwrap_or_else(|| panic!("{method}"));
+            let call = &client[at..at + client[at..].find(");").expect("the request ends")];
+            assert!(call.contains("CALL_START_REQUEST_TIMEOUT_MS"), "{method}: {call}");
+        }
+        let hangup = &client[client.find("\"call_hangup\"").expect("call_hangup")..];
+        let hangup = &hangup[..hangup.find(");").expect("the request ends")];
+        assert!(!hangup.contains("TIMEOUT_MS"), "the hangup keeps the ordinary ceiling: {hangup}");
+
+        // And each wait holds what runs inside it: two creating requests (an attach, then an
+        // acceptance), a sharing session with its grant, a hangup on the End class.
+        let create = calling::SignalClass::Create.timeout();
+        assert!(create * 2 < CALL_START_WAIT, "an attach and an acceptance outlast the wait");
+        assert!(create + SHARING_GRANT_WAIT < CALL_START_WAIT, "a sharing session outlasts it");
+        assert!(calling::SignalClass::End.timeout() < HANGUP_WAIT, "a hangup outlasts its wait");
+    }
+
+    /// A stand-in calling service on loopback that answers ONE request with `reply` after
+    /// `delay`, and hands back the request it received — its head and body as text.
+    fn stand_in_service(
+        reply: &'static str,
+        delay: Duration,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let address = listener.local_addr().expect("its address");
+        let (received, requests) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut socket, _)) = listener.accept() else { return };
+            // Read until the declared body is whole, so the request is reported complete.
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 16 * 1024];
+            loop {
+                let Ok(read) = socket.read(&mut chunk) else { break };
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8_lossy(&request);
+                if let Some(head_end) = text.find("\r\n\r\n") {
+                    let length = text[..head_end]
+                        .lines()
+                        .find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").map(|n| n.trim().to_string()))
+                        .and_then(|n| n.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if request.len() >= head_end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let _ = received.send(String::from_utf8_lossy(&request).into_owned());
+            std::thread::sleep(delay);
+            let _ = socket.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                     connection: close\r\n\r\n{reply}",
+                    reply.len()
+                )
+                .as_bytes(),
+            );
+        });
+        (format!("http://{address}/stand-in/"), requests)
+    }
+
+    /// A backend context that can SEND: a fresh session whose directory names `conversation`,
+    /// and an ic3 token in a cache that reaches no broker.
+    async fn sending_ctx(conversation: &str) -> Ctx {
+        let mut ctx = test_ctx();
+        ctx.tokens = auth::TokenCache::preloaded(&[(IC3_SCOPE, "ic3")]);
+        let mut session = test_session();
+        session.gtms = json!({
+            "calling_conversationServiceUrl": conversation,
+            "calling_trouterUrl": "https://trouter.invalid/",
+        });
+        ctx.adopt_session(session).await;
+        ctx
+    }
+
+    /// THE HANDLER GIVES UP; THE REQUEST DOES NOT. A creating request run detached is still READ
+    /// after its handler's wait has run out — which is what lets a late answer reach
+    /// `hang_up_orphan` and take back the leg the service made. Driven for real: the transport's
+    /// own POST against a service that answers after the wait ended.
+    #[tokio::test]
+    async fn a_detached_request_is_still_read_after_its_handler_gave_up() {
+        let (url, _) =
+            stand_in_service(r#"{"links":{"hangup":"https://cc/late/hangup"}}"#, Duration::from_millis(400));
+        let session = Session {
+            skypetoken: "skype".into(),
+            region: "emea".into(),
+            gtms: json!({}),
+            self_name: String::new(),
+            self_mri: String::new(),
+        };
+        let (read, answer) = tokio::sync::oneshot::channel();
+        let operation = async move {
+            let outcome = calling::post_signal(
+                &reqwest::Client::new(),
+                calling::SignalClass::Create,
+                &url,
+                &session,
+                "ic3",
+                "call-1",
+                &json!({}),
+            )
+            .await;
+            let _ = read.send(outcome.map(|body| calling::Links::collect(&body)));
+        };
+        assert!(
+            matches!(detached(Duration::from_millis(100), operation).await, Detached::StillRunning),
+            "the wait should have run out before the late answer"
+        );
+        let links = tokio::time::timeout(Duration::from_secs(5), answer)
+            .await
+            .expect("the detached request was dropped with its handler")
+            .expect("the task ended without a word")
+            .expect("the late answer");
+        assert_eq!(links.hangup(), Some("https://cc/late/hangup"), "the late answer's links were read");
+    }
+
+    /// A PLACED CALL WHOSE HANDLER GAVE UP IS STILL HUNG UP, end to end. The invite answers after
+    /// the handler's wait ran out and the start was ended here; the late answer finds the call gone
+    /// and hangs up on the link it carried — so the callee's phone does not ring for a call nothing
+    /// holds. Against stand-in services, through the real start, the real transport and the real
+    /// orphan path.
+    // Multi-threaded: the test waits on the stand-ins with a BLOCKING receive, which on the
+    // single-threaded test runtime would stall the very task it is waiting for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_placed_call_whose_handler_gave_up_is_hung_up_on_its_late_answer() {
+        let (hangup, hangups) = stand_in_service("{}", Duration::ZERO);
+        let answer: &'static str =
+            Box::leak(format!(r#"{{"links":{{"hangup":"{hangup}"}}}}"#).into_boxed_str());
+        let (conversation, invites) = stand_in_service(answer, Duration::from_millis(600));
+        let ctx = sending_ctx(&conversation).await;
+        let mut call = call_on_session("live");
+        call.phase = CallPhase::Dialing;
+        call.ring = vec!["8:orgid:her".into()];
+        call.links = calling::Links::default();
+        ctx.calling.lock().unwrap().call = Some(call);
+
+        let start = ctx.clone().place_reserved_call("call-1".into(), "v=0".into());
+        assert!(matches!(detached(Duration::from_millis(200), start).await, Detached::StillRunning));
+        // What `await_call_start` does when its wait runs out.
+        ctx.end_call_if_still("call-1", "CallEndReasonPlaceFailed").await;
+        assert!(ctx.calling.lock().unwrap().call.is_none(), "the start ended here");
+
+        let invite = invites.recv_timeout(Duration::from_secs(5)).expect("the invite went out");
+        assert!(invite.contains("conversationRequest"), "{invite}");
+        let told = hangups
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the late answer was never hung up — the callee would ring for nothing");
+        assert!(told.contains("callTransactionEnd"), "the hangup body: {told}");
+        assert!(told.contains("x-microsoft-skype-chain-id: call-1"), "its own call's id: {told}");
+    }
+
+    /// AN ACCEPTANCE THAT ANSWERS AFTER ITS HANDLER GAVE UP IS HUNG UP, end to end. The attach
+    /// answered, so the call was taken and held its links; the acceptance — the request that really
+    /// answers the caller — was still travelling when the handler's wait ran out and the call was
+    /// ended here. Its late answer must hang the leg up, or the caller is connected to a machine
+    /// that holds nothing and hears silence until they give up. The review of this milestone found
+    /// that path missing: the acceptance merged into a live call or did nothing at all.
+    // Multi-threaded: the test waits on the stand-ins with a BLOCKING receive, which on the
+    // single-threaded test runtime would stall the very task it is waiting for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_acceptance_that_answers_after_its_handler_gave_up_is_hung_up() {
+        let (leg, legs) = stand_in_service("{}", Duration::ZERO);
+        let (acceptance, acceptances) = stand_in_service("{}", Duration::from_millis(600));
+        let attached: &'static str = Box::leak(
+            format!(r#"{{"links":{{"acceptance":"{acceptance}","callLeg":"{leg}"}}}}"#)
+                .into_boxed_str(),
+        );
+        let (attach, attaches) = stand_in_service(attached, Duration::ZERO);
+        let ctx = sending_ctx("https://conversation.invalid/").await;
+        let mut call = call_on_session("live");
+        call.direction = CallDirection::Incoming;
+        call.phase = CallPhase::Ringing;
+        call.connected_at_ms = None;
+        call.links = calling::Links::collect(&json!({ "links": { "attach": attach } }));
+        ctx.calling.lock().unwrap().call = Some(call);
+
+        let start = ctx.clone().accept_ringing_call("call-1".into(), "v=0".into());
+        let waited = detached(Duration::from_millis(300), start).await;
+        assert!(matches!(waited, Detached::StillRunning), "the acceptance should still be out");
+        attaches.recv_timeout(Duration::from_secs(5)).expect("the attach went out");
+        acceptances.recv_timeout(Duration::from_secs(5)).expect("the acceptance went out");
+        // The attach was answered, so the call is taken; the wait runs out now.
+        assert_eq!(
+            ctx.calling.lock().unwrap().call.as_ref().map(|c| c.phase),
+            Some(CallPhase::Connected)
+        );
+        ctx.end_call_if_still("call-1", "CallEndReasonAcceptFailed").await;
+
+        let told = legs
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the late acceptance was never hung up — the caller would hear silence");
+        assert!(told.contains("callTransactionEnd"), "the hangup body: {told}");
+    }
+
+    /// A LATE FAILURE ENDS ITS OWN CALL AND NO OTHER. A start runs in a task of its own and can
+    /// fail after its call is gone and the user has placed the next — and `end_call_locally` ends
+    /// whichever call is live. The id-scoped ending is what such a task uses.
+    #[tokio::test]
+    async fn a_late_failure_ends_its_own_call_and_no_other() {
+        let ctx = test_ctx();
+        let mut next = call_on_session("live");
+        next.id = "call-2".into();
+        ctx.calling.lock().unwrap().call = Some(next);
+        ctx.end_call_if_still("call-1", "CallEndReasonPlaceFailed").await;
+        let live = ctx.calling.lock().unwrap().call.as_ref().map(|c| (c.id.clone(), c.phase));
+        assert_eq!(live, Some(("call-2".to_string(), CallPhase::Connected)), "the next call was ended");
+        ctx.end_call_if_still("call-2", "CallEndReasonPlaceFailed").await;
+        assert!(ctx.calling.lock().unwrap().call.is_none(), "its own call is ended and freed");
     }
 
     #[test]

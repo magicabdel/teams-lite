@@ -729,6 +729,14 @@ The milestone tag is in brackets (§ 10).
   `invitation_payload`, `join_payload`. This is the ONE golden fixture set (README § 3, collision
   4): meeting-participation M1's "golden joins" extend it with the new kinds and the
   `suppress_dialout` variant rather than pinning the same bodies a second time.
+  **As implemented (landed ahead of the rest of M1, because plane-reliability M4 depends on it):**
+  `calling::tests::every_call_body_is_byte_for_byte_its_golden_pin` pins NINETEEN bodies, not seven
+  — the seven above plus three join shapes (long link, short link, a thread joined for the roster
+  alone), the acknowledgement, hangup, rejection, mute, endpoint-state, glare refusal, both
+  content-sharing bodies and both source-request shapes — one file each in
+  `src/testdata/call-bodies/`, from fixed invented inputs (`golden_bodies`). A pin with no body
+  behind it fails too. Re-bless with `TEAMS_LITE_BLESS_CALL_BODIES=1 cargo test --lib golden`. The
+  rest of M1 (own streams, the inbound content type, the driver verdict) is still open.
 - **[M1] Own streams.** Add `own_streams_of(roster_member, endpoint_id)`. It reads the same paths as
   `streams_of` but does NOT require a `sourceId`, and it reads `mdRequestId`. `streams_of`, and so
   `publishing` and the receive path, is left untouched.

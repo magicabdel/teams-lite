@@ -2586,9 +2586,16 @@ pub async fn join_meeting(
 ) -> Result<JoinedConversation> {
     let endpoints = endpoints(session)?;
     let payload = join_payload(local, meeting, callbacks, offer);
-    let raw =
-        post_signal(http, &endpoints.conversation_service, session, ic3, correlation_id, &payload)
-            .await?;
+    let raw = post_signal(
+        http,
+        SignalClass::Create,
+        &endpoints.conversation_service,
+        session,
+        ic3,
+        correlation_id,
+        &payload,
+    )
+    .await?;
     Ok(JoinedConversation {
         controller: raw.get("conversationController").and_then(Value::as_str).map(String::from),
         links: Links::collect(&raw),
@@ -2895,15 +2902,162 @@ pub struct PlacedCall {
     pub raw: Value,
 }
 
-/// POST one signaling frame and return the parsed response (or `Value::Null` for an
-/// empty 200, which is the normal answer to an acknowledgement).
+/// What a signaling request is FOR — and so how long its answer may take before the transport
+/// gives up on it (docs/calling-roadmap/plane-reliability.md § 4.6).
 ///
-/// Both tokens travel because the service decides which one it wants per endpoint
-/// and answers `www-authenticate` when it disagrees; sending the pair is what the
-/// web client does when it holds both, and it is one round trip instead of two.
+/// Nothing bounded a signaling request before this: the backend's client carries no timeout, so a
+/// request the service never answered held its caller for ever — and the frame handler awaits its
+/// acknowledgements in line, so one unanswered acknowledgement stopped every later frame of the
+/// call behind it. Each class is the real client's own bound for that kind of operation, or above
+/// it, so this app never gives up on an answer the client would still be waiting for.
+///
+/// The bound aborts the HTTP request and NOTHING ELSE. The credentials are read before the request
+/// starts and outside it: `session()` and the token cache can hold the broker's interactive turn,
+/// and a future dropped there would leave an abandoned window on the broker's display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalClass {
+    /// A request whose ANSWER carries the links of a leg the service may already have made — the
+    /// invitation, a join, an attach, an acceptance, a sharing session (`addModality`). Those links
+    /// are the only address that leg will ever have, so its caller runs in a task of its own and a
+    /// page that goes away never cancels it. 65 s: the client's `addModalityTimeoutSec`, its
+    /// longest single-request operation.
+    Create,
+    /// A media answer, our own renegotiation offer, or a subscription. 35 s, the client's
+    /// `mediaAnswerTimeoutSec`: a lost answer costs one renegotiation, never a leg nobody holds.
+    Answer,
+    /// Ends, refuses, acknowledges or publishes — a hangup, a reject, a mute, a keep-alive, a
+    /// stop-sharing, a glare refusal, an acknowledgement, the relay token, the unregister. 10 s,
+    /// the client's `fetchTimeoutMs`: each is idempotent or ending, so a lost answer costs nothing
+    /// the ending itself does not settle.
+    End,
+    /// The hangup and the unregister a STOPPING backend sends, inside the stop budget the
+    /// supervisors grant it (§ 4.8). 4 s.
+    Shutdown,
+}
+
+impl SignalClass {
+    /// How long the transport waits for this class's answer, connection included.
+    pub const fn timeout(self) -> std::time::Duration {
+        std::time::Duration::from_secs(match self {
+            SignalClass::Create => 65,
+            SignalClass::Answer => 35,
+            SignalClass::End => 10,
+            SignalClass::Shutdown => 4,
+        })
+    }
+}
+
+/// The service REFUSED a signaling request outright: a 4xx, which says the request was read and
+/// turned down — never a lost answer, which says nothing about whether it was carried out.
+///
+/// It travels in the error chain so a caller can tell the two apart
+/// (`e.downcast_ref::<SignalRefused>()`). A step that falls back on a refusal must never fall back
+/// on a timeout or a dropped connection: the leg it would fall back FROM may exist, and the only
+/// address it has is the answer that never arrived. A 5xx is not one either — the service failed,
+/// which says no more than silence does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignalRefused {
+    pub status: u16,
+    /// The sentence the error reads as: the service's own words and headers, unchanged, because
+    /// they name the real cause ("this user has no calling licence").
+    message: String,
+}
+
+impl std::fmt::Display for SignalRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SignalRefused {}
+
+/// POST one signaling frame and return the parsed response (or `Value::Null` for an empty 200,
+/// which is the normal answer to an acknowledgement).
+///
+/// This and its two siblings are THE ONE way this app reaches the calling service
+/// (docs/calling-roadmap/README.md § 3, collision 7): every request carries the same headers
+/// ([`signal_headers`]), is read the same way ([`read_signal_reply`]) and is bounded by its
+/// [`SignalClass`]. A workstream that needs another verb uses these rather than adding a transport
+/// or a timeout of its own.
 pub async fn post_signal(
     http: &reqwest::Client,
+    class: SignalClass,
     url: &str,
+    session: &Session,
+    ic3: &str,
+    correlation_id: &str,
+    payload: &Value,
+) -> Result<Value> {
+    signal_within(
+        http,
+        reqwest::Method::POST,
+        url,
+        class.timeout(),
+        session,
+        ic3,
+        correlation_id,
+        payload,
+    )
+    .await
+}
+
+/// PUT one signaling frame — [`post_signal`] with the other verb, for the conversation's state
+/// doors (docs/calling-roadmap/meeting-participation.md § 5).
+pub async fn put_signal(
+    http: &reqwest::Client,
+    class: SignalClass,
+    url: &str,
+    session: &Session,
+    ic3: &str,
+    correlation_id: &str,
+    payload: &Value,
+) -> Result<Value> {
+    signal_within(
+        http,
+        reqwest::Method::PUT,
+        url,
+        class.timeout(),
+        session,
+        ic3,
+        correlation_id,
+        payload,
+    )
+    .await
+}
+
+/// DELETE with a signaling body — [`post_signal`] with the other verb. The client's own DELETE
+/// carries a body (`sendDeleteRequest({url, payload})`), so this one does too
+/// (docs/calling-roadmap/incoming-and-conversation.md § 4.5).
+pub async fn delete_signal(
+    http: &reqwest::Client,
+    class: SignalClass,
+    url: &str,
+    session: &Session,
+    ic3: &str,
+    correlation_id: &str,
+    payload: &Value,
+) -> Result<Value> {
+    signal_within(
+        http,
+        reqwest::Method::DELETE,
+        url,
+        class.timeout(),
+        session,
+        ic3,
+        correlation_id,
+        payload,
+    )
+    .await
+}
+
+/// Send one signaling request under an explicit bound. The three public verbs are this with their
+/// class's bound; the tests drive it with a short one against a stub that never answers.
+#[allow(clippy::too_many_arguments)]
+async fn signal_within(
+    http: &reqwest::Client,
+    method: reqwest::Method,
+    url: &str,
+    bound: std::time::Duration,
     session: &Session,
     ic3: &str,
     correlation_id: &str,
@@ -2915,22 +3069,38 @@ pub async fn post_signal(
     // and the SDP is theirs — see `record_call_frame` for where this must not be pointed.
     if std::env::var("TEAMS_LITE_CALL_DEBUG").as_deref() == Ok("1") {
         eprintln!(
-            "[calling] POST {}\n{}",
+            "[calling] {method} {}\n{}",
             redact_url(url),
             serde_json::to_string_pretty(payload).unwrap_or_default()
         );
     }
-    // Every header below was copied off a request this service ACCEPTED (captured from
-    // the real client, 2026-08-05). Two of them are absences, and they are the point:
-    //
-    //   * NO `X-Skypetoken`. The captured request authenticates with the ic3 bearer
-    //     ALONE. This app sent both, and a calling request carrying two credentials is a
-    //     shape the real client never produces — the likeliest reading of a `400` that
-    //     names nothing.
-    //   * NO `api-version`. The conversation service is not versioned that way; the
-    //     header belongs to the relay-token GET, which is a different service.
-    let response = http
-        .post(url)
+    let response = signal_headers(http.request(method.clone(), url), &session.region, ic3, correlation_id)
+        .json(payload)
+        .timeout(bound)
+        .send()
+        .await
+        .map_err(|e| transport_failure(&method, url, bound, e))?;
+    read_signal_reply(response, &method, url, bound).await
+}
+
+/// The headers every signaling request carries, whatever its verb.
+///
+/// Every header below was copied off a request this service ACCEPTED (captured from
+/// the real client, 2026-08-05). Two of them are absences, and they are the point:
+///
+///   * NO `X-Skypetoken`. The captured request authenticates with the ic3 bearer
+///     ALONE. This app sent both, and a calling request carrying two credentials is a
+///     shape the real client never produces — the likeliest reading of a `400` that
+///     names nothing.
+///   * NO `api-version`. The conversation service is not versioned that way; the
+///     header belongs to the relay-token GET, which is a different service.
+fn signal_headers(
+    builder: reqwest::RequestBuilder,
+    region: &str,
+    ic3: &str,
+    correlation_id: &str,
+) -> reqwest::RequestBuilder {
+    builder
         .header("content-type", "application/json")
         .header("accept", "*/*")
         .header("authorization", format!("Bearer {ic3}"))
@@ -2943,14 +3113,46 @@ pub async fn post_signal(
         .header("X-MS-Migration", "True")
         // Where this user lives. The service routes on all three, and the captured
         // request carries them on every call.
-        .header("ms-teams-region", &session.region)
-        .header("ms-teams-partition", teams_partition(&session.region))
+        .header("ms-teams-region", region)
+        .header("ms-teams-partition", teams_partition(region))
         .header("ms-teams-ring", "general")
-        .json(payload)
-        .send()
-        .await
-        .context("calling: signaling POST failed")?;
+}
 
+/// Why a signaling request never got an answer: the bound ran out, or the connection did.
+///
+/// Said as a lost answer, never as a refusal — nothing here knows whether the service carried the
+/// request out, and a caller must not read silence as a no.
+///
+/// reqwest's own error carries the WHOLE address, query included, and prints it ("… for url
+/// (<url>)"), so it is stripped before it is wrapped: a signaling link can carry a token in its
+/// query, and this sentence ends up in a journal that is read for weeks. The redacted address in
+/// the context is the only one left.
+fn transport_failure(
+    method: &reqwest::Method,
+    url: &str,
+    bound: std::time::Duration,
+    error: reqwest::Error,
+) -> anyhow::Error {
+    let error = error.without_url();
+    if error.is_timeout() {
+        anyhow::Error::new(error).context(format!(
+            "calling: no answer to a signaling {method} from {} within {} s",
+            redact_url(url),
+            bound.as_secs_f32()
+        ))
+    } else {
+        anyhow::Error::new(error)
+            .context(format!("calling: signaling {method} to {} failed", redact_url(url)))
+    }
+}
+
+/// Read a signaling answer: its JSON on success, and the service's own words on a refusal.
+async fn read_signal_reply(
+    response: reqwest::Response,
+    method: &reqwest::Method,
+    url: &str,
+    bound: std::time::Duration,
+) -> Result<Value> {
     let status = response.status();
     // The service explains a refusal in HEADERS as often as in the body: a validation
     // failure answers `{}` and names the field in `x-microsoft-skype-*`. A 400 with an
@@ -2964,7 +3166,28 @@ pub async fn post_signal(
         })
         .filter_map(|(name, value)| value.to_str().ok().map(|v| format!("{name}: {v}")))
         .collect();
-    let text = response.text().await.unwrap_or_default();
+    let text = match response.text().await {
+        Ok(text) => text,
+        // A refusal is reported by its status whatever became of its words.
+        Err(_) if !status.is_success() => String::new(),
+        // A SUCCESS whose body never arrived whole is still a success: the service DID what was
+        // asked, and only its words were lost. It reads as an empty answer, as it always has —
+        // and that is the safer of the two for a creating request too. Reported as a failure, a
+        // placed call would be ended here while the callee's phone rang, and the frames that can
+        // still name its links (an acceptance, a conversation update) would then find no call to
+        // land on. Kept, the call can still learn them. Said in the journal, since it is rare
+        // and it is exactly what a "why did this call have no hangup link" question needs.
+        Err(e) => {
+            eprintln!(
+                "[calling] {method} {} answered {status}, but its body was lost: {} (bounded at \
+                 {} s)",
+                redact_url(url),
+                e.without_url(),
+                bound.as_secs_f32()
+            );
+            String::new()
+        }
+    };
     if !status.is_success() {
         // A refusal says so in the journal, exactly as a refused write does. It used to
         // reach the page and nowhere else, so the only record of a call this machine
@@ -2979,12 +3202,16 @@ pub async fn post_signal(
         // Keep the service's own words: its phrases name the real cause ("this user
         // has no calling licence", "conversation does not exist") and a generic
         // message here would hide them.
-        return Err(anyhow!(
+        let message = format!(
             "calling: {status} from {} — {} [{}]",
             redact_url(url),
             text.chars().take(400).collect::<String>(),
             reasons.join("; ")
-        ));
+        );
+        if status.is_client_error() {
+            return Err(SignalRefused { status: status.as_u16(), message }.into());
+        }
+        return Err(anyhow!(message));
     }
     if text.trim().is_empty() {
         return Ok(Value::Null);
@@ -3010,9 +3237,16 @@ pub async fn place_call(
     }
     let endpoints = endpoints(session)?;
     let payload = invitation_payload(local, to, thread_id, offer, callbacks);
-    let raw =
-        post_signal(http, &endpoints.conversation_service, session, ic3, correlation_id, &payload)
-            .await?;
+    let raw = post_signal(
+        http,
+        SignalClass::Create,
+        &endpoints.conversation_service,
+        session,
+        ic3,
+        correlation_id,
+        &payload,
+    )
+    .await?;
     Ok(PlacedCall {
         links: Links::collect(&raw),
         conversation_url: ["/conversationUrl/Location", "/conversation/url", "/Location"]
@@ -3129,8 +3363,14 @@ pub async fn fetch_relay_credentials(
         .get(token_url)
         .header("X-Skypetoken", &session.skypetoken)
         .header("api-version", "2")
+        // Bounded like every other request this module makes: the relay token is fetched while a
+        // call is being prepared, and a GET nobody answered held `call_prepare` with it.
+        .timeout(SignalClass::End.timeout())
         .send()
         .await
+        // Never the URL: a relay token URL has carried a token in its query, and reqwest's own
+        // error prints the whole address.
+        .map_err(reqwest::Error::without_url)
         .context("calling: relay token request failed")?;
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
@@ -4528,22 +4768,280 @@ mod tests {
     #[test]
     fn a_calling_request_carries_one_credential_and_no_api_version() {
         let source = include_str!("calling.rs");
-        // `post_signal` alone. The relay-token GET below it legitimately sends a
-        // skypetoken and an api-version — that is a different service, and the web
-        // client's own legacy token fetcher sends exactly those two.
-        let start = source.find("pub async fn post_signal").expect("post_signal");
+        // The ONE header builder every verb goes through. The relay-token GET below it
+        // legitimately sends a skypetoken and an api-version — that is a different service, and
+        // the web client's own legacy token fetcher sends exactly those two.
+        let start = source.find("fn signal_headers(").expect("signal_headers");
         let end = source[start..].find("\n/// ").map(|at| start + at).unwrap_or(source.len());
-        let post_signal = &source[start..end];
+        let headers = &source[start..end];
         assert!(
-            !post_signal.contains(".header(\"X-Skypetoken\""),
+            !headers.contains(".header(\"X-Skypetoken\""),
             "the calling service takes the ic3 bearer alone; a second credential is refused"
         );
         assert!(
-            !post_signal.contains(".header(\"api-version\""),
+            !headers.contains(".header(\"api-version\""),
             "the conversation service is not versioned by that header"
         );
-        assert!(post_signal.contains("ms-teams-region"), "the service routes on the region");
-        assert!(post_signal.contains("ms-teams-ring"), "and on the ring");
+        assert!(headers.contains("ms-teams-region"), "the service routes on the region");
+        assert!(headers.contains("ms-teams-ring"), "and on the ring");
+        // And nothing BUT that builder sets a header on a signaling request: the transport
+        // function adds the body and the bound, never a header of its own.
+        let within = source.find("async fn signal_within(").expect("signal_within");
+        let within = &source[within..within + source[within..].find("\n}\n").expect("its end")];
+        assert!(!within.contains(".header("), "a header set outside signal_headers:\n{within}");
+    }
+
+    /// EVERY VERB CARRIES THE SAME HEADERS, built and read back rather than scanned: a PUT or a
+    /// DELETE that grew a header of its own — or lost one — is a request shape the service has
+    /// never accepted from this app, and the refusal would name nothing. The set is the one the
+    /// verified POST has always carried.
+    #[test]
+    fn every_signaling_verb_carries_the_one_header_set() {
+        let http = reqwest::Client::new();
+        let names = |method: reqwest::Method| -> Vec<String> {
+            let request = signal_headers(
+                http.request(method, "https://conv.example/conversation/"),
+                "emea",
+                "ic3-token",
+                "call-1",
+            )
+            .json(&json!({ "a": 1 }))
+            .build()
+            .expect("a request");
+            let mut names: Vec<String> =
+                request.headers().keys().map(|name| name.as_str().to_string()).collect();
+            names.sort_unstable();
+            names
+        };
+        let post = names(reqwest::Method::POST);
+        assert_eq!(
+            post,
+            [
+                "accept",
+                "authorization",
+                "content-type",
+                "ms-teams-partition",
+                "ms-teams-region",
+                "ms-teams-ring",
+                "x-microsoft-skype-chain-id",
+                "x-microsoft-skype-client",
+                "x-microsoft-skype-message-id",
+                "x-ms-migration",
+            ]
+        );
+        assert_eq!(names(reqwest::Method::PUT), post);
+        assert_eq!(names(reqwest::Method::DELETE), post);
+        // The values that are not per-request, for the POST the verified calls go out on.
+        let request = signal_headers(
+            http.post("https://conv.example/conversation/"),
+            "emea",
+            "ic3-token",
+            "call-1",
+        )
+        .build()
+        .expect("a request");
+        let value = |name: &str| request.headers()[name].to_str().unwrap().to_string();
+        assert_eq!(value("authorization"), "Bearer ic3-token");
+        assert_eq!(value("x-microsoft-skype-chain-id"), "call-1");
+        assert_eq!(value("x-microsoft-skype-client"), CLIENT_IDENTITY);
+        assert_eq!(value("ms-teams-region"), "emea");
+        assert_eq!(value("ms-teams-partition"), teams_partition("emea"));
+        assert_eq!(value("ms-teams-ring"), "general");
+        assert_eq!(value("x-ms-migration"), "True");
+        assert_eq!(value("accept"), "*/*");
+    }
+
+    /// A stand-in calling service on loopback, on a thread of its own: it reads one request and
+    /// answers `reply` after `delay` — or NEVER answers when `reply` is `None`, holding the
+    /// connection open, which is exactly the hang a transport bound exists for.
+    fn stub_service(reply: Option<String>, delay: std::time::Duration) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let address = listener.local_addr().expect("its address");
+        std::thread::spawn(move || {
+            let Ok((mut socket, _)) = listener.accept() else { return };
+            let mut request = [0u8; 16 * 1024];
+            let _ = socket.read(&mut request);
+            std::thread::sleep(delay);
+            match reply {
+                Some(reply) => {
+                    let _ = socket.write_all(reply.as_bytes());
+                }
+                None => std::thread::sleep(std::time::Duration::from_secs(120)),
+            }
+        });
+        format!("http://{address}/conversation/")
+    }
+
+    fn stub_session() -> Session {
+        Session {
+            skypetoken: "skype".into(),
+            region: "emea".into(),
+            gtms: json!({}),
+            self_name: String::new(),
+            self_mri: String::new(),
+        }
+    }
+
+    fn http_reply(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+             x-microsoft-skype-diagnostics: golden-reason\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// A REQUEST NOBODY ANSWERS IS BOUNDED. Before this the backend's client carried no timeout,
+    /// so a signaling request the service never answered held its caller for ever — and the
+    /// frame handler awaits its acknowledgements in line, so one hung acknowledgement stopped
+    /// every later frame of the call. Driven for real against a socket that accepts and says
+    /// nothing, and said as a LOST answer, never as a refusal.
+    #[tokio::test]
+    async fn a_signaling_request_nobody_answers_is_bounded_and_said_as_lost() {
+        let url = stub_service(None, std::time::Duration::ZERO);
+        let began = std::time::Instant::now();
+        let error = signal_within(
+            &reqwest::Client::new(),
+            reqwest::Method::POST,
+            &url,
+            std::time::Duration::from_millis(300),
+            &stub_session(),
+            "ic3",
+            "call-1",
+            &json!({ "a": 1 }),
+        )
+        .await
+        .expect_err("a request with no answer must end");
+        assert!(began.elapsed() < std::time::Duration::from_secs(5), "{:?}", began.elapsed());
+        let said = format!("{error:#}");
+        assert!(said.contains("no answer to a signaling POST"), "{said}");
+        assert!(said.contains("within 0.3 s"), "{said}");
+        assert!(error.downcast_ref::<SignalRefused>().is_none(), "silence is not a refusal");
+    }
+
+    /// A LOST ANSWER NEVER PRINTS ITS ADDRESS'S QUERY. reqwest's own error carries the whole URL
+    /// and prints it, and a signaling link can carry a token in its query — so the sentence a
+    /// timeout reads as, chain and all, holds the redacted address and nothing else.
+    #[tokio::test]
+    async fn a_lost_answer_never_prints_the_query_of_its_address() {
+        let url = format!("{}?i=secret-token", stub_service(None, std::time::Duration::ZERO));
+        let error = signal_within(
+            &reqwest::Client::new(),
+            reqwest::Method::POST,
+            &url,
+            std::time::Duration::from_millis(200),
+            &stub_session(),
+            "ic3",
+            "call-1",
+            &json!({}),
+        )
+        .await
+        .expect_err("a request with no answer must end");
+        let said = format!("{error:#}");
+        assert!(said.contains("no answer to a signaling POST"), "{said}");
+        assert!(!said.contains("secret-token"), "the query leaked into the error: {said}");
+        // And the same for a connection that is REFUSED rather than silent.
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+            let address = listener.local_addr().expect("its address");
+            drop(listener);
+            format!("http://{address}/conversation/?i=secret-token")
+        };
+        let error = signal_within(
+            &reqwest::Client::new(),
+            reqwest::Method::POST,
+            &closed,
+            std::time::Duration::from_secs(2),
+            &stub_session(),
+            "ic3",
+            "call-1",
+            &json!({}),
+        )
+        .await
+        .expect_err("nothing listens there");
+        let said = format!("{error:#}");
+        assert!(said.contains("calling: signaling POST to http://127.0.0.1:"), "{said}");
+        assert!(!said.contains("secret-token"), "the query leaked into the error: {said}");
+    }
+
+    /// A SUCCESS WHOSE BODY WAS CUT OFF IS STILL A SUCCESS. The service did what was asked and only
+    /// its words were lost, so it reads as the empty answer it always has — never as a failure,
+    /// which would end a placed call here while the callee's phone rang and leave the frames that
+    /// can still name its links nowhere to land.
+    #[tokio::test]
+    async fn a_success_whose_body_was_cut_off_reads_as_an_empty_answer() {
+        // Declares 200 bytes, sends a dozen, and closes.
+        let cut = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 200\r\n\
+                   connection: close\r\n\r\n{\"links\":{\"hang"
+            .to_string();
+        let answered = signal_within(
+            &reqwest::Client::new(),
+            reqwest::Method::POST,
+            &stub_service(Some(cut), std::time::Duration::ZERO),
+            std::time::Duration::from_secs(5),
+            &stub_session(),
+            "ic3",
+            "call-1",
+            &json!({}),
+        )
+        .await
+        .expect("a 2xx is a success whatever became of its body");
+        assert_eq!(answered, Value::Null);
+    }
+
+    /// A 4xx is a REFUSAL, typed so a caller can fall back on it; a 5xx and a lost answer are
+    /// not, because neither says the request was turned down. The sentence a refusal reads as is
+    /// the one it always was — the service's own words and headers — since the page and the
+    /// journal both read it.
+    #[tokio::test]
+    async fn a_refusal_is_typed_and_reads_as_it_always_did() {
+        let http = reqwest::Client::new();
+        let send = |reply: String| {
+            let http = http.clone();
+            async move {
+                signal_within(
+                    &http,
+                    reqwest::Method::POST,
+                    &stub_service(Some(reply), std::time::Duration::ZERO),
+                    std::time::Duration::from_secs(5),
+                    &stub_session(),
+                    "ic3",
+                    "call-1",
+                    &json!({}),
+                )
+                .await
+            }
+        };
+        let refused = send(http_reply("403 Forbidden", "{\"subCode\":4005}")).await.unwrap_err();
+        let typed = refused.downcast_ref::<SignalRefused>().expect("a 4xx is a refusal");
+        assert_eq!(typed.status, 403);
+        let said = refused.to_string();
+        assert!(said.starts_with("calling: 403 Forbidden from http://127.0.0.1:"), "{said}");
+        assert!(said.contains("— {\"subCode\":4005} [x-microsoft-skype-diagnostics: golden-reason]"), "{said}");
+
+        let failed = send(http_reply("503 Service Unavailable", "")).await.unwrap_err();
+        assert!(failed.downcast_ref::<SignalRefused>().is_none(), "a 5xx says no more than silence");
+        assert!(failed.to_string().starts_with("calling: 503 Service Unavailable from"), "{failed}");
+
+        let answered = send(http_reply("200 OK", "{\"links\":{\"hangup\":\"https://h/\"}}")).await;
+        assert_eq!(answered.unwrap(), json!({ "links": { "hangup": "https://h/" } }));
+        assert_eq!(send(http_reply("200 OK", "")).await.unwrap(), Value::Null);
+    }
+
+    /// The classes are the real client's own bounds or above them, and their ORDER is the point:
+    /// a creating request is given the longest, because its answer is the only address of a leg
+    /// the service may already have made.
+    #[test]
+    fn the_signaling_classes_are_the_clients_own_bounds() {
+        let secs = |class: SignalClass| class.timeout().as_secs();
+        // `addModalityTimeoutSec:65`, `mediaAnswerTimeoutSec:35`, `fetchTimeoutMs:1e4`.
+        assert_eq!(secs(SignalClass::Create), 65);
+        assert_eq!(secs(SignalClass::Answer), 35);
+        assert_eq!(secs(SignalClass::End), 10);
+        assert_eq!(secs(SignalClass::Shutdown), 4);
+        assert!(secs(SignalClass::Create) > secs(SignalClass::Answer));
+        assert!(secs(SignalClass::Answer) > secs(SignalClass::End));
+        assert!(secs(SignalClass::End) > secs(SignalClass::Shutdown));
     }
 
     /// The journal names the address a call publishes its links on, because a refusal

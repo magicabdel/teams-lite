@@ -256,6 +256,20 @@ impl TokenCache {
         Self::default()
     }
 
+    /// A cache that already holds `tokens`, each as fresh as one just minted.
+    ///
+    /// It reaches no broker, and that is the point: a test that drives a request end to end
+    /// against a stand-in service needs a token, and must never ask the user's own broker for one.
+    pub fn preloaded(tokens: &[(&str, &str)]) -> Self {
+        let cache = Self::default();
+        if let Ok(mut map) = cache.inner.lock() {
+            for (scope, token) in tokens {
+                map.insert((*scope).to_string(), ((*token).to_string(), Instant::now()));
+            }
+        }
+        cache
+    }
+
     /// Return a valid token for `scope`, refreshing through the broker if the
     /// cached one is missing or near expiry.
     pub async fn get(&self, scope: &str) -> Result<String> {

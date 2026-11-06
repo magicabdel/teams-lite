@@ -140,6 +140,34 @@ describe("callFailureMessage", () => {
     }
   });
 
+  it("says a start the backend gave up on took too long, and blames nobody", () => {
+    // The backend's own give-up names no cause, because it knows none: the wait it ran out of
+    // holds the sign-in as well as Teams.
+    for (const method of ["call_place", "call_join", "call_accept"]) {
+      expect(callFailureMessage(new Error(`${method}: the call did not start in time`))).toBe(
+        "The call took too long to start. Try again in a moment.",
+      );
+    }
+    expect(
+      callFailureMessage(new Error("call_start_sharing: the screen share did not start in time")),
+    ).toBe("The screen share took too long to start. Try again in a moment.");
+  });
+
+  it("says the calling service did not answer one request, without its address", () => {
+    // The transport's own bound on one request, which names the service's URL.
+    const said = callFailureMessage(
+      new Error(
+        "calling: no answer to a signaling POST from https://api.flightproxy.teams.microsoft.com/conversation/ within 65 s: operation timed out",
+      ),
+    );
+    expect(said).toBe("Teams' calling service did not answer in time. Try again.");
+    expect(said).not.toContain("https://");
+    // The PAGE's own ceiling is a different thing — a lost answer — and keeps its sentence.
+    expect(callFailureMessage(new Error("timeout: call_place"))).toBe(
+      "The backend did not answer. Try again.",
+    );
+  });
+
   it("leaves a colon that is not an RPC name alone", () => {
     // A sentence may carry a colon of its own, and eating half of it would change what it
     // said. Only a leading snake_case word counts.

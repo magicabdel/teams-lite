@@ -294,6 +294,22 @@ const UPLOAD_REQUEST_TIMEOUT_MS = 5 * 60_000;
  */
 const SIGNIN_REQUEST_TIMEOUT_MS = 2 * 60_000;
 
+/**
+ * The ceiling for the four requests that START something on a call: placing it, joining a meeting,
+ * answering a ring, and asking for a sharing session.
+ *
+ * The backend runs each of them in a task of its own and WAITS for it at most `CALL_START_WAIT`
+ * (150 s, src/bin/server.rs) — an attach and then an acceptance can each take the signaling
+ * `Create` class's 65 s. When that wait runs out the backend ends the start itself and answers with
+ * the reason; this ceiling is longer, so the page hears that answer rather than a bare
+ * `timeout: call_place`, which it has to read as a lost answer and keep the microphone open for.
+ * `the_pages_call_start_ceiling_outlasts_the_backends_wait` pins the pair across the socket.
+ *
+ * Every measured start answered in about two seconds, so this is the bound of the pathological case
+ * and never what an ordinary call waits.
+ */
+const CALL_START_REQUEST_TIMEOUT_MS = 180_000;
+
 export type BackendOptions = {
   giveUpMs?: number;
   initialDelayMs?: number;
@@ -1059,7 +1075,11 @@ export class Backend {
   /** Place the call: one POST carrying our offer. This is what makes a device buzz in
    *  somebody's pocket, so it is an `OUTWARD_METHODS` entry and carries out one click. */
   callPlace(callId: string, sdp: string): Promise<{ call_id: string }> {
-    return this.writeRequest<{ call_id: string }>("call_place", { call_id: callId, sdp });
+    return this.writeRequest<{ call_id: string }>(
+      "call_place",
+      { call_id: callId, sdp },
+      CALL_START_REQUEST_TIMEOUT_MS,
+    );
   }
   /** Join a meeting: the same one POST, with the meeting's own thread instead of
    *  somebody to ring. Outward, because everybody already in the meeting sees the user
@@ -1072,16 +1092,20 @@ export class Backend {
     meeting: MeetingAddress,
     sdp: string,
   ): Promise<{ call_id: string }> {
-    return this.writeRequest<{ call_id: string }>("call_join", {
-      call_id: callId,
-      ...meetingParams(meeting),
-      sdp,
-    });
+    return this.writeRequest<{ call_id: string }>(
+      "call_join",
+      { call_id: callId, ...meetingParams(meeting), sdp },
+      CALL_START_REQUEST_TIMEOUT_MS,
+    );
   }
   /** Answer the ringing call with our own SDP. Outward: it opens the user's microphone
    *  to whoever is on the other end. */
   callAccept(callId: string, sdp: string): Promise<{ call_id: string }> {
-    return this.writeRequest<{ call_id: string }>("call_accept", { call_id: callId, sdp });
+    return this.writeRequest<{ call_id: string }>(
+      "call_accept",
+      { call_id: callId, sdp },
+      CALL_START_REQUEST_TIMEOUT_MS,
+    );
   }
   /**
    * Answer a media offer the service made mid-call.
@@ -1157,9 +1181,11 @@ export class Backend {
    * this endpoint is about to show them something.
    */
   callStartSharing(callId: string): Promise<{ call_id: string; can_stop: boolean }> {
-    return this.writeRequest<{ call_id: string; can_stop: boolean }>("call_start_sharing", {
-      call_id: callId,
-    });
+    return this.writeRequest<{ call_id: string; can_stop: boolean }>(
+      "call_start_sharing",
+      { call_id: callId },
+      CALL_START_REQUEST_TIMEOUT_MS,
+    );
   }
   /** Give the sharing session back. Outward for the same reason, and never skipped: a share
    *  this app could start and not stop is one it would not make. */

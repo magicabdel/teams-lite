@@ -203,7 +203,9 @@ async fn leave(
         "id": local.id, "displayName": local.display_name,
         "endpointId": local.endpoint_id, "participantId": local.participant_id,
         "languageId": "en-us" } } });
-    match calling::post_signal(http, url, session, ic3, correlation, &body).await {
+    match calling::post_signal(http, calling::SignalClass::End, url, session, ic3, correlation, &body)
+        .await
+    {
         Ok(_) => println!("     left"),
         Err(e) => println!("     could not leave: {e:#} — leave it in Teams if it stuck"),
     }

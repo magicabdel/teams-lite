@@ -56,6 +56,20 @@ export function callFailureMessage(error: unknown): string {
   if (/calling is not connected yet/i.test(raw)) {
     return "Calls are not connected on this machine yet. They connect on their own — try again in a moment.";
   }
+  // A START THE BACKEND GAVE UP ON (`CALL_START_WAIT` in src/bin/server.rs). It has already let
+  // the call go, so this is a REASON and never a lost answer. It names no cause because the backend
+  // knows none: every request inside the wait is bounded well under it, so what ran out was as
+  // likely the sign-in read before them as Teams itself.
+  if (/did not start in time/i.test(raw)) {
+    return /^call_start_sharing:/.test(raw)
+      ? "The screen share took too long to start. Try again in a moment."
+      : "The call took too long to start. Try again in a moment.";
+  }
+  // ONE REQUEST to Teams' calling service went unanswered within its own bound. Its raw words
+  // carry the service's address, which is nothing a reader can act on.
+  if (/no answer to a signaling/i.test(raw)) {
+    return "Teams' calling service did not answer in time. Try again.";
+  }
   // The write lock, after a backend restart minted a new token. The client already re-read
   // the token and retried once (`retryWithAFreshToken` in lib/ws-client.ts), so reaching
   // this means the fresh one was refused too.
