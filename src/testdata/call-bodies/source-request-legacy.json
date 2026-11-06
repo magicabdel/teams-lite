@@ -1,0 +1,13 @@
+{
+  "controlVideoStreaming": {
+    "controlInfo": [
+      {
+        "control": "start",
+        "fmtParams": "max-fs=8160;max-mbps=245000;max-fps=3000;profile-level-id=42C02A;packetization-mode=1",
+        "sourceId": 7,
+        "streamMsid": "golden-stream"
+      }
+    ],
+    "sequenceNumber": 1
+  }
+}

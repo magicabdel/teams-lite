@@ -5368,4 +5368,148 @@ mod tests {
         assert_eq!(redact_url("https://x/call/end/?access_token=secret"), "https://x/call/end/");
         assert_eq!(redact_url("https://x/call/end/"), "https://x/call/end/");
     }
+
+    /// Where the golden call bodies live, one file per body.
+    const GOLDEN_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/testdata/call-bodies");
+
+    /// Every body this module builds, in its DEFAULT shape, from fixed inputs — each named by the
+    /// file it is pinned to.
+    ///
+    /// The inputs are invented and stable: nobody's ids, and nothing that moves between runs. A
+    /// builder that started reading a clock or minting a uuid would fail here at once, because a
+    /// body that differs between two presses is one nobody can compare with a capture.
+    fn golden_bodies() -> Vec<(&'static str, Value)> {
+        let local = LocalParticipant {
+            id: "8:orgid:00000000-0000-4000-8000-000000000001".into(),
+            display_name: "Ada Lovelace".into(),
+            endpoint_id: "11111111-1111-4111-8111-111111111111".into(),
+            participant_id: "22222222-2222-4222-8222-222222222222".into(),
+        };
+        let callbacks = CallbackBase {
+            surl: "https://pub-ent-golden.trouter.teams.microsoft.com:3443/v4/f/GOLDEN/".into(),
+            session_id: "33333333-3333-4333-8333-333333333333".into(),
+            cause_id: "0a1b2c3d".into(),
+        };
+        let sdp = MediaContent::sdp(
+            "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 9 RTP/SAVP 111\r\na=mid:0\r\n",
+        );
+        let callee = vec!["8:orgid:00000000-0000-4000-8000-0000000000aa".to_string()];
+        let long_link = MeetingJoin::from_join_url(
+            "https://teams.microsoft.com/l/meetup-join/19%3ameeting_GOLDEN%40thread.v2/0?context=\
+             %7b%22Tid%22%3a%2244444444-4444-4444-8444-444444444444%22%2c%22Oid%22%3a%2255555555-5555-\
+             4555-8555-555555555555%22%7d",
+        )
+        .expect("a long join link");
+        let short_link =
+            MeetingJoin::from_join_url("https://teams.microsoft.com/meet/123456789012?p=GoldenPass")
+                .expect("a short join link");
+        let thread = MeetingJoin::from_thread_id("19:meeting_GOLDEN@thread.v2").expect("a thread");
+        let subscription = SourceRequest {
+            mid: "3".into(),
+            source_id: 7,
+            stream_msid: "golden-stream".into(),
+            fmt_params: DEFAULT_VIDEO_FMTP.into(),
+        };
+        let seed = match start_endpoint_state() {
+            Value::Object(map) => map,
+            other => panic!("the start endpoint state is an object: {other}"),
+        };
+        vec![
+            (
+                "invitation",
+                invitation_payload(&local, &callee, Some("19:golden@unq.gbl.spaces"), &sdp, &callbacks),
+            ),
+            ("join-long-link", join_payload(&local, &long_link, &callbacks, Some(&sdp))),
+            ("join-short-link", join_payload(&local, &short_link, &callbacks, Some(&sdp))),
+            ("join-thread-roster-only", join_payload(&local, &thread, &callbacks, None)),
+            ("attach", attach_payload(&local, &sdp, &callbacks)),
+            ("acceptance", acceptance_payload(&local, &sdp, &callbacks)),
+            ("media-answer", media_answer_payload(&local, &sdp, &callbacks, &[MODALITY_AUDIO])),
+            (
+                "media-offer",
+                media_offer_payload(&local, &sdp, &callbacks, &[MODALITY_AUDIO, MODALITY_VIDEO]),
+            ),
+            (
+                "start-outgoing-negotiation",
+                start_outgoing_negotiation_payload(
+                    &local,
+                    &sdp,
+                    &callbacks,
+                    &[MODALITY_AUDIO, MODALITY_VIDEO],
+                ),
+            ),
+            ("acceptance-acknowledgement", acceptance_acknowledgement_payload(&callbacks)),
+            ("hangup", hangup_payload(&local)),
+            ("rejection", rejection_payload(&local)),
+            ("mute", mute_payload(&local, true)),
+            (
+                "endpoint-state",
+                endpoint_state_payload(&local, &next_endpoint_state(&seed, true, 1)),
+            ),
+            ("media-glare-rejection", media_glare_rejection_payload(&local)),
+            (
+                "content-sharing",
+                content_sharing_payload(&local, &callbacks, "66666666-6666-4666-8666-666666666666"),
+            ),
+            ("content-sharing-leave", content_sharing_leave_payload(&local, &callbacks)),
+            ("source-request-modern", source_request_payload(&subscription, 1, true)),
+            ("source-request-legacy", source_request_payload(&subscription, 1, false)),
+        ]
+    }
+
+    /// THE GOLDEN PINS: every call body, byte for byte what it is today.
+    ///
+    /// This is the ONE golden fixture set (docs/calling-roadmap/README.md § 3, collision 4;
+    /// video-send M1) and it exists for the refactors that follow it. The verified calls — a
+    /// one-to-one both ways and a meeting join — rest on bodies nobody can re-measure without a
+    /// colleague on the other end, so a change that moves the transport, the classes or a builder
+    /// must prove it moved no byte the service reads. A later workstream that adds a kind EXTENDS
+    /// this set rather than pinning the same bodies a second time.
+    ///
+    /// What is compared is the pretty form of the JSON the request serializes. serde_json keeps
+    /// object keys sorted here (no `preserve_order`), so the key order on the wire is the order in
+    /// the file, and a value, a type or a key that moved is a line that moved.
+    ///
+    /// A deliberate change re-blesses with `TEAMS_LITE_BLESS_CALL_BODIES=1 cargo test --lib
+    /// golden`, and the diff of `src/testdata/call-bodies/` is then the review of what the
+    /// service will be sent differently. Never bless to make this pass.
+    #[test]
+    fn every_call_body_is_byte_for_byte_its_golden_pin() {
+        let bless = std::env::var("TEAMS_LITE_BLESS_CALL_BODIES").as_deref() == Ok("1");
+        let bodies = golden_bodies();
+        let mut names: Vec<&str> = bodies.iter().map(|(name, _)| *name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), bodies.len(), "two golden bodies share a file name");
+        let mut drifted = Vec::new();
+        for (name, body) in &bodies {
+            let path = format!("{GOLDEN_DIR}/{name}.json");
+            let rendered = format!("{}\n", serde_json::to_string_pretty(body).expect("a body is JSON"));
+            if bless {
+                std::fs::create_dir_all(GOLDEN_DIR).expect("the golden directory");
+                std::fs::write(&path, &rendered).expect("bless a golden body");
+                continue;
+            }
+            match std::fs::read_to_string(&path) {
+                Ok(pinned) if pinned == rendered => {}
+                Ok(pinned) => drifted.push(format!(
+                    "{name}: the body no longer matches {path}\n--- pinned\n{pinned}--- built now\n{rendered}"
+                )),
+                Err(e) => drifted.push(format!("{name}: no golden pin at {path} ({e})")),
+            }
+        }
+        // A pin with no body behind it is a builder somebody removed without saying so.
+        let mut stale = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(GOLDEN_DIR) {
+            for entry in entries.flatten() {
+                let file = entry.file_name().to_string_lossy().into_owned();
+                let Some(stem) = file.strip_suffix(".json") else { continue };
+                if !names.contains(&stem) {
+                    stale.push(file);
+                }
+            }
+        }
+        assert!(stale.is_empty(), "golden pins with no body behind them: {stale:?}");
+        assert!(drifted.is_empty(), "{}", drifted.join("\n"));
+    }
 }

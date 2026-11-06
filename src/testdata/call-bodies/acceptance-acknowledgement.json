@@ -1,0 +1,13 @@
+{
+  "callAcceptanceAcknowledgement": {
+    "links": {
+      "balanceUpdate": "https://pub-ent-golden.trouter.teams.microsoft.com:3443/v4/f/GOLDEN/callAgent/33333333-3333-4333-8333-333333333333/0a1b2c3d/call/balanceUpdate/",
+      "controlVideoStreaming": "https://pub-ent-golden.trouter.teams.microsoft.com:3443/v4/f/GOLDEN/callAgent/33333333-3333-4333-8333-333333333333/0a1b2c3d/call/controlVideoStreaming/",
+      "mediaRenegotiation": "https://pub-ent-golden.trouter.teams.microsoft.com:3443/v4/f/GOLDEN/callAgent/33333333-3333-4333-8333-333333333333/0a1b2c3d/call/mediaRenegotiation/",
+      "replacement": "https://pub-ent-golden.trouter.teams.microsoft.com:3443/v4/f/GOLDEN/callAgent/33333333-3333-4333-8333-333333333333/0a1b2c3d/call/replacement/",
+      "retargetCompletion": "https://pub-ent-golden.trouter.teams.microsoft.com:3443/v4/f/GOLDEN/callAgent/33333333-3333-4333-8333-333333333333/0a1b2c3d/call/retargetCompletion/",
+      "transfer": "https://pub-ent-golden.trouter.teams.microsoft.com:3443/v4/f/GOLDEN/callAgent/33333333-3333-4333-8333-333333333333/0a1b2c3d/call/transfer/",
+      "updateMediaDescriptions": "https://pub-ent-golden.trouter.teams.microsoft.com:3443/v4/f/GOLDEN/callAgent/33333333-3333-4333-8333-333333333333/0a1b2c3d/call/updateMediaDescriptions/"
+    }
+  }
+}
